@@ -28,6 +28,9 @@ pub struct BodyDesc {
     pub vel: Velocity,
     pub inv_mass: Scalar,
     pub dynamic: bool,
+    /// Body-frame inverse inertia tensor. None falls back to the old isotropic
+    /// diag(inv_mass), which treats every body like a unit sphere of radius ~1.2 m.
+    pub inv_inertia_local: Option<Mat3>,
 }
 
 pub struct Bodies {
@@ -101,14 +104,18 @@ impl Bodies {
         self.inv_mass.push(inv_m);
         self.dynamic.push(is_dyn);
 
-        let inv_i = if is_dyn { Mat3::from_diagonal(GVec3::splat(inv_m)) } else { Mat3::ZERO };
+        let inv_i = match (is_dyn, desc.inv_inertia_local) {
+            (false, _) => Mat3::ZERO,
+            (true, Some(m)) if m.is_finite() => m,
+            (true, _) => Mat3::from_diagonal(GVec3::splat(inv_m)),
+        };
         self.inv_inertia_local.push(inv_i);
 
         (self.pos.len() as u32) - 1
     }
 
     pub fn add_legacy(&mut self, pose: Isometry, vel: Velocity, inv_mass: Scalar, dynamic: bool) -> u32 {
-        self.add(BodyDesc { pose, vel, inv_mass, dynamic })
+        self.add(BodyDesc { pose, vel, inv_mass, dynamic, inv_inertia_local: None })
     }
 
     // -------- Accessors --------
@@ -138,14 +145,13 @@ impl Bodies {
     #[inline] pub fn inv_mass_of(&self, id: u32) -> Scalar { self.inv_mass[self.idx(id)] }
     #[inline] pub fn is_dynamic(&self, id: u32) -> bool { self.dynamic[self.idx(id)] }
 
+    /// World-frame inverse inertia: R * I_local^-1 * R^T (glam matrices are column-major,
+    /// so `from_quat` is the body-to-world rotation and its transpose is the inverse).
     #[inline] pub fn inv_inertia_world(&self, id: u32) -> Mat3 {
         let i = self.idx(id);
         if self.inv_mass[i] == 0.0 { return Mat3::ZERO; }
-
-        // The local inertia tensor is isotropic (a uniform diagonal matrix).
-        // Returning it directly avoids unnecessary matrix transposition errors
-        // and column-major rematrix corruption.
-        self.inv_inertia_local[i]
+        let r = Mat3::from_quat(self.rot[i]);
+        r * self.inv_inertia_local[i] * r.transpose()
     }
     // -------- Integration (Semi-Implicit) --------
 

@@ -46,23 +46,27 @@ fn test_xpbd_hinge_joint_stability() {
 
     let dt = 0.016f32;
 
-    // Simulate for 1 second (60 ticks) using the unified step function
+    // Simulate for ~1 second (60 ticks) using the unified step function. The leg is an
+    // undamped pendulum, so its height at any single instant depends on its period (which
+    // depends on its real inertia); check the whole swing instead.
+    let mut lowest_y = f32::MAX;
+    let mut worst_dist_err = 0.0f32;
     for _ in 0..60 {
         world.step(dt);
+        let p = world.get_body_pose(leg_id).pos;
+        lowest_y = lowest_y.min(p.y);
+        worst_dist_err = worst_dist_err.max((p.distance(Vec3::new(0.0, 10.0, 0.0)) - 1.0).abs());
     }
 
-    let final_leg_pose = world.get_body_pose(leg_id);
-
     // ASSERTIONS:
-    // 1. The leg should have swung downward due to gravity (Y < 10.0).
-    assert!(final_leg_pose.pos.y < 9.5, "Leg did not swing downward under gravity.");
+    // 1. The leg swings down through the bottom of its arc (y = 9.0) under gravity.
+    assert!(lowest_y < 9.1, "Leg did not swing downward under gravity (lowest y {}).", lowest_y);
 
-    // 2. The joint must not have ripped apart.
-    // The distance between pivot (0,10,0) and the leg's anchor point should still be exactly 1.0m.
-    let dist = final_leg_pose.pos.distance(Vec3::new(0.0, 10.0, 0.0));
+    // 2. The joint must not rip apart at any point: the distance between pivot (0,10,0)
+    //    and the leg's center stays 1.0 m.
     assert!(
-        (dist - 1.0).abs() < 0.01,
-        "XPBD Constraint failed! Joint ripped apart. Distance is {}", dist
+        worst_dist_err < 0.01,
+        "XPBD Constraint failed! Joint ripped apart. Worst distance error {}", worst_dist_err
     );
 }
 
@@ -245,4 +249,30 @@ fn test_pvr_determinism() {
         result_a, result_b,
         "PVR Determinism failure! Execution A yielded {:?}, Execution B yielded {:?}", result_a, result_b
     );
+}
+#[test]
+fn test_torque_uses_real_inertia() {
+    // A 0.5 x 0.1 x 0.5 m, 1.2 kg box: I_zz = m (w^2 + h^2) / 12 = 0.026 kg m^2. A body-frame
+    // torque must change angular velocity by tau dt / I, not tau dt / m (the old isotropic
+    // diag(inv_mass) placeholder made torques ~46x too weak on this body).
+    let mut world = World::with_capacity(8, 8);
+    world.set_gravity(Vec3::ZERO);
+    let half = Vec3::new(0.25, 0.05, 0.25);
+    let mass = MassProps::from_box_density(half, 1.2 / (8.0 * half.x * half.y * half.z));
+    let id = world.add_body(Isometry { pos: Vec3::new(0.0, 5.0, 0.0), rot: Quat::IDENTITY }, Velocity::default(), mass, true);
+    let dt = 1.0 / 60.0;
+    world.apply_torque(id, Vec3::new(0.0, 0.0, 0.44) * dt);
+    let w = world.get_body_vel(id).ang.z;
+    let expected = 0.44 * dt / mass.inertia.z_axis.z;
+    assert!((w - expected).abs() < 1e-4, "angular velocity {} expected {}", w, expected);
+
+    // Rotated 90 degrees about X, the body's own y axis points along world z, so the same
+    // world-z torque must meet I_yy (0.05) instead of I_zz: world inverse inertia must follow
+    // the body's orientation (R I^-1 R^T).
+    let rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let id2 = world.add_body(Isometry { pos: Vec3::new(3.0, 5.0, 0.0), rot }, Velocity::default(), mass, true);
+    world.apply_torque(id2, Vec3::new(0.0, 0.0, 0.44) * dt);
+    let w2 = world.get_body_vel(id2).ang.z;
+    let expected_rotated = 0.44 * dt / mass.inertia.y_axis.y;
+    assert!((w2 - expected_rotated).abs() < 1e-4, "rotated-body response {} expected {}", w2, expected_rotated);
 }

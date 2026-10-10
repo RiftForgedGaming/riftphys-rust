@@ -7,9 +7,11 @@ edition = "2021"
 name = "epoch_swap"
 path = "src/epoch_swap.rs"
 
-[[bin]]
-name = "bench_perf"
-path = "src/bench_perf.rs"
+# bench_perf.rs is fully commented out (written against an older World API); re-enable
+# once it is ported, like multi_loco_bench below.
+#[[bin]]
+#name = "bench_perf"
+#path = "src/bench_perf.rs"
 
 [[bin]]
 

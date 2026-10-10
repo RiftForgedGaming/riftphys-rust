@@ -1,0 +1,22 @@
+[package]
+name = "riftphys-uriel"
+version = "0.1.0"
+edition = "2021"
+description = "URIEL robotics protocol for RiftPhys: deterministic scenarios (drones, squads), expert demonstrations and JSONL telemetry"
+
+[lib]
+name = "riftphys_uriel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "riftphys-uriel-rollout"
+path = "src/bin/rollout.rs"
+
+[dependencies]
+riftphys-core = { path = "../riftphys-core" }
+riftphys-geom = { path = "../riftphys-geom" }
+riftphys-world = { path = "../riftphys-world" }
+riftphys-materials = { path = "../riftphys-materials" }
+glam = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"

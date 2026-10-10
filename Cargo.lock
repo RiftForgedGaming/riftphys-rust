@@ -2621,6 +2621,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "riftphys-uriel"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "riftphys-core",
+ "riftphys-geom",
+ "riftphys-materials",
+ "riftphys-world",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "riftphys-vehicles"
 version = "0.1.0"
 dependencies = [

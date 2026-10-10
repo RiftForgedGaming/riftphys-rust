@@ -374,7 +374,11 @@ impl World {
 
     pub fn add_body(&mut self, pose: Isometry, vel: Velocity, mass: MassProps, dynamic: bool) -> BodyId {
         let inv_mass = if dynamic { mass.inv_mass } else { 0.0 };
-        let id = self.bodies.add(BodyDesc { pose, vel, inv_mass, dynamic });
+        // Keep the shape's real inertia (MassProps.inertia is body-frame); the old path dropped
+        // it and used diag(inv_mass), so torques ignored a body's size and shape.
+        let det = mass.inertia.determinant();
+        let inv_inertia_local = (dynamic && det.is_finite() && det > 0.0).then(|| mass.inertia.inverse());
+        let id = self.bodies.add(BodyDesc { pose, vel, inv_mass, dynamic, inv_inertia_local });
         let idx = id as usize;
         self.sleep.ensure_capacity(idx);
         self.sleep.wake(idx);
