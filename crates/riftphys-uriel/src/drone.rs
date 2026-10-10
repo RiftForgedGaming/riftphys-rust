@@ -70,6 +70,10 @@ pub struct Drone {
     pub body: BodyId,
     pub target: Vec3,
     pub inertia: Vec3,
+    /// True mass (kg): MASS plus any payload.
+    pub mass: f32,
+    /// Steady wind force on this drone (N, world frame).
+    pub wind: Vec3,
     pub last_act: [f32; ROTORS],
     pub last_demo: Option<[f32; ROTORS]>,
     pub crashed: bool,
@@ -89,11 +93,15 @@ pub struct DroneConfig {
     pub start_offset: f32,
     pub start_tilt: f32,
     pub altitude: f32,
+    /// Random payload per drone: up to this fraction of MASS extra (0 = none).
+    pub payload: f32,
+    /// Random steady horizontal wind per drone: up to this force (N) (0 = none).
+    pub wind: f32,
 }
 
 impl Default for DroneConfig {
     fn default() -> Self {
-        Self { count: 1, spacing: 1.5, start_offset: 1.5, start_tilt: 0.25, altitude: 3.0 }
+        Self { count: 1, spacing: 1.5, start_offset: 1.5, start_tilt: 0.25, altitude: 3.0, payload: 0.0, wind: 0.0 }
     }
 }
 
@@ -118,19 +126,26 @@ impl DroneScenario {
         world.add_collider(ground, Shape::Box { hx: 50.0, hy: 0.5, hz: 50.0 }, material(MaterialId::Concrete));
 
         let center = Vec3::new(rng.range(-2.0, 2.0), cfg.altitude, rng.range(-2.0, 2.0));
-        let density = MASS / (8.0 * HALF.x * HALF.y * HALF.z);
         let mut drones = Vec::with_capacity(cfg.count);
         for i in 0..cfg.count {
             let target = center + formation_slot(i, cfg.count, cfg.spacing);
             let start = target + Vec3::new(rng.range(-1.0, 1.0), rng.range(-1.0, 1.0) * 0.5, rng.range(-1.0, 1.0)) * cfg.start_offset;
             let start = Vec3::new(start.x, start.y.max(0.5), start.z);
             let tilt = Quat::from_euler(glam::EulerRot::XYZ, rng.range(-1.0, 1.0) * cfg.start_tilt, rng.range(-3.14, 3.14), rng.range(-1.0, 1.0) * cfg.start_tilt);
-            let mp = MassProps::from_box_density(HALF, density);
+            // Disturbances draw random numbers only when enabled, so default episodes are unchanged
+            let mass = if cfg.payload > 0.0 { MASS * (1.0 + rng.range(0.0, cfg.payload)) } else { MASS };
+            let wind = if cfg.wind > 0.0 {
+                let a = rng.range(0.0, std::f32::consts::TAU);
+                Vec3::new(a.cos(), 0.0, a.sin()) * rng.range(0.3, 1.0) * cfg.wind
+            } else {
+                Vec3::ZERO
+            };
+            let mp = MassProps::from_box_density(HALF, mass / (8.0 * HALF.x * HALF.y * HALF.z));
             let body = world.add_body(Isometry { pos: start, rot: tilt }, Velocity::default(), mp, true);
             world.add_collider(body, Shape::Box { hx: HALF.x, hy: HALF.y, hz: HALF.z }, material(MaterialId::Aluminum));
             world.set_body_sleep_allowed(body, false);
             let inertia = Vec3::new(mp.inertia.x_axis.x, mp.inertia.y_axis.y, mp.inertia.z_axis.z);
-            drones.push(Drone { body, target, inertia, last_act: [0.0; ROTORS], last_demo: None, crashed: false });
+            drones.push(Drone { body, target, inertia, mass, wind, last_act: [0.0; ROTORS], last_demo: None, crashed: false });
         }
         Self { drones, formation_center: center, spacing: cfg.spacing }
     }
@@ -145,7 +160,7 @@ impl DroneScenario {
         }
         let (thrust, tau_body) = wrench(u.map(|ui| ui * T_MAX));
         let rot = world.get_body_pose(d.body).rot;
-        world.apply_impulse(d.body, rot * Vec3::new(0.0, thrust, 0.0) * dt);
+        world.apply_impulse(d.body, (rot * Vec3::new(0.0, thrust, 0.0) + d.wind) * dt);
         world.apply_torque(d.body, rot * tau_body * dt);
     }
 
@@ -169,6 +184,10 @@ impl DroneScenario {
 }
 
 /// Cascaded PD hover/formation controller.
+///
+/// `oracle` controllers know each drone's true mass and wind and feed them forward (the
+/// demonstrator). Non-oracle controllers assume the nominal airframe in still air, like a
+/// controller tuned on the bench and flown with an unknown payload.
 #[derive(Clone, Copy, Debug)]
 pub struct ExpertPd {
     pub kp: f32,
@@ -177,11 +196,20 @@ pub struct ExpertPd {
     pub k_att: f32,
     pub k_rate: f32,
     pub k_yaw: f32,
+    pub oracle: bool,
 }
 
 impl Default for ExpertPd {
     fn default() -> Self {
-        Self { kp: 4.0, kd: 3.0, max_tilt_accel: 5.0, k_att: 40.0, k_rate: 10.0, k_yaw: 3.0 }
+        Self { kp: 4.0, kd: 3.0, max_tilt_accel: 5.0, k_att: 40.0, k_rate: 10.0, k_yaw: 3.0, oracle: true }
+    }
+}
+
+impl ExpertPd {
+    /// A deliberately weak, nominal-model controller: keeps a drone up but drifts and sags
+    /// under payload and wind. The base that residual learning corrects.
+    pub fn nominal_base() -> Self {
+        Self { kp: 2.0, kd: 2.0, max_tilt_accel: 4.0, k_att: 30.0, k_rate: 8.0, k_yaw: 2.0, oracle: false }
     }
 }
 
@@ -191,8 +219,10 @@ impl ExpertPd {
         let vel = world.get_body_vel(d.body);
         let rot = pose.rot;
 
-        // Position loop -> desired acceleration (gravity compensated), horizontal part limited
-        let mut a = (d.target - pose.pos) * self.kp - vel.lin * self.kd;
+        let (mass, wind) = if self.oracle { (d.mass, d.wind) } else { (MASS, Vec3::ZERO) };
+
+        // Position loop -> desired acceleration (gravity and known wind compensated), horizontal limited
+        let mut a = (d.target - pose.pos) * self.kp - vel.lin * self.kd - wind / mass;
         let h = Vec3::new(a.x, 0.0, a.z);
         if h.length() > self.max_tilt_accel {
             let s = self.max_tilt_accel / h.length();
@@ -203,7 +233,7 @@ impl ExpertPd {
 
         let up = rot * Vec3::Y;
         let up_des = a.normalize_or_zero();
-        let thrust = MASS * a.dot(up).max(0.0);
+        let thrust = mass * a.dot(up).max(0.0);
 
         // Attitude loop: rotate up toward up_des, damp rates, hold yaw = 0
         let fwd = rot * Vec3::Z;

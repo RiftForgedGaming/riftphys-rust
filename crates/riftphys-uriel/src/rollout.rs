@@ -251,6 +251,29 @@ mod tests {
     }
 
     #[test]
+    fn oracle_handles_payload_and_wind_that_the_nominal_base_cannot() {
+        let mut cfg = RolloutConfig { noise: 0.0, gust_rate: 0.0, seconds: 10.0, ..Default::default() };
+        cfg.drones.payload = 0.25;
+        cfg.drones.wind = 1.0;
+        let final_err = |ctl: ExpertPd| {
+            let mut errs = Vec::new();
+            for e in 0..6 {
+                let mut env = DroneEnv::new(&cfg, e, 3);
+                while !env.done() {
+                    let acts: Vec<_> = (0..env.len()).map(|i| ctl.command(&env.world, &env.scenario.drones[i])).collect();
+                    env.step(&acts, None);
+                }
+                assert!(!env.crashed()[0], "neither controller should crash in this test");
+                errs.push(env.errors()[0]);
+            }
+            errs.iter().sum::<f32>() / errs.len() as f32
+        };
+        let (oracle, base) = (final_err(ExpertPd::default()), final_err(ExpertPd::nominal_base()));
+        assert!(oracle < 0.1, "oracle final error {}", oracle);
+        assert!(base > 3.0 * oracle && base > 0.15, "nominal base should sag/drift: base {} oracle {}", base, oracle);
+    }
+
+    #[test]
     fn constant_hover_throttle_drifts_off_target() {
         // The floor any learner must beat: open-loop 0.5 on every rotor cannot correct the
         // random start, so it never holds the target.
