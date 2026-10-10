@@ -8,7 +8,7 @@ use riftphys_gravity::GravitySpec;
 use riftphys_io::rig_physics::{humanoid_from_rig, load_into_world, PhysicsRig, WeaponLink};
 use riftphys_io::RigData;
 use riftphys_materials::materials::*;
-use riftphys_viz::DebugSettings;
+use riftphys_viz::viz::DebugSettings;
 use riftphys_world::world::World;
 
 // Import the shared types from your bench-helpers crate

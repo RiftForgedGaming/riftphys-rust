@@ -1,8 +1,7 @@
-// crates/riftphys-world/src/world/islands.rs
-use riftphys_core::BodyId;
-use riftphys_articulation::Joints;
-use riftphys_dynamics::Bodies;
-use super::world::{Contact, Collider};
+// SPDX-License-Identifier: RiftForged Proprietary License
+use riftphys_articulation::bodies::Joints;
+use riftphys_dynamics::dynamics::Bodies;
+use super::world::{Contact, Collider, TERRAIN_CI};
 
 pub(super) struct Island {
     pub(super) contact_indices: Vec<usize>,
@@ -13,7 +12,6 @@ pub(super) struct Island {
 pub(super) struct IslandManager {
     parent: Vec<u32>,
     rank: Vec<u32>,
-    // O(1) lookup: maps a root body ID directly to its index in the final islands array
     island_lookup: Vec<u32>,
 }
 
@@ -47,21 +45,19 @@ impl IslandManager {
         let is_dynamic = |id: u32| -> bool { bodies.inv_mass_of(id) > 0.0 };
 
         // --- 1. UNION PHASE ---
-        // Union by Joints
         for joint_kind in joints.kinds().iter() {
             let (id_a, id_b) = match joint_kind {
-                riftphys_articulation::JointKind::Distance(j) => (j.a.0, j.b.0),
-                riftphys_articulation::JointKind::D6(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::Distance(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::D6(j) => (j.a.0, j.b.0),
             };
             if is_dynamic(id_a) && is_dynamic(id_b) {
                 self.union(id_a, id_b);
             }
         }
 
-        // Union by Contacts
         for c in contacts {
             let id_a = colliders[c.a_collider].body.0;
-            if c.b_collider != crate::world::step::TERRAIN_CI {
+            if c.b_collider != TERRAIN_CI {
                 let id_b = colliders[c.b_collider].body.0;
                 if is_dynamic(id_a) && is_dynamic(id_b) {
                     self.union(id_a, id_b);
@@ -72,34 +68,30 @@ impl IslandManager {
         // --- 2. COLLECTION PHASE ---
         let mut islands: Vec<Island> = Vec::with_capacity(num_bodies / 4);
 
-        // Process Joints
         for (idx, joint_kind) in joints.kinds().iter().enumerate() {
             let (id_a, id_b) = match joint_kind {
-                riftphys_articulation::JointKind::Distance(j) => (j.a.0, j.b.0),
-                riftphys_articulation::JointKind::D6(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::Distance(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::D6(j) => (j.a.0, j.b.0),
             };
             self.route_to_island(id_a, id_b, is_dynamic(id_a), is_dynamic(id_b), true, idx, &mut islands);
         }
 
-        // Process Contacts
         for (idx, c) in contacts.iter().enumerate() {
             let id_a = colliders[c.a_collider].body.0;
             let mut id_b = 0;
             let mut dyn_b = false;
 
-            if c.b_collider != crate::world::step::TERRAIN_CI {
+            if c.b_collider != TERRAIN_CI {
                 id_b = colliders[c.b_collider].body.0;
                 dyn_b = is_dynamic(id_b);
             }
             self.route_to_island(id_a, id_b, is_dynamic(id_a), dyn_b, false, idx, &mut islands);
         }
 
-        // Ensure deterministic processing order for the solver
         islands.sort_unstable_by_key(|is| is.min_body_id);
         islands
     }
 
-    /// O(1) Routing: Maps constraints to their island without hashing or trees
     #[inline]
     fn route_to_island(
         &mut self,
@@ -108,13 +100,10 @@ impl IslandManager {
     ) {
         if !dyn_a && !dyn_b { return; }
 
-        // Find the root of the dynamic body
         let root = if dyn_a { self.find(body_a) } else { self.find(body_b) };
-
         let island_idx = self.island_lookup[root as usize];
 
         let target_island = if island_idx == u32::MAX {
-            // First time seeing this root: create a new island
             let new_idx = islands.len() as u32;
             self.island_lookup[root as usize] = new_idx;
             islands.push(Island {
@@ -124,7 +113,6 @@ impl IslandManager {
             });
             &mut islands[new_idx as usize]
         } else {
-            // O(1) retrieval of existing island
             &mut islands[island_idx as usize]
         };
 
@@ -135,7 +123,6 @@ impl IslandManager {
         }
     }
 
-    // Standard Union-Find with Path Compression
     fn find(&mut self, i: u32) -> u32 {
         let mut root = i;
         while self.parent[root as usize] != root {

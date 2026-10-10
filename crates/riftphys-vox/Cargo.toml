@@ -12,6 +12,6 @@ bitvec = "1"
 glam = { version = "0.27", features = ["bytemuck"] }
 riftphys-materials = { path = "../riftphys-materials" }
 
-wgpu     = { version = "0.20", optional = true }
+wgpu = { workspace = true, optional = true, features = ["wgsl"] }
 pollster = { version = "0.3",  optional = true }
 bytemuck = { version = "1.15", features = ["derive"], optional = true }

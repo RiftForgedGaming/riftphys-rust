@@ -152,7 +152,7 @@ pub fn collide_shapes(
         // --- CATCH-ALL DEBUGGER ---
         (a, b) => {
             // This will tell us EXACTLY what the two shapes are that failed
-            println!("Narrowphase Dispatch Miss: {:?} vs {:?}", a, b);
+            // println!("Narrowphase Dispatch Miss: {:?} vs {:?}", a, b);
             None
         }
         _ => None,

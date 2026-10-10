@@ -16,9 +16,9 @@ path = "src/bench_perf.rs"
 name = "voxel_bench_world"
 path = "src/voxel_bench_world.rs"
 
-[[bin]]
-name = "multi_loco_bench"
-path = "src/multi_loco_bench.rs"
+#[[bin]]
+#name = "multi_loco_bench"
+#path = "src/multi_loco_bench.rs"
 
 [[bin]]
 name = "loco_melee_test"

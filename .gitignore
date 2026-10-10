@@ -4,3 +4,9 @@
 /target/debug
 /target/release
 /ignore
+# Local build artifacts and run output
+/out/
+/charts/
+*.dll
+*.lib
+/riftphys-rust dll lib package/

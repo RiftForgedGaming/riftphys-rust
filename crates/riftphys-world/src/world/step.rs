@@ -1,14 +1,11 @@
+// SPDX-License-Identifier: RiftForged Proprietary License
 use rayon::prelude::*;
-use super::world::{Contact, World, CCD_MAX_MARGIN};
-use riftphys_core::{StepStage, StepStats, Scalar, Quat};
-use riftphys_geom::{Aabb};
+use super::world::{Contact, World, CCD_MAX_MARGIN, TERRAIN_CI};
+use riftphys_core::{StepStage, StepStats, Scalar, Quat, Isometry, Vec3, BodyId};
+use riftphys_geom::{aabb_of, Shape, Aabb};
 use riftphys_collision::narrowphase::collide_shapes;
 use riftphys_gravity::eval as grav_eval;
-use riftphys_viz::LedgerEvent;
-use riftphys_core::Isometry;
-use riftphys_geom::Shape;
-use riftphys_core::Vec3;
-pub const TERRAIN_CI: usize = u32::MAX as usize;
+use riftphys_viz::viz::LedgerEvent;
 
 // We use a safer, tighter margin for melee to prevent ghosting
 // and false speculative contacts from ruining the narrowphase solver.
@@ -25,159 +22,207 @@ impl World {
 
         let count = self.bodies.len() as u32;
 
-        // --- STAGE 1: Velocity Integration & CCD DISPATCH ---
-        self.schedule.push(StepStage::Integrate);
+        // --- STAGE 1: Force Integration ---
         for i in 0..count {
             if !self.bodies.is_dynamic(i) || !self.sleep.is_awake(i as usize) { continue; }
-
-            let pose = self.bodies.pose(i);
             let mut vel = self.bodies.vel(i);
-
-            // Apply Gravity
+            let pose = self.bodies.pose(i);
             let mut a_total = grav_eval(&self.gravity_proc, pose.pos);
-
-            // Apply Extra Accelerations (Aero/Prop)
             if let Some(Some(ac)) = self.accel_comps.get(i as usize) {
-                let inv_m = self.bodies.inv_mass_of(i);
-                if inv_m > 0.0 {
-                    let (a_grav, a_extra) = Self::eval_extra_accel(
-                        &self.models, &self.bodies, &self.accel_comps,
-                        self.epoch_id, self.tick, i, pose, vel, &self.gravity_proc, dt
-                    );
-                    a_total = a_grav + a_extra;
-                }
+                let (a_grav, a_extra) = Self::eval_extra_accel(&self.models, &self.bodies, &self.accel_comps, self.epoch_id, self.tick, i, pose, vel, &self.gravity_proc, dt);
+                a_total = a_grav + a_extra;
             }
-
             vel.lin += a_total * dt;
             self.bodies.set_vel(i, vel);
-
-            // THE CRITICAL FIX: CCD DISPATCH
-            // If the body is moving fast, use the sweep logic to prevent tunneling.
-            // This is what stops Mr. Box from ignoring the floor.
-            if vel.lin.length_squared() > 0.01 { // Only CCD if moving > 0.1m/s
-                if let Some(shape) = self.primary_shape(riftphys_core::BodyId(i)) {
-                    match shape {
-                        Shape::Box { hx, hy, hz } => { self.ccd_integrate_box(i, hx, hy, hz, dt); }
-                        Shape::Capsule { r, hh } => { self.ccd_integrate_capsule(i, r, hh, dt); }
-                        Shape::Sphere { r } => { self.ccd_integrate_sphere(i, dt); }
-                        _ => {}
-                    }
-                }
-            }
         }
 
-        // --- STAGE 2: Broadphase ---
-        self.schedule.push(StepStage::UpdateAabbsPre);
-        self.update_colliders_aabb(); // Use the existing helper to refresh AABBs
-
-        self.schedule.push(StepStage::BroadphaseSap);
-        let mut aabbs: Vec<Aabb> = self.colliders.iter().map(|c| c.aabb).collect();
-        for (i, c) in self.colliders.iter().enumerate() {
-            if !self.sleep.is_awake(c.body.0 as usize) { continue; }
-            let speed = self.bodies.vel(c.body.0).lin.length();
-            let margin = (speed * dt).min(MELEE_CCD_MARGIN);
-            if margin > 0.0 { aabbs[i].expand_by(margin); }
-        }
-
-        let pairs = self.broadphase.run(&aabbs);
+        // --- STAGE 2: Broadphase & Narrowphase ---
+        self.update_colliders_aabb();
+        let pairs = self.broadphase.run(&self.colliders.iter().map(|c| c.aabb).collect::<Vec<_>>());
         let pairs_tested_count = pairs.len() as u32;
 
-        // --- STAGE 3: Narrowphase ---
-        self.schedule.push(StepStage::Narrowphase);
         let colliders = &self.colliders;
         let bodies = &self.bodies;
-        let sleep = &self.sleep;
-
-        // Rigid Body vs Rigid Body
-        let mut contacts: Vec<Contact> = pairs.par_iter().flat_map(|&(i, j)| {
+        let mut raw_contacts: Vec<Contact> = pairs.par_iter().flat_map(|&(i, j)| {
             let ca = &colliders[i];
             let cb = &colliders[j];
-            let mut local = Vec::with_capacity(4);
-
-            let a_awake = sleep.is_awake(ca.body.0 as usize);
-            let b_awake = sleep.is_awake(cb.body.0 as usize);
-            if !a_awake && !b_awake { return local; }
-
-            let margin_a = if a_awake { bodies.vel(ca.body.0).lin.length() * dt } else { 0.0 };
-            let margin_b = if b_awake { bodies.vel(cb.body.0).lin.length() * dt } else { 0.0 };
-            let contact_dist = (margin_a + margin_b).min(MELEE_CCD_MARGIN);
-
-            if let Some(manifold) = collide_shapes(&ca.shape, &bodies.pose(ca.body.0), &cb.shape, &bodies.pose(cb.body.0), contact_dist) {
-                // Wake logic
-                if a_awake && !b_awake && bodies.vel(ca.body.0).lin.length_squared() > sleep.lin_threshold_sq { sleep.wake(cb.body.0 as usize); }
-                if !a_awake && b_awake && bodies.vel(cb.body.0).lin.length_squared() > sleep.lin_threshold_sq { sleep.wake(ca.body.0 as usize); }
-
+            let mut local = Vec::new();
+            if let Some(manifold) = collide_shapes(&ca.shape, &bodies.pose(ca.body.0), &cb.shape, &bodies.pose(cb.body.0), MELEE_CCD_MARGIN) {
                 for pt_idx in 0..manifold.len {
                     let pt = &manifold.points[pt_idx as usize];
-                    local.push(Contact { a_collider: i, b_collider: j, normal: pt.normal, depth: pt.penetration, env_material: None });
+                    local.push(Contact { a_collider: i, b_collider: j, point: pt.position, normal: pt.normal, depth: pt.penetration, env_material: None, impulse: 0.0 });
                 }
             }
             local
         }).collect();
 
-        // Environment Narrowphase (Terrain)
-        let env_contacts: Vec<Contact> = colliders.par_iter().enumerate().filter_map(|(ci, c)| {
-            if bodies.inv_mass_of(c.body.0) == 0.0 || !sleep.is_awake(c.body.0 as usize) { return None; }
-
+        let env_contacts: Vec<Contact> = colliders.par_iter().enumerate().flat_map(|(ci, c)| {
             let mut local = Vec::new();
             let mut env_buffer = Vec::new();
-
-            // THE FIX: Expanded Query to prevent ghosting
-            let mut query_aabb = c.aabb;
-            query_aabb.expand_by(bodies.vel(c.body.0).lin.length() * dt + 0.1);
-
-            for env in &self.environments {
-                env.query_aabb(&query_aabb, &mut env_buffer);
-            }
-
-            let contact_dist = (bodies.vel(c.body.0).lin.length() * dt).min(MELEE_CCD_MARGIN);
-
+            for env in &self.environments { env.query_aabb(&c.aabb, &mut env_buffer); }
             for env_col in env_buffer {
-                if let Some(manifold) = collide_shapes(&c.shape, &bodies.pose(c.body.0), &env_col.shape, &env_col.transform, contact_dist) {
+                if let Some(manifold) = collide_shapes(&c.shape, &bodies.pose(c.body.0), &env_col.shape, &env_col.transform, MELEE_CCD_MARGIN) {
                     for pt_idx in 0..manifold.len {
                         let pt = &manifold.points[pt_idx as usize];
-                        local.push(Contact {
-                            a_collider: ci, b_collider: TERRAIN_CI,
-                            normal: pt.normal, depth: pt.penetration, env_material: Some(env_col.material)
-                        });
+                        local.push(Contact { a_collider: ci, b_collider: TERRAIN_CI, point: pt.position, normal: pt.normal, depth: pt.penetration, env_material: Some(env_col.material), impulse: 0.0 });
                     }
                 }
             }
-            if local.is_empty() { None } else { Some(local) }
-        }).flatten().collect();
+            local
+        }).collect();
+        raw_contacts.extend(env_contacts);
 
-        contacts.extend(env_contacts);
-
-        // --- STAGE 4 & 5: Island Solving ---
-        let mut contacts = self.cull_and_orient_contacts(contacts);
-        self.schedule.push(StepStage::Solve);
+        // --- STAGE 3: Solve Contacts (Velocity Level) ---
+        let mut contacts = self.cull_and_orient_contacts(raw_contacts);
         let islands = self.island_manager.build_islands(self.bodies.len(), &self.colliders, &self.bodies, &self.joints, &contacts);
 
         if !islands.is_empty() {
-            self.solve_islands_parallel(&islands, &contacts, dt);
+            self.solve_islands_parallel(&islands, &mut contacts, dt);
         }
 
-        // --- STAGE 6: Position Integration ---
+        // --- STAGE 3.5: Motor Injection ---
+        for kind in self.joints.kinds().iter() {
+            if let riftphys_articulation::bodies::JointKind::D6(j) = kind {
+                for axis in 0..3 {
+                    if let Some(drive) = j.r[axis].drive {
+                        if drive.vel_mode {
+                            let axis_vec = match axis {
+                                0 => Vec3::new(1.0, 0.0, 0.0),
+                                1 => Vec3::new(0.0, 1.0, 0.0),
+                                _ => Vec3::new(0.0, 0.0, 1.0),
+                            };
+                            let vel_a = self.bodies.vel(j.a.0).ang;
+                            let vel_b = self.bodies.vel(j.b.0).ang;
+                            let v_rel = (vel_b - vel_a).dot(axis_vec);
+                            let err = drive.target - v_rel;
+
+                            // Motor directly drives velocity. Removed `dt` multiplication to restore its bite.
+                            let correction = (err * drive.kd).clamp(-drive.max_impulse, drive.max_impulse);
+
+                            if self.bodies.is_dynamic(j.a.0) {
+                                let mut va = self.bodies.vel(j.a.0);
+                                va.ang -= axis_vec * correction;
+                                self.bodies.set_vel(j.a.0, va);
+                            }
+                            if self.bodies.is_dynamic(j.b.0) {
+                                let mut vb = self.bodies.vel(j.b.0);
+                                vb.ang += axis_vec * correction;
+                                self.bodies.set_vel(j.b.0, vb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- STAGE 4: Position Integration ---
+        let mut original_poses = vec![Isometry { pos: Vec3::ZERO, rot: Quat::IDENTITY }; count as usize];
         for i in 0..count {
             if !self.bodies.is_dynamic(i) || !self.sleep.is_awake(i as usize) { continue; }
             let mut pose = self.bodies.pose(i);
+            original_poses[i as usize] = pose;
+
             let vel = self.bodies.vel(i);
             pose.pos += vel.lin * dt;
             if vel.ang.length_squared() > 1e-9 {
                 let axis = vel.ang.normalize();
                 let angle = vel.ang.length() * dt;
-                let rotation_step = Quat::from_axis_angle(axis, angle);
-                pose.rot = (rotation_step * pose.rot).normalize();
+                pose.rot = (Quat::from_axis_angle(axis, angle) * pose.rot).normalize();
             }
             self.bodies.set_pose(i, pose);
         }
 
-        // --- STAGE 7: Sleep Evaluation ---
-        self.sleep.evaluate(count, &self.bodies);
-        self.schedule.push(StepStage::UpdateAabbsPost);
-        self.update_colliders_aabb();
+        // --- STAGE 5: Solve Joints (Position Level) ---
+        if !self.joints.kinds().is_empty() {
+            self.solve_joints(dt, 20);
+        }
 
-        StepStats { pairs_tested: pairs_tested_count, contacts: contacts.len() as u32, islands: islands.len() as u32 }
+        // --- STAGE 6: Velocity Derivation (THE FINAL FIX) ---
+        for i in 0..count {
+            if !self.bodies.is_dynamic(i) || !self.sleep.is_awake(i as usize) { continue; }
+            let mut vel = self.bodies.vel(i);
+            let old_pose = original_poses[i as usize];
+            let mut new_pose = self.bodies.pose(i);
+
+            vel.lin = (new_pose.pos - old_pose.pos) / dt;
+
+            // FIX 1: MASS RATIO CRUSH (Floor grounding guarantee)
+            let mut touching_ground = false;
+            for c in &contacts {
+                if c.b_collider == TERRAIN_CI && self.colliders[c.a_collider].body.0 == i {
+                    touching_ground = true; break;
+                }
+            }
+
+            // If the heavy stack pushed us down into the floor, kill the derived downward velocity
+            // and snap position back to prevent sinking.
+            if touching_ground && vel.lin.y < 0.0 {
+                vel.lin.y = 0.0;
+                new_pose.pos.y = old_pose.pos.y;
+                self.bodies.set_pose(i, new_pose);
+            }
+
+            // FIX 2: MOTOR OVERWRITE
+            let mut is_driven = false;
+            for kind in self.joints.kinds().iter() {
+                if let riftphys_articulation::bodies::JointKind::D6(j) = kind {
+                    if j.a.0 == i || j.b.0 == i {
+                        for axis in 0..3 {
+                            if let Some(drive) = j.r[axis].drive {
+                                if drive.vel_mode { is_driven = true; break; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Only derive angular velocity if a motor isn't actively setting it
+            if !is_driven {
+                let dq = new_pose.rot * old_pose.rot.conjugate();
+                let mut ang_vel = Vec3::new(dq.x, dq.y, dq.z) * (2.0 / dt);
+                if dq.w < 0.0 { ang_vel = -ang_vel; }
+                vel.ang = ang_vel;
+            }
+
+            self.bodies.set_vel(i, vel);
+        }
+
+        // --- STAGE 7: Sleep & Telemetry ---
+        self.sleep.evaluate(count, &self.bodies);
+        self.update_colliders_aabb();
+        self.last_frame_contacts = contacts;
+
+        if self.debug.dump_state_every > 0 && self.tick % self.debug.dump_state_every as u64 == 0 {
+            let mut ke_lin_total = 0.0;
+            let mut ke_ang_total = 0.0;
+            let mut pe_grav_total = 0.0;
+            let g_mag = self.gravity.length();
+
+            for i in 0..count {
+                if !self.body_alive(BodyId(i)) { continue; }
+                let pose = self.bodies.pose(i);
+                let vel = self.bodies.vel(i);
+
+                self.record(LedgerEvent::BodyState { id: i, pos: pose.pos, rot: pose.rot, v_lin: vel.lin, v_ang: vel.ang });
+
+                if self.bodies.is_dynamic(i) {
+                    let inv_mass = self.bodies.inv_mass_of(i);
+                    if inv_mass > 0.0 {
+                        let mass = 1.0 / inv_mass;
+                        ke_lin_total += 0.5 * mass * vel.lin.length_squared();
+
+                        let inv_i = self.bodies.inv_inertia_world(i);
+                        if inv_i.x_axis.x > 0.0 && inv_i.y_axis.y > 0.0 && inv_i.z_axis.z > 0.0 {
+                            ke_ang_total += 0.5 * ((vel.ang.x * vel.ang.x / inv_i.x_axis.x) + (vel.ang.y * vel.ang.y / inv_i.y_axis.y) + (vel.ang.z * vel.ang.z / inv_i.z_axis.z));
+                        }
+                        pe_grav_total += mass * g_mag * pose.pos.y;
+                    }
+                }
+            }
+            self.record(LedgerEvent::SystemEnergy { ke_lin: ke_lin_total, ke_ang: ke_ang_total, pe_grav: pe_grav_total, total: ke_lin_total + ke_ang_total + pe_grav_total });
+        }
+
+        StepStats { pairs_tested: pairs_tested_count, contacts: self.last_frame_contacts.len() as u32, islands: islands.len() as u32 }
     }
 
     fn cull_and_orient_contacts(&self, mut contacts: Vec<Contact>) -> Vec<Contact> {
@@ -203,6 +248,7 @@ impl World {
         }
         culled
     }
+
     pub fn update_players(&mut self, dt: f32) {
         for p_idx in 0..self.players.len() {
             let mut player = self.players[p_idx].clone();
@@ -235,7 +281,7 @@ impl World {
 
                 let player_xf = Isometry { pos: pos + desired_move, rot: Quat::IDENTITY };
                 let player_shape = Shape::Capsule { r: player.radius, hh: player.height * 0.5 };
-                let player_aabb = riftphys_geom::aabb_of(&player_shape, &player_xf);
+                let player_aabb = aabb_of(&player_shape, &player_xf);
 
                 let mut hit_normal = None;
                 let mut hit_penetration = 0.0;
@@ -245,8 +291,8 @@ impl World {
                 let mut env_buffer = Vec::new();
                 for env in &self.environments { env.query_aabb(&player_aabb, &mut env_buffer); }
                 for env_col in env_buffer {
-                    // THE FIX: 0.05 margin ensures continuous floor detection
-                    if let Some(m) = riftphys_collision::narrowphase::collide_shapes(&player_shape, &player_xf, &env_col.shape, &env_col.transform, 0.05) {
+                    // 0.05 margin ensures continuous floor detection
+                    if let Some(m) = collide_shapes(&player_shape, &player_xf, &env_col.shape, &env_col.transform, 0.05) {
                         hit_normal = Some(m.points[0].normal);
                         hit_penetration = m.points[0].penetration;
                         break;
@@ -255,9 +301,10 @@ impl World {
 
                 // B. Check Spheres with 5cm Slop Margin
                 if hit_normal.is_none() {
-                    for (ci, c) in self.colliders.iter().enumerate() {
+                    // Addressed warning: prefixed `ci` with an underscore
+                    for (_ci, c) in self.colliders.iter().enumerate() {
                         if c.body != player.body && player_aabb.intersects(&c.aabb) {
-                            if let Some(m) = riftphys_collision::narrowphase::collide_shapes(&player_shape, &player_xf, &c.shape, &self.bodies.pose(c.body.0), 0.05) {
+                            if let Some(m) = collide_shapes(&player_shape, &player_xf, &c.shape, &self.bodies.pose(c.body.0), 0.05) {
                                 hit_normal = Some(m.points[0].normal);
                                 hit_penetration = m.points[0].penetration;
                                 hit_body = Some(c.body);

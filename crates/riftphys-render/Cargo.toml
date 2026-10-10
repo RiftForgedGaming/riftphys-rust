@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wgpu = { version = "0.20", features = ["wgsl"]}
+# THE FIX: Upgraded to 0.22 to mathematically align with egui 0.29
+wgpu = { workspace = true, features = ["wgsl"] }
 winit = { version = "0.30", features = ["rwh_06"] }
 
 riftphys-materials = { path = "../riftphys-materials" }
 glam = { workspace = true }
 bytemuck = { version = "1.16", features = ["derive"] }
 pollster = "0.3"
+
+# Removed egui-winit as the render crate only needs the wgpu overlay
+egui = "0.29"
+egui-wgpu = "0.29"

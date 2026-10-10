@@ -1,6 +1,7 @@
 use wgpu::util::DeviceExt;
 use riftphys_materials::materials as mats;
 use riftphys_materials::vis::*;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GpuMatVisU {
@@ -16,13 +17,15 @@ pub struct MatPalette {
     pub bind:   wgpu::BindGroup,
 }
 
-pub fn build_palette(device:&wgpu::Device) -> MatPalette {
+pub fn build_palette(device: &wgpu::Device) -> MatPalette {
     let mut table = [GpuMatVisU { base_rough:[0.5,0.5,0.5,0.9], metal_pad:[0.0,0.0,0.0,0.0] }; 256];
     for i in 0..256 {
         let id = unsafe { std::mem::transmute::<u8, mats::MaterialId>(i as u8) };
         let v  = mat_vis(id);
-        table[i] = GpuMatVisU { base_rough:[v.base_rgb[0], v.base_rgb[1], v.base_rgb[2], v.rough],
-            metal_pad:[v.metal, 0.0, 0.0, 0.0] };
+        table[i] = GpuMatVisU {
+            base_rough:[v.base_rgb[0], v.base_rgb[1], v.base_rgb[2], v.rough],
+            metal_pad:[v.metal, 0.0, 0.0, 0.0]
+        };
     }
 
     let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

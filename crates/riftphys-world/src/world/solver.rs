@@ -1,23 +1,21 @@
-// crates/riftphys-world/src/world/solver.rs
+// SPDX-License-Identifier: RiftForged Proprietary License
 use rayon::prelude::*;
 use super::geom::orthonormal_basis;
 use riftphys_core::Vec3;
-use super::world::{Contact, World};
-use super::step::TERRAIN_CI;
+use super::world::{Contact, World, TERRAIN_CI};
 use super::islands::Island;
 use riftphys_materials::materials as mats;
 
 #[derive(Copy, Clone)]
-struct UnsafeSyncBodies(*mut riftphys_dynamics::Bodies);
+struct UnsafeSyncBodies(*mut riftphys_dynamics::dynamics::Bodies);
 unsafe impl Send for UnsafeSyncBodies {}
 unsafe impl Sync for UnsafeSyncBodies {}
 
 impl UnsafeSyncBodies {
     #[inline(always)]
-    unsafe fn get_mut(&self) -> &mut riftphys_dynamics::Bodies { &mut *self.0 }
+    unsafe fn get_mut(&self) -> &mut riftphys_dynamics::dynamics::Bodies { &mut *self.0 }
 }
 
-// Wrapper to safely mutate our accumulated impulses array in parallel
 #[derive(Copy, Clone)]
 struct UnsafeAcc(*mut f32);
 unsafe impl Send for UnsafeAcc {}
@@ -33,8 +31,8 @@ impl UnsafeAcc {
 struct ContactConstraint {
     ai: u32, bi: u32,
     b_is_terrain: bool,
-    inv_a: f32, // <-- ADDED: Permafrost dynamic mass
-    inv_b: f32, // <-- ADDED: Permafrost dynamic mass
+    inv_a: f32,
+    inv_b: f32,
     inv_mass_sum: f32,
     normal: Vec3, t1: Vec3, t2: Vec3,
     mu_s: f32,
@@ -43,9 +41,9 @@ struct ContactConstraint {
 }
 
 impl World {
-    pub fn solve_islands_parallel(&mut self, islands: &[Island], contacts: &[Contact], dt: f32) {
-        let iterations = 8;
-        let beta = 0.2;
+    pub fn solve_islands_parallel(&mut self, islands: &[Island], contacts: &mut [Contact], dt: f32) {
+        let iterations = 20; // Increased for energy conservation
+        let beta = 0.05;     // Lowered for stability
         let slop = 0.005;
         let num_bodies = self.bodies.len();
 
@@ -66,7 +64,6 @@ impl World {
                                         if b_is_terrain { c.env_material.unwrap_or(mats::MaterialId::Default) }
                                         else { self.colliders[c.b_collider].material.id });
 
-            // THE FIX: Force the narrowphase environment normal to point A -> B (Downwards)
             let mut normal = c.normal;
             if b_is_terrain {
                 normal = -normal;
@@ -84,7 +81,7 @@ impl World {
                 inv_a, inv_b,
                 inv_mass_sum: if inv_sum > 0.0 { 1.0 / inv_sum } else { 0.0 },
                 normal, t1, t2, mu_s: pair.mu_s,
-                depth_bias: (c.depth - slop).max(0.0) * (beta / dt),
+                depth_bias: ((c.depth - slop).max(0.0) * (beta / dt)).min(2.0),
                 restitution_bias,
             }
         }).collect();
@@ -105,7 +102,6 @@ impl World {
             contact_batches[target_level].push(c_idx);
 
             body_level[cs.ai as usize] = target_level + 1;
-            // Terrain prevents lock contention by not elevating its level
             if !cs.b_is_terrain { body_level[cs.bi as usize] = target_level + 1; }
         }
 
@@ -117,8 +113,8 @@ impl World {
 
         for &j_idx in &active_joints {
             let (id_a, id_b) = match &self.joints.kinds()[j_idx] {
-                riftphys_articulation::JointKind::Distance(j) => (j.a.0, j.b.0),
-                riftphys_articulation::JointKind::D6(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::Distance(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::D6(j) => (j.a.0, j.b.0),
             };
             let level_a = joint_body_level[id_a as usize];
             let level_b = joint_body_level[id_b as usize];
@@ -144,7 +140,7 @@ impl World {
             for batch in &joint_batches {
                 batch.par_iter().for_each(|&j_idx| {
                     let bodies = unsafe { bodies_ptr.get_mut() };
-                    if let riftphys_articulation::JointKind::Distance(j) = &joints_ref.kinds()[j_idx] {
+                    if let riftphys_articulation::bodies::JointKind::Distance(j) = &joints_ref.kinds()[j_idx] {
                         let pa = bodies.pose(j.a.0).pos;
                         let pb = bodies.pose(j.b.0).pos;
                         let dir = pb - pa;
@@ -171,7 +167,6 @@ impl World {
             for batch in &contact_batches {
                 batch.par_iter().for_each(move |&c_idx| {
                     let cs = &constraints_slice[c_idx];
-
                     let bodies = unsafe { bodies_ptr.get_mut() };
                     let acc_jn_slice = unsafe { acc_jn_ptr.get_mut_slice(num_constraints) };
 
@@ -180,15 +175,19 @@ impl World {
                     let v_rel_n = (vb - va).dot(cs.normal);
 
                     let jn_raw = (cs.restitution_bias + cs.depth_bias - v_rel_n) * cs.inv_mass_sum;
-
                     let old_jn = acc_jn_slice[c_idx];
-                    acc_jn_slice[c_idx] = (old_jn + jn_raw).max(0.0);
-                    let jn = acc_jn_slice[c_idx] - old_jn;
+                    let new_jn = (old_jn + jn_raw).max(0.0);
+                    acc_jn_slice[c_idx] = new_jn;
+                    let jn = new_jn - old_jn;
+
+                    // Mass-Weighted Impulse Distribution (The Fix for Jitter)
+                    let total_inv_mass = cs.inv_a + cs.inv_b;
+                    let weight_a = if total_inv_mass > 0.0 { cs.inv_a / total_inv_mass } else { 0.5 };
+                    let weight_b = if total_inv_mass > 0.0 { cs.inv_b / total_inv_mass } else { 0.5 };
 
                     let impulse = cs.normal * jn;
-
-                    if cs.inv_a > 0.0 { bodies.apply_impulse(cs.ai, -impulse); }
-                    if cs.inv_b > 0.0 { bodies.apply_impulse(cs.bi, impulse); }
+                    if cs.inv_a > 0.0 { bodies.apply_impulse(cs.ai, -impulse * (weight_a * 2.0)); }
+                    if cs.inv_b > 0.0 { bodies.apply_impulse(cs.bi, impulse * (weight_b * 2.0)); }
 
                     let v_f = if cs.b_is_terrain { -bodies.vel(cs.ai).lin }
                     else { bodies.vel(cs.bi).lin - bodies.vel(cs.ai).lin };
@@ -205,6 +204,11 @@ impl World {
                     }
                 });
             }
+        }
+
+        // 4. Write back the final normal impulses to the contact array
+        for (i, contact) in contacts.iter_mut().enumerate() {
+            contact.impulse = acc_jn[i];
         }
     }
 }

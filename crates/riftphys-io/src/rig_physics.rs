@@ -14,7 +14,7 @@ use riftphys_core::{vec3, Isometry, Quat, Velocity};
 use riftphys_geom::Shape;
 use riftphys_world::world::World;
 
-use riftphys_articulation::D6Joint;
+use riftphys_articulation::bodies::D6Joint;
 use riftphys_materials::materials::{material, MaterialId};
 
 /// Quantize to 1e-6 for deterministic JSON emission.
