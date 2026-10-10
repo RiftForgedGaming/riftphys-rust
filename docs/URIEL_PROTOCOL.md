@@ -37,12 +37,15 @@ RiftPhys, closed loop; defined, not yet served).
 | `rot` | | unit quaternion `[x, y, z, w]`, body to world |
 | `ang` | rad/s | world-frame angular velocity |
 | `target` | m | the agent's goal (formation slot, waypoint), when it has one |
-| `act` | actuator units | commands applied this tick |
-| `demo` | actuator units | the expert's command this tick, when a teacher exists: the imitation label. Rollouts execute a noise-perturbed copy (`act`) while recording the clean one (DART), so data covers recovering from mistakes |
+| `act` | actuator units | commands chosen from this sample's state (applied by the step that follows) |
+| `demo` | actuator units | the expert's command for this sample's state, when a teacher exists: the imitation label. Rollouts execute a noise-perturbed copy (`act`) while recording the clean one (DART), so data covers recovering from mistakes |
+
+A sample is the state *before* the tick's step, together with the commands chosen from it, so
+(state, `demo`) pairs line up for imitation. `tick` is the number of steps already taken.
 
 ### Determinism
 
-`sample.hash` is the first 16 hex characters of the world's `step_hash()` after that tick. Every
+`sample.hash` is the first 16 hex characters of the world's `step_hash()` for the sampled state. Every
 episode records its `seed` in `episode_start`; re-running the scenario with that seed must
 reproduce every line, hashes included (tested in `riftphys-uriel`, `rollouts_replay_bit_exactly`).
 
