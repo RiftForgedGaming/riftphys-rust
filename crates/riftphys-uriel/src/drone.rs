@@ -178,6 +178,7 @@ impl DroneScenario {
                 target: Some(d.target.to_array()),
                 act: d.last_act.to_vec(),
                 demo: d.last_demo.map(|a| a.to_vec()),
+                joints: None,
             }
         }).collect()
     }

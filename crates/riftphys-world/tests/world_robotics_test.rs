@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: RiftForged Proprietary License
 use riftphys_world::world::World;
 use riftphys_core::{Isometry, Quat, Vec3, Velocity};
-use riftphys_geom::MassProps;
+use riftphys_geom::{MassProps, Shape};
+use riftphys_materials::materials::{material, MaterialId};
 use riftphys_articulation::bodies::D6Drive;
 use riftphys_viz::viz::{DebugSettings, LedgerEvent};
 
@@ -120,10 +121,12 @@ fn test_xpbd_motor_drive_velocity() {
         "Motor failed to reach target velocity. Current ang_vel_x: {}", final_vel.ang.x
     );
 
-    // 2. The physical position of the leg must have swung upward (Z should no longer be 0, Y should rise).
+    // 2. The leg must physically swing about the pivot. Positive rotation about +x carries -y
+    //    toward -z (right-hand rule), so the hanging leg moves to -z and rises. At 2 rad/s for
+    //    0.48 s it turns ~0.96 rad: centre at z = -sin(0.96) = -0.82, y = 10 - cos(0.96) = 9.43.
     assert!(
-        final_pose.pos.z > 0.1,
-        "Leg did not physically swing forward. Pos: {:?}", final_pose.pos
+        final_pose.pos.z < -0.7 && final_pose.pos.y > 9.3,
+        "Leg did not physically swing about the pivot. Pos: {:?}", final_pose.pos
     );
 }
 
@@ -190,20 +193,24 @@ fn test_pvr_energy_conservation_pendulum() {
 fn test_pvr_high_mass_ratio_stability() {
     let mut world = setup_test_world();
 
-    // Floor
-    world.add_body(Isometry { pos: Vec3::new(0.0, 0.0, 0.0), rot: Quat::IDENTITY }, Velocity::default(), MassProps::infinite(), false);
+    // Floor (top surface at y = 0). The bodies need colliders: without them this test only
+    // measured free fall (the light box "jittered" at g x 1.9 s).
+    let floor = world.add_body(Isometry { pos: Vec3::new(0.0, -0.5, 0.0), rot: Quat::IDENTITY }, Velocity::default(), MassProps::infinite(), false);
+    world.add_collider(floor, Shape::Box { hx: 50.0, hy: 0.5, hz: 50.0 }, material(MaterialId::Concrete));
 
-    // A 1kg box placed on the floor
+    // A 1kg box placed on the floor (half extents 0.5: a 1 m cube)
     let light_box = world.add_body(
         Isometry { pos: Vec3::new(0.0, 0.5, 0.0), rot: Quat::IDENTITY },
-        Velocity::default(), MassProps::from_box_density(Vec3::new(0.5, 0.5, 0.5), 8.0), true // 8kg/m3 * 0.125m3 = 1kg
+        Velocity::default(), MassProps::from_box_density(Vec3::new(0.5, 0.5, 0.5), 1.0), true // 1 kg/m3 * 1 m3 = 1 kg
     );
+    world.add_collider(light_box, Shape::Box { hx: 0.5, hy: 0.5, hz: 0.5 }, material(MaterialId::Wood));
 
     // A 1000kg box dropped directly on top of the 1kg box
     let heavy_box = world.add_body(
         Isometry { pos: Vec3::new(0.0, 2.0, 0.0), rot: Quat::IDENTITY },
-        Velocity::default(), MassProps::from_box_density(Vec3::new(0.5, 0.5, 0.5), 8000.0), true // 8000kg/m3 * 0.125m3 = 1000kg
+        Velocity::default(), MassProps::from_box_density(Vec3::new(0.5, 0.5, 0.5), 1000.0), true // 1000 kg/m3 * 1 m3 = 1000 kg
     );
+    world.add_collider(heavy_box, Shape::Box { hx: 0.5, hy: 0.5, hz: 0.5 }, material(MaterialId::Wood));
 
     let dt = 0.016f32;
     for _ in 0..120 { // 2 seconds to settle

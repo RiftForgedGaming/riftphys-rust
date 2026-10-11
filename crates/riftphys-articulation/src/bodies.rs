@@ -309,22 +309,17 @@ fn solve_d6(
                     target_pos = target_pos.clamp(q6(lim.min), q6(lim.max));
                 }
                 c_err = Some(q6(coord - target_pos));
-            } else {
-                if c_err.is_none() {
-                    c_err = Some(q6(coord - 0.0));
-                    target_pos = 0.0;
-                }
+            } else if row.limit.is_none() {
+                // Velocity drives act at velocity level (motor rows in the World's velocity
+                // solve); at position level the axis is free apart from its limits. Leaving it
+                // locked at 0 here (as before) meant a velocity-driven joint could never turn.
+                c_err = None;
             }
         }
 
         let Some(mut c) = c_err else { continue; };
 
-        let mut bias_vel = 0.0f32;
-        if let Some(drive) = row.drive {
-            if drive.vel_mode {
-                bias_vel = q6(drive.target);
-            }
-        }
+        let bias_vel = 0.0f32;
 
         let ra_u = q6v((xa - pa.pos).cross(u));
         let rb_u = q6v((xb - pb.pos).cross(u));
@@ -394,22 +389,15 @@ fn solve_d6(
                     target_ang = target_ang.clamp(q6(lim.min), q6(lim.max));
                 }
                 c_err = Some(q6(angle - target_ang));
-            } else {
-                if c_err.is_none() {
-                    c_err = Some(q6(angle - 0.0));
-                    target_ang = 0.0;
-                }
+            } else if row.limit.is_none() {
+                // Velocity drives: velocity level only (see the translational rows above)
+                c_err = None;
             }
         }
 
         let Some(mut c) = c_err else { continue; };
 
-        let mut bias_vel = 0.0f32;
-        if let Some(drive) = row.drive {
-            if drive.vel_mode {
-                bias_vel = q6(drive.target);
-            }
-        }
+        let bias_vel = 0.0f32;
 
         let w = q6(u.dot(iaw * u) + u.dot(ibw * u));
         let alpha = alpha_dt2(row.compliance, dt2);

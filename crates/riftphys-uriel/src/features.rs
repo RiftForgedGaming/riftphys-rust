@@ -33,7 +33,7 @@ mod tests {
 
     fn ent(rot: Quat, pos: Vec3, target: Vec3) -> EntState {
         EntState { eid: 1, kind: "quadrotor".into(), pos: pos.to_array(), rot: rot.to_array(), vel: [0.0; 3], ang: [0.0; 3],
-                   target: Some(target.to_array()), act: vec![], demo: None }
+                   target: Some(target.to_array()), act: vec![], demo: None, joints: None }
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub struct EntState {
     /// exploration noise, `act` (what ran) differs from `demo` (what the expert wanted).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub demo: Option<Vec<f32>>,
+    /// Articulated agents: [angle rad, rate rad/s] per joint, in `KindSpec.actuators` order.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub joints: Option<Vec<[f32; 2]>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

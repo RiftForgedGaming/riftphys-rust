@@ -20,6 +20,7 @@ members = [
     "crates/riftphys-io",
     "crates/riftphys-bridge-uriel",
     "crates/riftphys-uriel",
+    "crates/riftphys-reality",
     "crates/riftphys-riftnet",
     "tools/riftphys-vis-tool",
     "crates/riftphys-ffi",

@@ -157,6 +157,17 @@ pub struct World {
     pub(super) gravity_proc: GravitySpec,
 
     pub(super) joints: Joints,
+    /// (velocity, position) solver iterations per step; see `set_solver_iterations`
+    pub(super) solver_iters: (u32, u32),
+    /// Velocities at the start of the current step, before forces (restitution uses the
+    /// approach speed, not one that already includes this step's gravity)
+    pub(super) pre_step_vel: Vec<Velocity>,
+    /// Measured contact properties per material pair, replacing the built-in table (set from
+    /// fitting real data; see riftphys-reality). Keys are (min, max) by MaterialId order.
+    /// Linear velocity at the end of each body's last step (or as last set): the start of the
+    /// exact ballistic update. Impulses applied between steps are forces over the next step.
+    pub(super) last_lin_vel: Vec<Vec3>,
+    pub(super) pair_overrides: Vec<((riftphys_materials::materials::MaterialId, riftphys_materials::materials::MaterialId), riftphys_materials::materials::MatPairProps)>,
     pub(super) tick: u64,
     pub(super) debug: DebugSettings,
     pub ledger: Ledger,
@@ -251,6 +262,10 @@ impl World {
             pending_gravity: None,
             gravity_proc: GravitySpec::Uniform { g: [g.x, g.y, g.z] },
             joints: Joints::new(),
+            solver_iters: (20, 20),
+            pre_step_vel: Vec::new(),
+            pair_overrides: Vec::new(),
+            last_lin_vel: Vec::new(),
             tick: 0,
             debug: DebugSettings::default(),
             ledger: Ledger::new(4096),
@@ -379,6 +394,8 @@ impl World {
         let det = mass.inertia.determinant();
         let inv_inertia_local = (dynamic && det.is_finite() && det > 0.0).then(|| mass.inertia.inverse());
         let id = self.bodies.add(BodyDesc { pose, vel, inv_mass, dynamic, inv_inertia_local });
+        if self.last_lin_vel.len() <= id as usize { self.last_lin_vel.resize(id as usize + 1, Vec3::ZERO); }
+        self.last_lin_vel[id as usize] = vel.lin;
         let idx = id as usize;
         self.sleep.ensure_capacity(idx);
         self.sleep.wake(idx);
@@ -439,7 +456,10 @@ impl World {
         (a_grav, a_extra)
     }
 
-    pub fn set_body_vel(&mut self, id: BodyId, vel: Velocity) { self.bodies.set_vel(id.0, vel); }
+    pub fn set_body_vel(&mut self, id: BodyId, vel: Velocity) {
+        self.bodies.set_vel(id.0, vel);
+        if let Some(v) = self.last_lin_vel.get_mut(id.0 as usize) { *v = vel.lin; }
+    }
 
     pub fn apply_impulse(&mut self, id: BodyId, impulse: Vec3) {
         self.sleep.wake(id.0 as usize);
@@ -564,6 +584,26 @@ impl World {
     pub fn set_d6_limit_r(&mut self, id: JointId, axis: usize, limit: Option<D6Limit>) { self.joints.set_d6_limit_r(id, axis, limit); }
 
     // --- XPBD CONSTRAINT SOLVER ---
+    /// Use measured contact properties for a material pair (either order) instead of the table.
+    pub fn set_pair_props(&mut self, a: riftphys_materials::materials::MaterialId, b: riftphys_materials::materials::MaterialId, props: riftphys_materials::materials::MatPairProps) {
+        let key = if (a as u8) <= (b as u8) { (a, b) } else { (b, a) };
+        self.pair_overrides.retain(|(k, _)| *k != key);
+        self.pair_overrides.push((key, props));
+    }
+
+    /// Contact properties the solver uses for a pair: a measured override, else the table.
+    pub fn pair_props(&self, a: riftphys_materials::materials::MaterialId, b: riftphys_materials::materials::MaterialId) -> riftphys_materials::materials::MatPairProps {
+        let key = if (a as u8) <= (b as u8) { (a, b) } else { (b, a) };
+        self.pair_overrides.iter().find(|(k, _)| *k == key).map(|(_, p)| *p)
+            .unwrap_or_else(|| riftphys_materials::materials::pair_props(a, b))
+    }
+
+    /// Velocity-level (contacts, distance joints) and position-level (D6 joints + contact
+    /// projection) iterations per step; default (20, 20). Scenes that substep can use fewer.
+    pub fn set_solver_iterations(&mut self, velocity: u32, position: u32) {
+        self.solver_iters = (velocity.max(1), position.max(1));
+    }
+
     pub fn solve_joints(&mut self, dt: f32, iterations: u32) {
         // 1. Standard XPBD Solve
         self.joints.solve(&mut self.bodies, dt, iterations);

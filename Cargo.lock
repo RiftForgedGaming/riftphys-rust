@@ -2586,6 +2586,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "riftphys-reality"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "riftphys-core",
+ "riftphys-geom",
+ "riftphys-materials",
+ "riftphys-world",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "riftphys-render"
 version = "0.1.0"
 dependencies = [
@@ -2625,6 +2638,8 @@ name = "riftphys-uriel"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "riftphys-articulation",
+ "riftphys-collision",
  "riftphys-core",
  "riftphys-geom",
  "riftphys-materials",

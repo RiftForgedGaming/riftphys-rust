@@ -38,6 +38,7 @@ RiftPhys, closed loop; defined, not yet served).
 | `ang` | rad/s | world-frame angular velocity |
 | `target` | m | the agent's goal (formation slot, waypoint), when it has one |
 | `act` | actuator units | commands chosen from this sample's state (applied by the step that follows) |
+| `joints` | rad, rad/s | articulated kinds only: `[angle, rate]` per joint, in actuator order |
 | `demo` | actuator units | the expert's command for this sample's state, when a teacher exists: the imitation label. Rollouts execute a noise-perturbed copy (`act`) while recording the clean one (DART), so data covers recovering from mistakes |
 
 A sample is the state *before* the tick's step, together with the commands chosen from it, so
@@ -75,6 +76,27 @@ of N drones hold a line (N <= 3) or ring formation.
 riftphys-uriel-rollout --out hover.jsonl --episodes 60 [--drones 4] [--seed 1] [--noise 0.1] [--gust-rate 0.004]
 ```
 
+### Biped (`biped`, scenario code in `riftphys-uriel::biped`; no rollout CLI yet)
+
+80 kg: pelvis 10, torso 40 (capsule), head 4, thighs 8, shanks 4, feet 1 kg (box 0.12 x 0.06 x
+0.24 m, rubber). Spine and neck are locked hinges; six actuated hinges about the pelvis x axis,
+in order `hip_l, knee_l, ankle_l, hip_r, knee_r, ankle_r`, torque limits 200/200/120 N m. Angle
+signs: positive knee = flexion. Entity state is the pelvis plus `joints`. Control runs at 60 Hz
+with 4 physics/servo substeps (240 Hz) per tick; limb bodies carry 0.08 kg m^2 of actuator
+armature about the joint axis. Fallen: pelvis below 0.6 m or torso tilted past ~53 degrees.
+Teacher: `StandPd`.
+
+## Engine note: contacts
+
+The contact solver applied twice the impulse it accumulated, so each iteration's push was
+cancelled by the next clamp and nothing could rest on a static body; it also treated the
+narrowphase's 5 cm contact margin as penetration and had no angular terms. Now: sequential
+impulses at the contact point (lever arms through the world inverse inertia), accumulated
+Coulomb friction, the margin solved as a speculative gap, a position-level contact projection
+interleaved with the joint solve (so joints can't press loaded feet into the ground), and no
+collisions between bodies joined by a joint. Box-box narrowphase (SAT, up to 4 points) was also
+missing. Tests: `contact_resting_test`, `box_box_tests`.
+
 ## Engine note: inertia
 
 `riftphys-uriel` surfaced that `Bodies::add` ignored each body's inertia tensor and used
@@ -88,4 +110,4 @@ single-instant height check only held for the old (wrong) pendulum period.
 
 - `command` lines are defined but not served: closed-loop control (URIEL flying the drone) needs
   a host that reads commands, over a local socket or `riftnet-rust`.
-- Humanoid scenario (port from argref `uriel-agent-biped`).
+- Biped rollout CLI and demo export; a learned (URIEL) stand policy.

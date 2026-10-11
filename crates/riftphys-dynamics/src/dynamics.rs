@@ -147,6 +147,12 @@ impl Bodies {
 
     /// World-frame inverse inertia: R * I_local^-1 * R^T (glam matrices are column-major,
     /// so `from_quat` is the body-to-world rotation and its transpose is the inverse).
+    /// Body-frame inverse inertia (zero for static bodies).
+    #[inline] pub fn inv_inertia_local_of(&self, id: u32) -> Mat3 {
+        let i = self.idx(id);
+        if self.inv_mass[i] == 0.0 { Mat3::ZERO } else { self.inv_inertia_local[i] }
+    }
+
     #[inline] pub fn inv_inertia_world(&self, id: u32) -> Mat3 {
         let i = self.idx(id);
         if self.inv_mass[i] == 0.0 { return Mat3::ZERO; }
