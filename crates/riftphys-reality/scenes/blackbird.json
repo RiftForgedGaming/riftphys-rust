@@ -1,0 +1,23 @@
+{
+  "name": "blackbird",
+  "hz": 360,
+  "body": "blackbird",
+  "cmd": "blackbird",
+  "mass": 0.915,
+  "inertia": [0.0049, 0.0069, 0.0049],
+  "rotors": [
+    {"pos": [ 0.1202, 0.0,  0.1202], "spin":  1.0},
+    {"pos": [-0.1202, 0.0,  0.1202], "spin": -1.0},
+    {"pos": [-0.1202, 0.0, -0.1202], "spin":  1.0},
+    {"pos": [ 0.1202, 0.0, -0.1202], "spin": -1.0}
+  ],
+  "k_thrust": 0.01, "k_torque": 0.00016, "drag": 0.0,
+  "params": [
+    {"name": "k_thrust", "kind": "k_thrust", "min": 0.002, "max": 0.05, "init": 0.01},
+    {"name": "k_torque", "kind": "k_torque", "min": 0.00001, "max": 0.001, "init": 0.00016},
+    {"name": "drag", "kind": "drag", "min": 0.0, "max": 1.0, "init": 0.1},
+    {"name": "inertia_rp", "kind": "inertia_roll_pitch", "min": 0.3, "max": 3.0, "init": 1.0},
+    {"name": "inertia_yaw", "kind": "inertia_yaw", "min": 0.3, "max": 3.0, "init": 1.0}
+  ],
+  "notes": "PLACEHOLDER geometry: mass, inertia, arm length, rotor order and spin directions are unverified guesses, not Blackbird's published values. Before fitting real flights, set them from the Blackbird paper (IJRR 2020) and check the rotor order against the rpm channels (riftphys-fit prints a hover k_thrust estimate; rotor order shows up as roll/pitch torque sign)."
+}

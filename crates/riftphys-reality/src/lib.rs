@@ -8,6 +8,7 @@
 //! - [`fit`] + [`cmaes`]: fit unknown parameters (restitution, friction, drag, mass) on training
 //!   takes, report held-out error before and after (`riftphys-fit`).
 //! - [`synth`]: synthetic logs from known parameters, to check the pipeline (`riftphys-synth`).
+//! - [`quadrotor`]: vehicles replayed from measured rotor speeds (Blackbird-style logs).
 //!
 //! See docs/PHYSICS_FIDELITY.md.
 
@@ -15,5 +16,6 @@ pub mod analytic;
 pub mod cmaes;
 pub mod fit;
 pub mod log;
+pub mod quadrotor;
 pub mod scene;
 pub mod synth;

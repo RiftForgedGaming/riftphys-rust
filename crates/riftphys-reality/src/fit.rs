@@ -5,7 +5,16 @@
 
 use crate::cmaes;
 use crate::log::RealityLog;
-use crate::scene::{replay, windows, Scene, Window};
+use crate::scene::{Window, WindowError};
+
+/// Anything whose parameters can be fitted by replaying windows of a reality log: object scenes
+/// (`scene::Scene`) and rotor-driven vehicles (`quadrotor::QuadScene`).
+pub trait Replayable {
+    /// (name, min, max, init) per fitted parameter
+    fn params(&self) -> Vec<(String, f32, f32, f32)>;
+    fn windows(&self, log: &RealityLog, cfg: &FitConfig) -> Vec<Window>;
+    fn replay(&self, log: &RealityLog, x: &[f32], w: Window, cfg: &FitConfig) -> Option<WindowError>;
+}
 
 #[derive(Clone, Debug)]
 pub struct FitConfig {
@@ -63,8 +72,8 @@ pub fn split(log: &RealityLog, ws: &[Window], every: usize) -> (Vec<Window>, Vec
 }
 
 /// Mean RMS position error over windows at each horizon, for physical parameters `x`.
-pub fn score(scene: &Scene, log: &RealityLog, x: &[f32], ws: &[Window], vel_half: f64) -> Scores {
-    let errs: Vec<_> = ws.iter().filter_map(|w| replay(scene, log, x, *w, vel_half)).collect();
+pub fn score(scene: &dyn Replayable, log: &RealityLog, x: &[f32], ws: &[Window], cfg: &FitConfig) -> Scores {
+    let errs: Vec<_> = ws.iter().filter_map(|w| scene.replay(log, x, *w, cfg)).collect();
     let rms = HORIZONS.iter().map(|&h| {
         let v: Vec<f32> = errs.iter().filter_map(|e| e.rms_until(h)).collect();
         if v.is_empty() { f32::NAN } else { v.iter().sum::<f32>() / v.len() as f32 }
@@ -72,36 +81,37 @@ pub fn score(scene: &Scene, log: &RealityLog, x: &[f32], ws: &[Window], vel_half
     Scores { windows: errs.len(), rms }
 }
 
-fn to_phys(scene: &Scene, u: &[f64]) -> Vec<f32> {
-    scene.params.iter().zip(u).map(|(p, &v)| p.min + v as f32 * (p.max - p.min)).collect()
+fn to_phys(params: &[(String, f32, f32, f32)], u: &[f64]) -> Vec<f32> {
+    params.iter().zip(u).map(|((_, lo, hi, _), &v)| lo + v as f32 * (hi - lo)).collect()
 }
 
-pub fn fit(scene: &Scene, log: &RealityLog, cfg: &FitConfig) -> Result<FitReport, String> {
-    if scene.params.is_empty() { return Err("scene has no params to fit".into()); }
-    let ws = windows(scene, log, cfg.window, cfg.stride, cfg.vel_half, cfg.max_residual);
+pub fn fit(scene: &dyn Replayable, log: &RealityLog, cfg: &FitConfig) -> Result<FitReport, String> {
+    let params = scene.params();
+    if params.is_empty() { return Err("scene has no params to fit".into()); }
+    let ws = scene.windows(log, cfg);
     let (train, test) = split(log, &ws, cfg.holdout_every);
     if train.is_empty() || test.is_empty() {
         return Err(format!("need training and held-out windows (got {} / {} of {})", train.len(), test.len(), ws.len()));
     }
-    let x0 = scene.init_params();
-    let u0: Vec<f64> = scene.params.iter().map(|p| ((p.init - p.min) / (p.max - p.min).max(1e-12)) as f64).collect();
+    let x0: Vec<f32> = params.iter().map(|p| p.3).collect();
+    let u0: Vec<f64> = params.iter().map(|(_, lo, hi, init)| ((init - lo) / (hi - lo).max(1e-12)) as f64).collect();
     // Objective: mean RMS over the whole window, training windows only
     let full = HORIZONS.len() - 1;
     let objective = |u: &[f64]| -> f64 {
-        let s = score(scene, log, &to_phys(scene, u), &train, cfg.vel_half);
+        let s = score(scene, log, &to_phys(&params, u), &train, cfg);
         let v = s.rms[full] as f64;
         if v.is_finite() { v } else { 1e9 }
     };
     let r = cmaes::minimize(objective, &u0, 0.3, cfg.max_evals, cfg.seed);
-    let x = to_phys(scene, &r.x);
+    let x = to_phys(&params, &r.x);
     Ok(FitReport {
-        names: scene.params.iter().map(|p| p.name.clone()).collect(),
+        names: params.iter().map(|p| p.0.clone()).collect(),
         initial: x0.clone(),
         fitted: x.clone(),
-        train_before: score(scene, log, &x0, &train, cfg.vel_half),
-        train_after: score(scene, log, &x, &train, cfg.vel_half),
-        test_before: score(scene, log, &x0, &test, cfg.vel_half),
-        test_after: score(scene, log, &x, &test, cfg.vel_half),
+        train_before: score(scene, log, &x0, &train, cfg),
+        train_after: score(scene, log, &x, &train, cfg),
+        test_before: score(scene, log, &x0, &test, cfg),
+        test_after: score(scene, log, &x, &test, cfg),
         evals: r.evals,
     })
 }

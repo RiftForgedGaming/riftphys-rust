@@ -114,11 +114,49 @@ Restitution is recovered; friction is not identifiable from bounces alone (the b
 slides; capture sliding or spinning throws to fit it). The floor is bounce chaos: impact timing
 differs by up to one step and compounds over several bounces.
 
+### Rotor-driven vehicles (quadrotor scenes)
+
+`quadrotor.rs`: a body driven by **measured** rotor speeds from the log's `cmd` lines (as
+Blackbird's tachometers report them, so no motor model): thrust k_thrust (rpm/1000)^2 along body
+up at each rotor, reaction torque spin k_torque (rpm/1000)^2, linear drag. Rotor layout, mass
+and inertia come from the scene; k_thrust, k_torque, drag and inertia scales can be fitted.
+`riftphys-fit` detects a quadrotor scene (it has `rotors`), uses 0.5 s windows (open-loop
+flight diverges quickly), and prints a hover-regression estimate of k_thrust from the log.
+
+Synthetic check (60 s PD-controlled flight, poses 240 Hz with 0.3 mm noise, rotor rpm 190 Hz with
+20 rpm noise; truth k_thrust 0.01, k_torque 0.00016, drag 0.15, roll/pitch inertia x1.3):
+
+| | k_thrust | inertia_rp | drag | k_torque | held-out RMS at 0.5 s |
+|---|---|---|---|---|---|
+| initial | 0.008 | 1.0 | 0 | 0.0003 | 121 mm |
+| fitted | **0.0100** | 1.37 | 0.114 | 0.0003 | 5.4 mm |
+
+Yaw torque is not identifiable from a heading-hold flight (positions barely depend on it);
+real flights with yaw motion constrain it. Test: `recovers_thrust_coefficient_from_a_synthetic_flight`.
+
+### Blackbird logs
+
+`tools/blackbird_to_reality.py` reads a flight without ROS installed: the ROS1 bag (v2.0;
+plain or bz2 chunks, lz4 with the `lz4` module), topics `/blackbird/state`
+(geometry_msgs/PoseStamped, mocap) and `/blackbird/rotor_rpm` (blackbird/MotorRPM: Header,
+time[] sample_stamp, float32[] rpm), or the flight's CSVs (`groundTruthPoses.csv`,
+`csv/blackbird_slash_rotor_rpm.csv`, columns detected from headers; check with `--verbose`).
+Blackbird's mocap frame is NED and its body frame FRD; both map to RiftPhys by +90 degrees
+about x: (x, y, z) -> (x, -z, y). Message layouts and topics are from the dataset's own repo
+(github.com/mit-aera/Blackbird-Dataset: `msg/MotorRPM.msg`, `logConversionUtilities`).
+
+End-to-end check: the synthetic flight above written out as a NED Blackbird-style bag, converted
+back, and fitted gives identical results (hover estimate 0.00999). `python
+tools/blackbird_to_reality.py selftest` covers the bag reader.
+
+`scenes/blackbird.json` geometry (mass, inertia, arm, rotor order and spins) is a
+**placeholder**: set it from the Blackbird paper before fitting real flights, and check the
+rotor order against the rpm channels.
+
 ## 3. Next
 
-- Validate on real data: the MIT Blackbird quadrotor dataset (motor RPM + mocap ground truth;
-  ROS bags, 4.9 TB in total, chunks downloadable separately; its data host did not resolve on
-  2026-10-11). Needs a quadrotor scene with rotor-speed inputs (thrust and drag coefficients,
-  inertia, motor lag as fit parameters) and a rosbag reader.
+- Run on real Blackbird flights: its data host (blackbird-dataset.mit.edu) had no DNS record on
+  2026-10-11 from local, Google or Cloudflare resolvers. When it is back: one calibration flight
+  ("for dynamics, no camera data") first; downloads only with the user's go-ahead.
 - Own captures once mocap is set up: drops, tosses, sliding blocks, pendulums, then a Crazyflie.
 - Close the fast-joint energy gap (above) before trusting fast limb motion.

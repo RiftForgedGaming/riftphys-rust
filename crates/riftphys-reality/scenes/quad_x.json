@@ -1,0 +1,22 @@
+{
+  "name": "quad_x",
+  "hz": 240,
+  "body": "quad",
+  "cmd": "quad",
+  "mass": 0.9,
+  "inertia": [0.0050, 0.0090, 0.0050],
+  "rotors": [
+    {"pos": [ 0.12, 0.0,  0.12], "spin":  1.0},
+    {"pos": [-0.12, 0.0,  0.12], "spin": -1.0},
+    {"pos": [-0.12, 0.0, -0.12], "spin":  1.0},
+    {"pos": [ 0.12, 0.0, -0.12], "spin": -1.0}
+  ],
+  "k_thrust": 0.01, "k_torque": 0.00016, "drag": 0.0,
+  "params": [
+    {"name": "k_thrust", "kind": "k_thrust", "min": 0.004, "max": 0.03, "init": 0.008},
+    {"name": "k_torque", "kind": "k_torque", "min": 0.00002, "max": 0.0006, "init": 0.0003},
+    {"name": "drag", "kind": "drag", "min": 0.0, "max": 0.6, "init": 0.0},
+    {"name": "inertia_rp", "kind": "inertia_roll_pitch", "min": 0.4, "max": 2.5, "init": 1.0}
+  ],
+  "notes": "Generic X quadrotor for synthetic checks of the rotor-speed replay."
+}

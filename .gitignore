@@ -10,3 +10,6 @@
 *.dll
 *.lib
 /riftphys-rust dll lib package/
+
+# Python bytecode (tools/)
+__pycache__/

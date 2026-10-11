@@ -262,3 +262,15 @@ pub fn replay(scene: &Scene, log: &RealityLog, x: &[f32], w: Window, vel_half: f
     }
     Some(err)
 }
+
+impl crate::fit::Replayable for Scene {
+    fn params(&self) -> Vec<(String, f32, f32, f32)> {
+        self.params.iter().map(|p| (p.name.clone(), p.min, p.max, p.init)).collect()
+    }
+    fn windows(&self, log: &RealityLog, cfg: &crate::fit::FitConfig) -> Vec<Window> {
+        windows(self, log, cfg.window, cfg.stride, cfg.vel_half, cfg.max_residual)
+    }
+    fn replay(&self, log: &RealityLog, x: &[f32], w: Window, cfg: &crate::fit::FitConfig) -> Option<WindowError> {
+        replay(self, log, x, w, cfg.vel_half)
+    }
+}
