@@ -115,6 +115,9 @@ pub fn collide_shapes(
             collide_box_capsule(xf_b, Vec3::new(*hx, *hy, *hz), xf_a, *r, *hh, contact_dist)
                 .map(flip_manifold)
         }
+        (Box { hx: ax, hy: ay, hz: az }, Box { hx: bx, hy: by, hz: bz }) => {
+            collide_box_box(xf_a, Vec3::new(*ax, *ay, *az), xf_b, Vec3::new(*bx, *by, *bz), contact_dist)
+        }
 
         // --- NEW: TRIANGLE MATH HANDLERS ---
         (Sphere { r }, Triangle(tri)) => {
@@ -152,11 +155,104 @@ pub fn collide_shapes(
         // --- CATCH-ALL DEBUGGER ---
         (a, b) => {
             // This will tell us EXACTLY what the two shapes are that failed
-            println!("Narrowphase Dispatch Miss: {:?} vs {:?}", a, b);
+            // println!("Narrowphase Dispatch Miss: {:?} vs {:?}", a, b);
             None
         }
         _ => None,
     }
+}
+
+/* ───────────────────────── Box / Box ───────────────────────── */
+
+/// Box vs box: separating-axis test over the 15 candidate axes (3 face normals of each box and
+/// the 9 edge-edge cross products), then contact points from the vertices of either box that
+/// penetrate the other along the chosen normal, deepest 4 kept. Face axes win ties (within 5%)
+/// over edge axes so resting contacts stay stable. Normal points A -> B; `penetration` includes
+/// `contact_dist`, as for the other pairs.
+fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dist: f32) -> Option<ContactManifold> {
+    let a_axes = [xa.rot * Vec3::X, xa.rot * Vec3::Y, xa.rot * Vec3::Z];
+    let b_axes = [xb.rot * Vec3::X, xb.rot * Vec3::Y, xb.rot * Vec3::Z];
+    let (ea_a, eb_a) = (ea.to_array(), eb.to_array());
+    let t = xb.pos - xa.pos;
+
+    let radius = |axes: &[Vec3; 3], e: &[f32; 3], l: Vec3| -> f32 {
+        e[0] * axes[0].dot(l).abs() + e[1] * axes[1].dot(l).abs() + e[2] * axes[2].dot(l).abs()
+    };
+
+    // (overlap, axis, is_face)
+    let mut best: Option<(f32, Vec3, bool)> = None;
+    let mut consider = |l: Vec3, is_face: bool| -> bool {
+        let len2 = l.length_squared();
+        if len2 < 1.0e-10 { return true; } // parallel edges: no information
+        let l = l / len2.sqrt();
+        let overlap = radius(&a_axes, &ea_a, l) + radius(&b_axes, &eb_a, l) - t.dot(l).abs();
+        if overlap < -contact_dist { return false; } // separated
+        let better = match best {
+            None => true,
+            Some((o, _, face)) => {
+                if is_face == face { overlap < o } else if is_face { overlap < o * 1.05 + 1.0e-4 } else { overlap < o * 0.95 - 1.0e-4 }
+            }
+        };
+        if better { best = Some((overlap, l, is_face)); }
+        true
+    };
+    for ax in a_axes.iter().chain(b_axes.iter()) {
+        if !consider(*ax, true) { return None; }
+    }
+    for aa in a_axes.iter() {
+        for bb in b_axes.iter() {
+            if !consider(aa.cross(*bb), false) { return None; }
+        }
+    }
+    let (overlap, axis, _) = best?;
+    let n = if t.dot(axis) < 0.0 { -axis } else { axis };
+    let normal = q6_norm_vec3(n, Vec3::Y);
+
+    let corners = |x: &Isometry, e: Vec3| -> [Vec3; 8] {
+        let mut out = [Vec3::ZERO; 8];
+        for (i, c) in out.iter_mut().enumerate() {
+            let s = Vec3::new(if i & 1 == 0 { -1.0 } else { 1.0 }, if i & 2 == 0 { -1.0 } else { 1.0 }, if i & 4 == 0 { -1.0 } else { 1.0 });
+            *c = x.pos + x.rot * (s * e);
+        }
+        out
+    };
+    // Is `p` inside box (x, e) grown by `grow` on every axis?
+    let inside = |p: Vec3, x: &Isometry, e: Vec3, grow: f32| -> bool {
+        let l = x.rot.conjugate() * (p - x.pos);
+        l.x.abs() <= e.x + grow && l.y.abs() <= e.y + grow && l.z.abs() <= e.z + grow
+    };
+
+    let ra_n = radius(&a_axes, &ea_a, normal);
+    let rb_n = radius(&b_axes, &eb_a, normal);
+    let mut cands: Vec<(f32, Vec3)> = Vec::with_capacity(16);
+    // B's vertices pushed into A: depth below A's support plane along +n
+    for v in corners(xb, eb) {
+        let depth = ra_n - (v - xa.pos).dot(normal);
+        if depth > -contact_dist && inside(v, xa, ea, contact_dist + 1.0e-4) {
+            cands.push((depth, v + normal * (0.5 * depth)));
+        }
+    }
+    // A's vertices pushed into B: depth past B's support plane along -n
+    for w in corners(xa, ea) {
+        let depth = (w - xb.pos).dot(normal) + rb_n;
+        if depth > -contact_dist && inside(w, xb, eb, contact_dist + 1.0e-4) {
+            cands.push((depth, w - normal * (0.5 * depth)));
+        }
+    }
+
+    let mut manifold = ContactManifold { normal, ..Default::default() };
+    if cands.is_empty() {
+        // Edge-edge: one point between the two supports
+        let sa = xa.pos + normal * ra_n;
+        let sb = xb.pos - normal * rb_n;
+        manifold.push(ContactPoint { position: q6_vec3((sa + sb) * 0.5), normal, penetration: q6(overlap + contact_dist) });
+        return Some(manifold);
+    }
+    cands.sort_by(|p, q| q.0.partial_cmp(&p.0).unwrap_or(std::cmp::Ordering::Equal).then(p.1.x.partial_cmp(&q.1.x).unwrap_or(std::cmp::Ordering::Equal)));
+    for (depth, pos) in cands.into_iter().take(4) {
+        manifold.push(ContactPoint { position: q6_vec3(pos), normal, penetration: q6(depth + contact_dist) });
+    }
+    Some(manifold)
 }
 
 /* ───────────────────────── Sphere / Capsule Logic ───────────────────────── */
@@ -553,4 +649,47 @@ fn collide_capsule_triangle(
         }
     }
     best_m
+}
+
+#[cfg(test)]
+mod box_box_tests {
+    use super::*;
+    use riftphys_core::types::Quat;
+
+    fn iso(p: Vec3, r: Quat) -> Isometry { Isometry { pos: p, rot: r } }
+    fn bx(h: Vec3) -> Shape { Shape::Box { hx: h.x, hy: h.y, hz: h.z } }
+
+    #[test]
+    fn resting_box_gets_four_upward_contacts() {
+        let ground = (bx(Vec3::new(50.0, 0.5, 50.0)), iso(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY));
+        let foot = (bx(Vec3::new(0.06, 0.03, 0.12)), iso(Vec3::new(0.0, 0.025, 0.0), Quat::IDENTITY)); // 5 mm into the ground
+        let m = collide_shapes(&ground.0, &ground.1, &foot.0, &foot.1, 0.01).expect("contact");
+        assert_eq!(m.len, 4);
+        assert!((m.normal - Vec3::Y).length() < 1e-5, "normal {:?}", m.normal);
+        for p in &m.points[..4] {
+            assert!((p.penetration - 0.015).abs() < 1e-4, "penetration {}", p.penetration);
+        }
+        // Swapped order flips the normal
+        let m2 = collide_shapes(&foot.0, &foot.1, &ground.0, &ground.1, 0.01).expect("contact");
+        assert!((m2.normal + Vec3::Y).length() < 1e-5);
+    }
+
+    #[test]
+    fn separated_boxes_do_not_touch() {
+        let a = bx(Vec3::splat(0.5));
+        assert!(collide_shapes(&a, &iso(Vec3::ZERO, Quat::IDENTITY), &a, &iso(Vec3::new(1.2, 0.0, 0.0), Quat::IDENTITY), 0.01).is_none());
+    }
+
+    #[test]
+    fn tilted_box_touches_with_its_low_edge() {
+        let ground = bx(Vec3::new(10.0, 0.5, 10.0));
+        let b = bx(Vec3::splat(0.2));
+        let rot = Quat::from_rotation_z(0.3);
+        // Lowest point of the tilted box sits 2 mm into the ground
+        let low = 0.2 * (0.3f32.cos() + 0.3f32.sin());
+        let m = collide_shapes(&ground, &iso(Vec3::new(0.0, -0.5, 0.0), Quat::IDENTITY), &b, &iso(Vec3::new(0.0, low - 0.002, 0.0), rot), 0.0).expect("contact");
+        assert!(m.len >= 1 && m.len <= 2, "edge contact, got {} points", m.len);
+        assert!((m.normal - Vec3::Y).length() < 1e-4);
+        assert!((m.points[0].penetration - 0.002).abs() < 1e-4, "penetration {}", m.points[0].penetration);
+    }
 }

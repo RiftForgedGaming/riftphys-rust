@@ -1,6 +1,5 @@
-// crates/riftphys-world/src/world/world.rs
-
-use glam::UVec2;
+// SPDX-License-Identifier: RiftForged Proprietary License
+use std::collections::BTreeMap;
 
 use riftphys_controllers::{BalanceCtrl, BalanceParams, GuardCtrl};
 use riftphys_core::{
@@ -9,20 +8,22 @@ use riftphys_core::{
 };
 use riftphys_core::models::{AeroHandle, AeroQuery, ModelRegistry, PropHandle, PropQuery};
 
-use riftphys_articulation::{D6Joint, Joints};
-use riftphys_dynamics::{Bodies, BodyDesc};
-use riftphys_geom::{aabb_of, Aabb, MassProps, Shape};
+use riftphys_articulation::bodies::{D6Joint, Joints, D6Drive, D6Limit, JointKind};
+use riftphys_dynamics::dynamics::{Bodies, BodyDesc};
+use riftphys_geom::{aabb_of, Aabb, Shape};
+use riftphys_geom::MassProps;
 use riftphys_gravity::{eval as grav_eval, spec_id as gravity_epoch_id, GravitySpec};
-use riftphys_viz::{DebugSettings, Ledger, LedgerEvent, ScheduleRecorder};
+use riftphys_viz::viz::{DebugSettings, Ledger, LedgerEvent, ScheduleRecorder};
 
 use riftphys_collision::environment::SpatialEnvironment;
 use riftphys_collision::broadphase::GridBroadphase;
+
 use crate::world::sleep::SleepManager;
-use std::collections::BTreeMap;
-use rayon::prelude::*;
-
 use super::islands::IslandManager;
+use super::voxel_env::VoxelEnvironment;
+use riftphys_vox::VoxelChunk;
 
+pub const TERRAIN_CI: usize = u32::MAX as usize;
 pub(super) const CCD_MAX_MARGIN: f32 = 1.0e-0;
 
 /* ---------------- Controllers ---------------- */
@@ -40,7 +41,6 @@ pub(super) struct BalanceInstance {
     pub(super) ctrl: BalanceCtrl,
 }
 
-// --- NEW: KINEMATIC PLAYER CONTROLLER ---
 #[derive(Clone, Debug)]
 pub struct PlayerController {
     pub body: BodyId,
@@ -79,12 +79,14 @@ pub struct Collider {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(super) struct Contact {
-    pub(super) a_collider: usize,
-    pub(super) b_collider: usize, // Uses TERRAIN_CI if it's an environment hit
-    pub(super) normal: Vec3,      // from A -> B
-    pub(super) depth: Scalar,
-    pub(super) env_material: Option<riftphys_materials::materials::MaterialId>,
+pub struct Contact {
+    pub a_collider: usize,
+    pub b_collider: usize,
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub depth: Scalar,
+    pub env_material: Option<riftphys_materials::materials::MaterialId>,
+    pub impulse: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -145,8 +147,8 @@ pub struct World {
     pub rng: XorShift64,
 
     pub(super) schedule: ScheduleRecorder,
-    pub(super) bodies: Bodies,
-    pub(super) colliders: Vec<Collider>,
+    pub bodies: Bodies,
+    pub colliders: Vec<Collider>,
     pub(super) island_manager: IslandManager,
     pub(super) broadphase: GridBroadphase,
     pub(super) sleep: SleepManager,
@@ -155,9 +157,20 @@ pub struct World {
     pub(super) gravity_proc: GravitySpec,
 
     pub(super) joints: Joints,
+    /// (velocity, position) solver iterations per step; see `set_solver_iterations`
+    pub(super) solver_iters: (u32, u32),
+    /// Velocities at the start of the current step, before forces (restitution uses the
+    /// approach speed, not one that already includes this step's gravity)
+    pub(super) pre_step_vel: Vec<Velocity>,
+    /// Measured contact properties per material pair, replacing the built-in table (set from
+    /// fitting real data; see riftphys-reality). Keys are (min, max) by MaterialId order.
+    /// Linear velocity at the end of each body's last step (or as last set): the start of the
+    /// exact ballistic update. Impulses applied between steps are forces over the next step.
+    pub(super) last_lin_vel: Vec<Vec3>,
+    pub(super) pair_overrides: Vec<((riftphys_materials::materials::MaterialId, riftphys_materials::materials::MaterialId), riftphys_materials::materials::MatPairProps)>,
     pub(super) tick: u64,
     pub(super) debug: DebugSettings,
-    pub(super) ledger: Ledger,
+    pub ledger: Ledger,
 
     pub environments: Vec<Box<dyn SpatialEnvironment>>,
 
@@ -166,8 +179,9 @@ pub struct World {
     pub(super) accel_comps: Vec<Option<AccelComp>>,
     pub(super) balances: Vec<BalanceInstance>,
 
-    // --- NEW: KINEMATIC PLAYER CONTROLLER ARRAY ---
     pub players: Vec<PlayerController>,
+
+    pub last_frame_contacts: Vec<Contact>,
 
     pub(super) warm_cache: BTreeMap<(u32, u32), WarmImp>,
     pub(super) last_normal_impulse: Vec<f32>,
@@ -193,22 +207,14 @@ impl World {
         }
         self.ledger.push(e);
     }
-    pub fn total_impulse_sum(&self) -> f32 {
-        self.prov_impulses_sum
-    }
-    pub fn num_colliders(&self) -> Vec<Collider> {
-        self.colliders.clone()
-    }
 
-    pub fn num_broadphase_pairs(&self) -> usize {
-        self.broadphase.get_pairs()
-    }
-
+    pub fn total_impulse_sum(&self) -> f32 { self.prov_impulses_sum }
+    pub fn num_colliders(&self) -> Vec<Collider> { self.colliders.clone() }
+    pub fn num_broadphase_pairs(&self) -> usize { self.broadphase.get_pairs() }
     pub fn count_capsules(&self) -> usize {
-        self.colliders.iter().filter(|c| {
-            matches!(c.shape, Shape::Capsule { .. })
-        }).count()
+        self.colliders.iter().filter(|c| matches!(c.shape, Shape::Capsule { .. })).count()
     }
+
     #[inline]
     pub(super) fn reset_provenance(&mut self) {
         self.prov_impulses_sum = 0.0;
@@ -231,20 +237,13 @@ impl World {
     }
 
     pub fn num_bodies(&self) -> u32 { self.bodies.len() as u32 }
-    pub fn inv_mass_of(&self, id: BodyId) -> f32 {
-        self.bodies.inv_mass_of(id.0)
-    }
-    pub fn primary_shape(&self, body: BodyId) -> Option<Shape> {
-        self.colliders.iter().find(|c| c.body == body).map(|c| c.shape)
-    }
-
+    pub fn inv_mass_of(&self, id: BodyId) -> f32 { self.bodies.inv_mass_of(id.0) }
+    pub fn primary_shape(&self, body: BodyId) -> Option<Shape> { self.colliders.iter().find(|c| c.body == body).map(|c| c.shape) }
     #[inline]
     pub fn tick_index(&self) -> u64 { self.tick }
-
     pub fn for_each_collider<F: FnMut(u32, BodyId, &Shape, &Aabb)>(&self, mut f: F) {
         for (i, c) in self.colliders.iter().enumerate() { f(i as u32, c.body, &c.shape, &c.aabb); }
     }
-
     pub fn body_pose(&self, id: BodyId) -> Isometry { self.bodies.pose(id.0) }
 
     pub fn with_capacity(bodies: usize, colliders: usize) -> Self {
@@ -263,6 +262,10 @@ impl World {
             pending_gravity: None,
             gravity_proc: GravitySpec::Uniform { g: [g.x, g.y, g.z] },
             joints: Joints::new(),
+            solver_iters: (20, 20),
+            pre_step_vel: Vec::new(),
+            pair_overrides: Vec::new(),
+            last_lin_vel: Vec::new(),
             tick: 0,
             debug: DebugSettings::default(),
             ledger: Ledger::new(4096),
@@ -271,10 +274,8 @@ impl World {
             models: ModelRegistry::new(),
             accel_comps: vec![None; bodies],
             balances: Vec::new(),
-
-            // Initialize Player Vector
             players: Vec::new(),
-
+            last_frame_contacts: Vec::with_capacity(colliders * 4),
             warm_cache: BTreeMap::new(),
             last_normal_impulse: vec![0.0; bodies],
             prov_impulses_sum: 0.0,
@@ -286,28 +287,22 @@ impl World {
     }
 
     pub fn add_player(&mut self, pose: Isometry) -> usize {
-        // Create the Kinematic Ghost Body
         let id = self.add_body(pose, Velocity::default(), MassProps::infinite(), false);
-
         let pc = PlayerController::new(id);
         let hh = pc.height * 0.5;
         let r = pc.radius;
-
         self.add_collider(id, Shape::Capsule { r, hh }, riftphys_materials::materials::material(riftphys_materials::materials::MaterialId::Default));
-
         let idx = self.players.len();
         self.players.push(pc);
         idx
     }
 
-    pub fn add_environment(&mut self, env: Box<dyn SpatialEnvironment>) {
+    pub fn add_environment(&mut self, env: Box<dyn SpatialEnvironment>) { self.environments.push(env); }
+    pub fn clear_environments(&mut self) { self.environments.clear(); }
+    pub fn add_voxel_chunk(&mut self, chunk: VoxelChunk, origin: Vec3) {
+        let env = Box::new(VoxelEnvironment::new(chunk, origin));
         self.environments.push(env);
     }
-
-    pub fn clear_environments(&mut self) {
-        self.environments.clear();
-    }
-
     pub fn add_balance_controller(&mut self, pelvis: BodyId, left: BodyId, right: BodyId, params: BalanceParams) {
         self.balances.push(BalanceInstance { pelvis, left, right, ctrl: BalanceCtrl::new(params) });
     }
@@ -340,9 +335,7 @@ impl World {
     }
 
     pub fn set_body_throttle(&mut self, body: BodyId, t: f32) {
-        if let Some(Some(ac)) = self.accel_comps.get_mut(body.0 as usize) {
-            ac.throttle01 = t.clamp(0.0, 1.0);
-        }
+        if let Some(Some(ac)) = self.accel_comps.get_mut(body.0 as usize) { ac.throttle01 = t.clamp(0.0, 1.0); }
     }
 
     pub fn add_guard_controller(&mut self, pivot: BodyId, eff: BodyId, params: riftphys_controllers::GuardParams) -> JointId {
@@ -363,14 +356,14 @@ impl World {
         self.gravity = g;
         self.gravity_proc = GravitySpec::Uniform { g: [g.x, g.y, g.z] };
     }
+
     pub fn set_body_sleep_allowed(&mut self, id: BodyId, allowed: bool) {
         let idx = id.0 as usize;
-        if allowed {
-            // Logic to allow the SleepManager to process this index
-        } else {
-            self.sleep.wake(idx);
-        }
+        self.sleep.ensure_capacity(idx);
+        self.sleep.sleep_allowed[idx] = allowed;
+        if !allowed { self.sleep.wake(idx); }
     }
+
     pub fn set_epoch(&mut self, epoch: u64) { self.epoch_id = epoch; }
     pub fn set_rng_seed(&mut self, seed: u64) { self.rng = XorShift64::new(seed); }
     pub fn queue_epoch_swap(&mut self, desc: EpochDescriptor) { self.pending_epoch = Some(desc); }
@@ -383,19 +376,26 @@ impl World {
             if let GravitySpec::Uniform { g } = spec { self.gravity = Vec3::new(g[0], g[1], g[2]); }
             self.warm_cache.clear();
         }
-
         if let Some(desc) = self.pending_epoch.take() {
             self.epoch_id = epoch_id(&desc);
             self.set_gravity(Vec3::new(desc.gravity_g[0], desc.gravity_g[1], desc.gravity_g[2]));
             self.warm_cache.clear();
         }
     }
+
     pub fn num_sleeping(&self) -> usize {
         self.sleep.awake.iter().filter(|a| a.load(std::sync::atomic::Ordering::Relaxed) == 0).count()
     }
+
     pub fn add_body(&mut self, pose: Isometry, vel: Velocity, mass: MassProps, dynamic: bool) -> BodyId {
         let inv_mass = if dynamic { mass.inv_mass } else { 0.0 };
-        let id = self.bodies.add(BodyDesc { pose, vel, inv_mass, dynamic });
+        // Keep the shape's real inertia (MassProps.inertia is body-frame); the old path dropped
+        // it and used diag(inv_mass), so torques ignored a body's size and shape.
+        let det = mass.inertia.determinant();
+        let inv_inertia_local = (dynamic && det.is_finite() && det > 0.0).then(|| mass.inertia.inverse());
+        let id = self.bodies.add(BodyDesc { pose, vel, inv_mass, dynamic, inv_inertia_local });
+        if self.last_lin_vel.len() <= id as usize { self.last_lin_vel.resize(id as usize + 1, Vec3::ZERO); }
+        self.last_lin_vel[id as usize] = vel.lin;
         let idx = id as usize;
         self.sleep.ensure_capacity(idx);
         self.sleep.wake(idx);
@@ -456,8 +456,16 @@ impl World {
         (a_grav, a_extra)
     }
 
-    pub fn set_body_vel(&mut self, id: BodyId, vel: Velocity) { self.bodies.set_vel(id.0, vel); }
-    pub fn apply_impulse(&mut self, id: BodyId, impulse: Vec3) { self.bodies.apply_impulse(id.0, impulse); }
+    pub fn set_body_vel(&mut self, id: BodyId, vel: Velocity) {
+        self.bodies.set_vel(id.0, vel);
+        if let Some(v) = self.last_lin_vel.get_mut(id.0 as usize) { *v = vel.lin; }
+    }
+
+    pub fn apply_impulse(&mut self, id: BodyId, impulse: Vec3) {
+        self.sleep.wake(id.0 as usize);
+        self.bodies.apply_impulse(id.0, impulse);
+    }
+
     pub fn body_alive(&self, id: BodyId) -> bool { self.alive.get(id.0 as usize).copied().unwrap_or(0) != 0 }
 
     pub fn remove_body(&mut self, id: BodyId) -> bool {
@@ -478,9 +486,7 @@ impl World {
     }
 
     #[inline]
-    pub fn normal_force(&self, body: BodyId, dt: f32) -> f32 {
-        self.last_normal_impulse.get(body.0 as usize).copied().unwrap_or(0.0) / dt
-    }
+    pub fn normal_force(&self, body: BodyId, dt: f32) -> f32 { self.last_normal_impulse.get(body.0 as usize).copied().unwrap_or(0.0) / dt }
 
     pub fn add_ball_joint(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry) -> JointId { self.joints.add_ball(a, b, fa, fb) }
     pub fn add_hinge_joint(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry, hinge_axis: usize) -> JointId { self.joints.add_hinge(a, b, fa, fb, hinge_axis) }
@@ -489,31 +495,12 @@ impl World {
     pub fn integrate_forces(&mut self, dt: f32) {
         let count = self.bodies.len() as u32;
         for i in 0..count {
-            if !self.body_alive(BodyId(i)) || !self.bodies.is_dynamic(i) {
-                continue;
-            }
-
+            if !self.body_alive(BodyId(i)) || !self.bodies.is_dynamic(i) { continue; }
             let pose = self.bodies.pose(i);
             let mut vel = self.bodies.vel(i);
 
-            // 1. Evaluate Gravity and Extra Accelerations (Aero/Prop)
-            let (a_grav, a_extra) = Self::eval_extra_accel(
-                &self.models,
-                &self.bodies,
-                &self.accel_comps,
-                self.epoch_id,
-                self.tick,
-                i,
-                pose,
-                vel,
-                &self.gravity_proc,
-                dt,
-            );
-
-            // 2. Update Linear Velocity
+            let (a_grav, a_extra) = Self::eval_extra_accel(&self.models, &self.bodies, &self.accel_comps, self.epoch_id, self.tick, i, pose, vel, &self.gravity_proc, dt);
             vel.lin += (a_grav + a_extra) * dt;
-
-            // 3. Update Angular Velocity
             self.bodies.set_vel(i, vel);
         }
     }
@@ -521,17 +508,42 @@ impl World {
     pub fn integrate_positions(&mut self, dt: f32) {
         let count = self.bodies.len() as u32;
         for i in 0..count {
-            if !self.body_alive(BodyId(i)) || !self.bodies.is_dynamic(i) {
-                continue;
+            if !self.body_alive(BodyId(i)) || !self.bodies.is_dynamic(i) { continue; }
+            let mut pose = self.bodies.pose(i);
+            let mut vel = self.bodies.vel(i);
+
+            // --- THE FIX: Universal Shape Clamping ---
+            // Iterate ALL attached shapes to find the absolute minimum
+            // geometric thickness for this composite body.
+            let mut overall_min_thickness = f32::MAX;
+            let mut has_shapes = false;
+
+            for c in &self.colliders {
+                if c.body.0 == i {
+                    has_shapes = true;
+                    let thickness = match c.shape {
+                        Shape::Sphere { r } => r,
+                        Shape::Capsule { r, .. } => r,
+                        Shape::Box { hx, hy, hz } => hx.min(hy).min(hz),
+                        _ => 0.1,
+                    };
+                    if thickness < overall_min_thickness {
+                        overall_min_thickness = thickness;
+                    }
+                }
             }
 
-            let mut pose = self.bodies.pose(i);
-            let vel = self.bodies.vel(i);
+            if has_shapes {
+                let max_dist = overall_min_thickness * 0.9;
+                let dist = vel.lin.length() * dt;
 
-            // 1. Linear Integration
+                if dist > max_dist {
+                    vel.lin = vel.lin * (max_dist / dist);
+                    self.prov_ccd_hits = self.prov_ccd_hits.wrapping_add(1);
+                }
+            }
+
             pose.pos += vel.lin * dt;
-
-            // 2. Angular Integration
             let omega = vel.ang;
             let dq = Quat::from_xyzw(omega.x, omega.y, omega.z, 0.0) * pose.rot;
 
@@ -540,10 +552,9 @@ impl World {
             pose.rot.z += 0.5 * dt * dq.z;
             pose.rot.w += 0.5 * dt * dq.w;
 
-            // 3. Re-normalize to ensure the quaternion remains on the unit hypersphere
             pose.rot = pose.rot.normalize();
-
             self.bodies.set_pose(i, pose);
+            self.bodies.set_vel(i, vel);
         }
     }
 
@@ -555,28 +566,80 @@ impl World {
     }
 
     pub fn apply_torque(&mut self, id: BodyId, torque: Vec3) {
+        self.sleep.wake(id.0 as usize);
         let mut vel = self.bodies.vel(id.0);
         let inv_inertia = self.bodies.inv_inertia_world(id.0);
-
         vel.ang += inv_inertia * torque;
         self.bodies.set_vel(id.0, vel);
     }
 
-    // --- ROLLBACK UTILITIES ---
-    pub fn set_tick(&mut self, tick: u64) {
-        self.tick = tick;
-    }
-
-    pub fn clear_solver_caches(&mut self) {
-        self.warm_cache.clear();
-        self.last_normal_impulse.fill(0.0);
-    }
-
+    pub fn set_tick(&mut self, tick: u64) { self.tick = tick; }
+    pub fn clear_solver_caches(&mut self) { self.warm_cache.clear(); self.last_normal_impulse.fill(0.0); }
     pub fn wake_all_bodies(&mut self) {
-        for i in 0..self.bodies.len() {
-            if self.bodies.is_dynamic(i as u32) {
-                self.sleep.wake(i);
+        for i in 0..self.bodies.len() { if self.bodies.is_dynamic(i as u32) { self.sleep.wake(i); } }
+    }
+
+    pub fn set_d6_drive_r(&mut self, id: JointId, axis: usize, drive: Option<D6Drive>) { self.joints.set_d6_drive_r(id, axis, drive); }
+    pub fn set_d6_drive_t(&mut self, id: JointId, axis: usize, drive: Option<D6Drive>) { self.joints.set_d6_drive_t(id, axis, drive); }
+    pub fn set_d6_limit_r(&mut self, id: JointId, axis: usize, limit: Option<D6Limit>) { self.joints.set_d6_limit_r(id, axis, limit); }
+
+    // --- XPBD CONSTRAINT SOLVER ---
+    /// Use measured contact properties for a material pair (either order) instead of the table.
+    pub fn set_pair_props(&mut self, a: riftphys_materials::materials::MaterialId, b: riftphys_materials::materials::MaterialId, props: riftphys_materials::materials::MatPairProps) {
+        let key = if (a as u8) <= (b as u8) { (a, b) } else { (b, a) };
+        self.pair_overrides.retain(|(k, _)| *k != key);
+        self.pair_overrides.push((key, props));
+    }
+
+    /// Contact properties the solver uses for a pair: a measured override, else the table.
+    pub fn pair_props(&self, a: riftphys_materials::materials::MaterialId, b: riftphys_materials::materials::MaterialId) -> riftphys_materials::materials::MatPairProps {
+        let key = if (a as u8) <= (b as u8) { (a, b) } else { (b, a) };
+        self.pair_overrides.iter().find(|(k, _)| *k == key).map(|(_, p)| *p)
+            .unwrap_or_else(|| riftphys_materials::materials::pair_props(a, b))
+    }
+
+    /// Velocity-level (contacts, distance joints) and position-level (D6 joints + contact
+    /// projection) iterations per step; default (20, 20). Scenes that substep can use fewer.
+    pub fn set_solver_iterations(&mut self, velocity: u32, position: u32) {
+        self.solver_iters = (velocity.max(1), position.max(1));
+    }
+
+    pub fn solve_joints(&mut self, dt: f32, iterations: u32) {
+        // 1. Standard XPBD Solve
+        self.joints.solve(&mut self.bodies, dt, iterations);
+
+        // The center-to-center "HARD PROJECTION" block has been completely removed.
+        // XPBD naturally enforces positional coincidence at the localized anchor
+        // offsets defined by the Isometry parameters in the Generic6Dof constraint.
+        // Forcing an arbitrary 1.0m global distance overrides the solver and
+        // introduces infinite energy into underconstrained/shorter assemblies.
+    }
+    pub fn is_motor_driven(&self, body_id: BodyId) -> bool {
+        for kind in self.joints.kinds().iter() {
+            if let JointKind::D6(j) = kind {
+                if j.a == body_id || j.b == body_id {
+                    for axis in 0..3 {
+                        if let Some(drive) = j.r[axis].drive {
+                            if drive.vel_mode { return true; }
+                        }
+                    }
+                }
             }
+        }
+        false
+    }
+    pub fn get_joint_relative_rot(&self, id: JointId) -> Option<Quat> {
+        let kinds = self.joints.kinds();
+        if id.0 as usize >= kinds.len() { return None; }
+        match &kinds[id.0 as usize] {
+            JointKind::D6(j) => {
+                let pa = self.bodies.pose(j.a.0);
+                let pb = self.bodies.pose(j.b.0);
+                let ra = pa.rot * j.fa.rot;
+                let rb = pb.rot * j.fb.rot;
+                Some(ra.conjugate() * rb)
+            },
+            _ => None
         }
     }
 }

@@ -44,6 +44,7 @@ impl GpuRaycaster {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::downlevel_defaults()
                     .using_resolution(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::default(),
             },
             None,
         ))
@@ -116,6 +117,7 @@ impl GpuRaycaster {
             module: &shader,
             entry_point: "main",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
         });
 
         Self { device, queue, pipeline, bind_layout, _shader: shader }

@@ -1,0 +1,30 @@
+[package]
+name = "riftphys-reality"
+version = "0.1.0"
+edition = "2021"
+description = "Physics fidelity for RiftPhys: closed-form benchmarks, reality logs (mocap + commands), replay and parameter fitting"
+
+[lib]
+name = "riftphys_reality"
+path = "src/lib.rs"
+
+[[bin]]
+name = "riftphys-fidelity"
+path = "src/bin/fidelity.rs"
+
+[[bin]]
+name = "riftphys-fit"
+path = "src/bin/fit.rs"
+
+[[bin]]
+name = "riftphys-synth"
+path = "src/bin/synth.rs"
+
+[dependencies]
+riftphys-core = { path = "../riftphys-core" }
+riftphys-geom = { path = "../riftphys-geom" }
+riftphys-world = { path = "../riftphys-world" }
+riftphys-materials = { path = "../riftphys-materials" }
+glam = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"

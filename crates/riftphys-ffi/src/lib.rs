@@ -13,6 +13,7 @@ use riftphys_core::{iso, vec3, BodyId, Velocity};
 use riftphys_geom::{MassProps, Shape};
 use riftphys_materials::materials::*;
 use riftphys_world::world;
+use riftphys_world::world::world::TERRAIN_CI;
 
 /* ===================== ABI CONTRACT =====================
    - Body IDs exposed via FFI are 1-based (never 0).
@@ -103,7 +104,15 @@ fn ffi_guard<F: FnOnce() -> RPhysResult>(f: F) -> RPhysResult {
         }
     }
 }
-
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RPhysContactEvent {
+    pub body_id_a: u32,
+    pub body_id_b: u32,
+    pub position: RPhysVec3,
+    pub normal: RPhysVec3,
+    pub impulse: f32,
+}
 /* ===================== FFI TYPES ===================== */
 
 #[repr(C)]
@@ -1782,4 +1791,82 @@ pub unsafe extern "C" fn rphys_world_snapshot_free(snapshot: *mut RPhysWorldSnap
     if !snapshot.is_null() {
         let _ = unsafe { Box::from_raw(snapshot) };
     }
+}
+#[no_mangle]
+pub unsafe extern "C" fn rphys_world_get_contacts(
+    world: *const RPhysWorld,
+    out_buffer: *mut RPhysContactEvent,
+    buffer_capacity: u32,
+    out_count: *mut u32,
+) -> RPhysResult {
+    ffi_guard(|| {
+        if world.is_null() || out_count.is_null() {
+            set_last_error("rphys_world_get_contacts: null arg");
+            return RPHYS_ERR_NULL;
+        }
+
+        let w = unsafe { RPhysWorld::from_raw_ref(world) };
+        let st = match w.state.lock() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+
+        // Pull the completely solved manifolds from the previous tick
+        let internal_contacts = &st.world.last_frame_contacts;
+
+        // 1. Tell C++ how many contacts exist
+        unsafe { *out_count = internal_contacts.len() as u32 };
+
+        // 2. If C++ just wanted the count (out_buffer is null), we are done.
+        if out_buffer.is_null() {
+            return RPHYS_OK;
+        }
+
+        // 3. Prevent buffer overrun
+        let count = core::cmp::min(internal_contacts.len(), buffer_capacity as usize);
+        if count == 0 {
+            return RPHYS_OK;
+        }
+
+        // 4. Translate Rust contacts to C structs
+        let mut mapped_events = Vec::with_capacity(count);
+        for i in 0..count {
+            let c = &internal_contacts[i];
+
+            // Resolve Body A via the collider array
+            let ffi_a = match body_to_ffi_checked(st.world.colliders[c.a_collider].body, "get_contacts") {
+                Ok(id) => id,
+                Err(_) => continue, // Skip malformed IDs
+            };
+
+            // Resolve Body B or handle the Terrain Sentinel
+            let ffi_b = if c.b_collider == TERRAIN_CI {
+                RPHYS_TERRAIN_BODY_ID
+            } else {
+                match body_to_ffi_checked(st.world.colliders[c.b_collider].body, "get_contacts") {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                }
+            };
+
+            mapped_events.push(RPhysContactEvent {
+                body_id_a: ffi_a,
+                body_id_b: ffi_b,
+                position: v3_to_ffi(c.point),
+                normal: v3_to_ffi(c.normal),
+                impulse: c.impulse,
+            });
+        }
+
+        // 5. Copy the mapped structs into the C++ buffer
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                mapped_events.as_ptr(),
+                out_buffer,
+                mapped_events.len()
+            );
+        }
+
+        RPHYS_OK
+    })
 }

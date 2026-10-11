@@ -18,7 +18,7 @@ use riftphys_geom::{MassProps, Shape};
 use riftphys_materials::materials::*;
 
 use riftphys_gravity::GravitySpec;
-use riftphys_viz::DebugSettings;
+use riftphys_viz::viz::DebugSettings;
 use riftphys_aero::{CombinedAero, FlatPlateDrag, ISA, SimpleWing};
 use riftphys_acceleration::{SimplePropulsion, ThrottleCurve};
 

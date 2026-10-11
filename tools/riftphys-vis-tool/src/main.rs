@@ -1,656 +1,385 @@
-// //! riftphys-vis-tool — 3D Visual Debugger (winit 0.30 + riftphys-render/wgpu 0.20)
-//
-// mod riftnet_client;
-// use parking_lot::Mutex;
-// //
-// // Controls:
-// //   RMB + move             -> look around (360° yaw, ±89° pitch)
-// //   W/A/S/D                -> move forward/left/back/right
-// //   Q / E                  -> move down / up
-// //   [  /  ]                -> camera speed step (1×..50×), like a slider
-// //   1/2/3/4/5              -> quick speed presets (1× / 2× / 5× / 20× / 50×)
-// //   Shift                  -> temporary 1.5× speed boost
-// //   F1                     -> toggle HUD (XYZ, speed) in title
-// //   R                      -> reset camera
-// //   Space                  -> pause/unpause physics
-// //   Esc                    -> exit
-// use std::sync::Arc;
-// use std::{collections::HashSet, time::Instant};
-// use glam::{Vec3, Quat};
-// use winit::{
-//     application::ApplicationHandler,
-//     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-//     keyboard::{KeyCode, PhysicalKey},
-//     window::{Window, WindowAttributes, WindowId, CursorGrabMode},
-// };
-// use winit::event::{ElementState, WindowEvent, KeyEvent, MouseButton, DeviceEvent, DeviceId};
-// use winit::event_loop::{ActiveEventLoop, EventLoop, DeviceEvents};
-// use wgpu::SurfaceError;
-// use riftphys_render::{Renderer, Instance, ShapeKind, trs};
-// use riftphys_materials::materials::*;
-// use riftphys_viz::DebugSettings;
-// use riftphys_world::*;
-// use riftphys_core::{iso, vec3, quat_identity, Velocity, BodyId};
-// use riftphys_geom::{MassProps, Shape};
-// use riftphys_gravity::GravitySpec;
-//
-// use riftphys_aero::{CombinedAero, FlatPlateDrag, ISA, SimpleWing};
-// use riftphys_acceleration::{SimplePropulsion, ThrottleCurve};
-// use riftphys_controllers::BalanceParams;
-// /* ---------------- env helpers ---------------- */
-// fn env_u32(key: &str, default: u32) -> u32 {
-//     std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
-// }
-//
-// /* ---------------- draw collider ---------------- */
-// #[derive(Clone, Copy)]
-// struct DrawCollider {
-//     body: BodyId,
-//     shape: Shape,
-// }
-//
-// /* ---------------- scene ---------------- */
-// fn build_scene() -> (world::World, Vec<DrawCollider>, BodyId) {
-//     use std::sync::Arc;
-//
-//     let mut w = world::WorldBuilder::new().with_capacity(256, 256).build();
-//     w.set_epoch(1);
-//     w.set_rng_seed(0xBADC0FFEE);
-//     w.set_debug(DebugSettings {
-//         print_every: 20,
-//         show_bodies: false,
-//         show_contacts: false,
-//         show_impulses: false,
-//         show_energy: false,
-//         max_lines: 10,
-//         ..DebugSettings::default()
-//     });
-//
-//     let mut drawlist: Vec<DrawCollider> = Vec::new();
-//
-//     // Simple material aliases for the scene
-//     let mat_ground = material(MaterialId::Concrete);
-//     let mat_wall   = material(MaterialId::Concrete);
-//     let mat_metal  = material(MaterialId::Steel);
-//     let mat_rubber = material(MaterialId::Rubber);
-//
-//     // Ground (static, infinite mass)
-//     let ground = w.add_body(
-//         iso(vec3(0.0, 0.0, 0.0), quat_identity()),
-//         Velocity::default(),
-//         MassProps::infinite(),
-//         false,
-//     );
-//     let ground_shape = Shape::Box { hx: 10.0, hy: 0.5, hz: 10.0 };
-//     w.add_collider(ground, ground_shape, mat_ground);
-//     drawlist.push(DrawCollider { body: ground, shape: ground_shape });
-//
-//     // Wall (static, infinite mass)
-//     let wall = w.add_body(
-//         iso(vec3(-3.5, 2.0, 0.0), quat_identity()),
-//         Velocity::default(),
-//         MassProps::infinite(),
-//         false,
-//     );
-//     let wall_shape = Shape::Box { hx: 0.05, hy: 2.0, hz: 2.0 };
-//     w.add_collider(wall, wall_shape, mat_wall);
-//     drawlist.push(DrawCollider { body: wall, shape: wall_shape });
-//
-//     // Sphere (dynamic; mass from Steel density)
-//     let s = w.add_body(
-//         iso(vec3(-5.0, 2.0, 0.0), quat_identity()),
-//         Velocity { lin: vec3(20.0, 0.0, 0.0), ang: vec3(0.0, 0.0, 0.0) },
-//         MassProps::from_sphere(0.25, MaterialId::Steel),
-//         true,
-//     );
-//     let sphere_shape = Shape::Sphere { r: 0.25 };
-//     w.add_collider(s, sphere_shape, mat_metal);
-//     drawlist.push(DrawCollider { body: s, shape: sphere_shape });
-//
-//     // Capsule (dynamic; mass from Steel density)
-//     let c = w.add_body(
-//         iso(vec3(2.0, 1.5, 0.0), quat_identity()),
-//         Velocity { lin: vec3(250.0, 0.0, 0.0), ang: vec3(0.0, 0.0, 0.0) },
-//         MassProps::from_capsule(0.25, 0.5, MaterialId::Steel),
-//         true,
-//     );
-//     let capsule_shape = Shape::Capsule { r: 0.25, hh: 0.5 };
-//     w.add_collider(c, capsule_shape, mat_metal);
-//     drawlist.push(DrawCollider { body: c, shape: capsule_shape });
-//
-//     // Balance demo – pelvis (dynamic; Steel)
-//     let pelvis = w.add_body(
-//         iso(vec3(0.0, 1.20, 0.50), quat_identity()),
-//         Velocity::default(),
-//         MassProps::from_capsule(0.15, 0.35, MaterialId::Steel),
-//         true,
-//     );
-//     let pelvis_shape = Shape::Capsule { r: 0.15, hh: 0.35 };
-//     w.add_collider(pelvis, pelvis_shape, mat_metal);
-//     drawlist.push(DrawCollider { body: pelvis, shape: pelvis_shape });
-//
-//     // Feet (dynamic; Rubber so you actually see traction differences)
-//     let left_foot = w.add_body(
-//         iso(vec3(-0.37, 0.55, 0.50), quat_identity()),
-//         Velocity::default(),
-//         MassProps::from_box(vec3(0.12, 0.05, 0.25), MaterialId::Rubber),
-//         true,
-//     );
-//     let right_foot = w.add_body(
-//         iso(vec3( 0.37, 0.55, 0.50), quat_identity()),
-//         Velocity::default(),
-//         MassProps::from_box(vec3(0.12, 0.05, 0.25), MaterialId::Rubber),
-//         true,
-//     );
-//     let foot_shape = Shape::Box { hx: 0.12, hy: 0.051, hz: 0.25 };
-//     w.add_collider(left_foot,  foot_shape, mat_rubber);
-//     w.add_collider(right_foot, foot_shape, mat_rubber);
-//     drawlist.push(DrawCollider { body: left_foot,  shape: foot_shape });
-//     drawlist.push(DrawCollider { body: right_foot, shape: foot_shape });
-//
-//     w.add_balance_controller(
-//         pelvis,
-//         left_foot,
-//         right_foot,
-//         BalanceParams {
-//             k_accel: 25.0,
-//             max_accel: 40.0,
-//             com_height: 1.0,
-//             quantize: 1e-6,
-//         },
-//     );
-//
-//     // Aero/Prop stays the same
-//     let isa = ISA::default();
-//     let drag = Arc::new(FlatPlateDrag { cd: 1.0, area_m2: 0.20, isa });
-//     let drag_h = w.models_mut().register_aero(drag);
-//
-//     let aero_capsule = Arc::new(CombinedAero::new(vec![
-//         Arc::new(FlatPlateDrag { cd: 1.0, area_m2: 0.60, isa: ISA::default() }),
-//         Arc::new(SimpleWing {
-//             cl_per_rad: 6.0,
-//             stall_rad: 0.8,
-//             area_m2: 0.60,
-//             lift_dir_body: Vec3::Z,
-//             isa: ISA::default(),
-//             cd0: 0.05,
-//             k_induced: 0.05,
-//         }),
-//     ]));
-//     let prop_caps = Arc::new(SimplePropulsion {
-//         thrust_constant_n: 0.0,
-//         thrust_max_n: 3000.0,
-//         curve: ThrottleCurve::QuadEaseIn,
-//     });
-//     let aero_capsule_h = w.models_mut().register_aero(aero_capsule);
-//     let prop_caps_h    = w.models_mut().register_prop(prop_caps);
-//
-//     w.set_body_accel(s, Some(drag_h), None, 0.20, 0.0, None);
-//     w.set_body_accel(c, Some(aero_capsule_h), Some(prop_caps_h), 0.60, 0.55, None);
-//     let v0 = w.get_body_vel(c);
-//     w.set_body_vel(c, Velocity { lin: v0.lin + vec3(3.0, 0.0, 0.0), ang: v0.ang });
-//
-//     // Gravity → epoch
-//     w.queue_gravity_swap(GravitySpec::LayeredPlanet {
-//         surface_g: 9.81,
-//         radius: 6_371_000.0,
-//         center: [0.0, -6_371_000.0, 0.0],
-//         min_r: 1_000.0,
-//     });
-//
-//     (w, drawlist, s)
-// }
-//
-//
-// /* ---------------- instance build ---------------- */
-// fn build_instances(world: &world::World, drawlist: &[DrawCollider]) -> Vec<Instance> {
-//     fn color_rgb(r: u8, g: u8, b: u8) -> glam::Vec3 {
-//         glam::Vec3::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
-//     }
-//     let c_box  = color_rgb(100, 200, 255);
-//     let c_sph  = color_rgb(220, 160,  80);
-//     let c_caps = color_rgb(170, 120, 240);
-//
-//     let mut v = Vec::with_capacity(drawlist.len());
-//     for dc in drawlist {
-//         let pose = world.get_body_pose(dc.body);
-//         let p = glam::Vec3::new(pose.pos.x, pose.pos.y, pose.pos.z);
-//         // Assuming pose.rot is glam::Quat
-//         let q: Quat = pose.rot;
-//
-//         match dc.shape {
-//             Shape::Box { hx, hy, hz } => {
-//                 v.push(Instance {
-//                     model: trs(p, q, glam::Vec3::new(hx, hy, hz)),
-//                     color: c_box,
-//                     kind: ShapeKind::Box { hx, hy, hz },
-//                 });
-//             }
-//             Shape::Sphere { r } => {
-//                 v.push(Instance {
-//                     model: trs(p, q, glam::Vec3::splat(r)),
-//                     color: c_sph,
-//                     kind: ShapeKind::Sphere { r },
-//                 });
-//             }
-//             Shape::Capsule { r, hh } => {
-//                 // renderer's unit capsule has radius=1 and cylinder half-height=1,
-//                 // so half-length_unit = 1 + 1 = 2. Desired half-length = hh + r.
-//                 // Scale Y by (hh + r) / 2; XZ by r.
-//                 let sy = (hh + r) / 2.0;
-//                 v.push(Instance {
-//                     model: trs(p, q, glam::Vec3::new(r, sy, r)),
-//                     color: c_caps,
-//                     kind: ShapeKind::CapsuleY { r, hh },
-//                 });
-//             }
-//         }
-//     }
-//     v
-// }
-//
-// /* ---------------- app ---------------- */
-// struct App {
-//     renderer: Option<Renderer>,
-//     window:   Option<Arc<Window>>,
-//     world: Option<world::World>,
-//     drawlist: Vec<DrawCollider>,
-//     paused: bool,
-//     last: Instant,
-//     acc: f32,
-//     dt_fixed: f32,
-//     pressed: HashSet<KeyCode>,
-//     rmb_down: bool,
-//     last_cursor: Option<PhysicalPosition<f64>>,
-//     move_speed: f32,
-//     base_speed: f32,      // meters per second at 1.0x
-//     speed_step: usize,    // index into SPEED_STEPS
-//     show_hud: bool,
-//
-//     sphere_id: BodyId,
-//     net: Option<riftnet_client::NetViewer>,
-//     net_ents: Arc<Mutex<Vec<riftphys_riftnet::wire::NetEnt>>>,
-//
-// }
-// const SPEED_STEPS: [f32; 10] = [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 35.0, 50.0];
-//
-// impl App {
-//     fn new() -> Self {
-//         let hz = env_u32("RPHYS_HZ", 120).clamp(120, 200);
-//         let dt_fixed = (1.0 / hz as f32).max(1.0 / 200.0);
-//
-//         let (world, drawlist, sphere_id) = build_scene();
-//
-//         Self {
-//             window: None,
-//             renderer: None,
-//             world: Some(world),
-//             drawlist,
-//             paused: false,
-//             last: Instant::now(),
-//             acc: 0.0,
-//             dt_fixed,
-//             pressed: HashSet::new(),
-//             rmb_down: false,
-//             last_cursor: None,
-//             move_speed: 5.0, // m/s base
-//             sphere_id,
-//             net: None,
-//             net_ents: Arc::new(Mutex::new(Vec::new())),
-//             base_speed: 5.0,    // 5 m/s at 1x feels good; tweak if you like
-//             speed_step: 0,      // 1.0x
-//             show_hud: true,     // show XYZ + speed in window title
-//         }
-//     }
-//     fn expand_capsules(mut v: Vec<Instance>) -> Vec<Instance> {
-//         use riftphys_render::{Instance, ShapeKind, trs};
-//         let mut out = Vec::with_capacity(v.len() * 3);
-//         out.clear();
-//
-//         for inst in v.drain(..) {
-//             match inst.kind {
-//                 ShapeKind::CapsuleY { r, hh } => {
-//                     // Extract p, q, scale from model (trs produced a pure TRS)
-//                     let m = inst.model;
-//                     let p = glam::Vec3::new(m.w_axis.x, m.w_axis.y, m.w_axis.z);
-//                     // local Y axis in world (ignoring scale)
-//                     let up_ws = glam::Vec3::new(m.y_axis.x, m.y_axis.y, m.y_axis.z).normalize_or_zero();
-//                     let q = {
-//                         // Pull rotation from columns; trs made a pure rotation*scale
-//                         let x = glam::Vec3::new(m.x_axis.x, m.x_axis.y, m.x_axis.z).normalize_or_zero();
-//                         let y = up_ws;
-//                         let z = x.cross(y).normalize_or_zero();
-//                         let rot = glam::Mat3::from_cols(x, y, z);
-//                         glam::Quat::from_mat3(&rot)
-//                     };
-//
-//                     // (1) cylinder as a box of half-extents (r, hh, r)
-//                     out.push(Instance {
-//                         model: trs(p, q, glam::Vec3::new(r, hh, r)),
-//                         color: inst.color,
-//                         kind: ShapeKind::Box { hx: r, hy: hh, hz: r },
-//                     });
-//
-//                     // (2) top sphere at +hh along local Y
-//                     let p_top = p + up_ws * hh;
-//                     out.push(Instance {
-//                         model: trs(p_top, q, glam::Vec3::splat(r)),
-//                         color: inst.color,
-//                         kind: ShapeKind::Sphere { r },
-//                     });
-//
-//                     // (3) bottom sphere at -hh along local Y
-//                     let p_bot = p - up_ws * hh;
-//                     out.push(Instance {
-//                         model: trs(p_bot, q, glam::Vec3::splat(r)),
-//                         color: inst.color,
-//                         kind: ShapeKind::Sphere { r },
-//                     });
-//                 }
-//                 _ => out.push(inst),
-//             }
-//         }
-//         out
-//     }
-//
-//     fn on_resize(&mut self, size: PhysicalSize<u32>) {
-//         if let Some(r) = self.renderer.as_mut() {
-//             r.resize(size.width.max(1), size.height.max(1));
-//         }
-//     }
-//
-//     fn handle_key(&mut self, ke: &KeyEvent, el: &ActiveEventLoop) {
-//         if let PhysicalKey::Code(code) = ke.physical_key {
-//             match ke.state {
-//                 ElementState::Pressed => {
-//                     // on-press actions
-//                     match code {
-//                         KeyCode::Escape => { el.exit(); return; }
-//                         KeyCode::Space  => { self.paused = !self.paused; }
-//                         KeyCode::KeyR   => {
-//                             if let Some(r) = self.renderer.as_mut() {
-//                                 r.camera.eye   = Vec3::new(-6.0, 4.0, 6.0);
-//                                 r.camera.yaw   = 45_f32.to_radians();
-//                                 r.camera.pitch = (-15_f32).to_radians();
-//                             }
-//                         }
-//                         _ => {}
-//                     }
-//                     match code {
-//                         KeyCode::Escape => { el.exit(); return; }
-//                         KeyCode::Space  => { self.paused = !self.paused; }
-//                         KeyCode::KeyR   => {
-//                             if let Some(r) = self.renderer.as_mut() {
-//                                 r.camera.eye   = Vec3::new(-6.0, 4.0, 6.0);
-//                                 r.camera.yaw   = 45_f32.to_radians();
-//                                 r.camera.pitch = (-15_f32).to_radians();
-//                             }
-//                         }
-//                         // --- NEW: speed “slider” like PVD ---
-//                         KeyCode::BracketLeft => {                 // step down
-//                             if self.speed_step > 0 { self.speed_step -= 1; }
-//                         }
-//                         KeyCode::BracketRight => {                // step up
-//                             if self.speed_step + 1 < SPEED_STEPS.len() { self.speed_step += 1; }
-//                         }
-//                         // quick presets
-//                         KeyCode::Digit1 => { self.speed_step = 0; } // 1.0x
-//                         KeyCode::Digit2 => { self.speed_step = 2; } // 2.0x
-//                         KeyCode::Digit3 => { self.speed_step = 4; } // 5.0x
-//                         KeyCode::Digit4 => { self.speed_step = 7; } // 20x
-//                         KeyCode::Digit5 => { self.speed_step = 9; } // 50x
-//
-//                         // HUD toggle (XYZ + speed in title)
-//                         KeyCode::F1 => { self.show_hud = !self.show_hud; }
-//
-//                         _ => {}
-//                     }
-//
-//                     self.pressed.insert(code);
-//                 }
-//                 ElementState::Released => {
-//                     self.pressed.remove(&code);
-//                 }
-//             }
-//         }
-//     }
-//
-//     fn handle_mouse(&mut self, event: &WindowEvent) {
-//         let window = match self.window.as_ref() { Some(w) => w, None => return };
-//         match *event {
-//             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
-//                 self.rmb_down = state == ElementState::Pressed;
-//                 let _ = window.set_cursor_grab(if self.rmb_down { CursorGrabMode::Locked } else { CursorGrabMode::None });
-//                 window.set_cursor_visible(!self.rmb_down);
-//                 self.last_cursor = None; // optional: no longer needed
-//             }
-//             _ => {}
-//         }
-//     }
-//
-//
-//     fn update_camera(&mut self, dt: f32) {
-//         let mut dir = Vec3::ZERO;
-//         let shift_down = self.pressed.contains(&KeyCode::ShiftLeft) || self.pressed.contains(&KeyCode::ShiftRight);
-//
-//         if let Some(r) = self.renderer.as_ref() {
-//             if self.pressed.contains(&KeyCode::KeyW) { dir += r.camera.forward(); }
-//             if self.pressed.contains(&KeyCode::KeyS) { dir -= r.camera.forward(); }
-//             if self.pressed.contains(&KeyCode::KeyD) { dir += r.camera.right();   }
-//             if self.pressed.contains(&KeyCode::KeyA) { dir -= r.camera.right();   }
-//             if self.pressed.contains(&KeyCode::KeyE) { dir += Vec3::Y; }
-//             if self.pressed.contains(&KeyCode::KeyQ) { dir -= Vec3::Y; }
-//         }
-//
-//         if let Some(r) = self.renderer.as_mut() {
-//             if dir.length_squared() > 1e-6 {
-//                 let step_scale = SPEED_STEPS[self.speed_step];
-//                 let boost = if shift_down { 1.5 } else { 1.0 };
-//                 let speed = self.base_speed * step_scale * boost;
-//                 r.camera.eye += dir.normalize() * speed * dt;
-//             }
-//
-//             // HUD: camera XYZ + speed in window title (cheap & always visible)
-//             if self.show_hud {
-//                 if let Some(w) = self.window.as_ref() {
-//                     let p = r.camera.eye;
-//                     let step_scale = SPEED_STEPS[self.speed_step];
-//                     let boost = if shift_down { " (SHIFT ×1.5)" } else { "" };
-//                     w.set_title(&format!(
-//                         "riftphys-vis-tool  |  Cam: X={:+.2} Y={:+.2} Z={:+.2}  |  Speed: {:.1}x{}",
-//                         p.x, p.y, p.z, step_scale, boost
-//                     ));
-//                 }
-//             }
-//         }
-//     }
-//
-//
-//     fn step_world(&mut self, dt_real: f32) {
-//         self.acc += dt_real.min(0.25);
-//         if self.paused { return; }
-//         if let Some(w) = self.world.as_mut() {
-//             while self.acc >= self.dt_fixed {
-//                 w.step(self.dt_fixed);
-//                 self.acc -= self.dt_fixed;
-//             }
-//         }
-//     }
-//
-//     fn render(&mut self) {
-//         let r = match self.renderer.as_mut() { Some(r) => r, None => return };
-//         fn color_for(kind: u32, scale: glam::Vec3, id: u32) -> glam::Vec3 {
-//             // Heuristic: very large spheres => planet
-//             if kind == 1 && scale.max_element() > 1.0e5 {
-//                 return glam::Vec3::new(0.35, 0.45, 0.95); // planet: cool blue
-//             }
-//             match kind {
-//                 1 => glam::Vec3::new(0.95, 0.85, 0.45),       // small spheres: warm gold
-//                 2 => glam::Vec3::new(0.30, 0.82, 0.62),       // boxes: teal
-//                 3 => glam::Vec3::new(0.86, 0.42, 0.88),       // capsules: magenta
-//                 _ => { // fallback: hash id to a pastel
-//                     let h = id.wrapping_mul(2654435761);
-//                     let r = ((h >>  0) & 255) as f32 / 255.0;
-//                     let g = ((h >>  8) & 255) as f32 / 255.0;
-//                     let b = ((h >> 16) & 255) as f32 / 255.0;
-//                     glam::Vec3::new(0.6 + 0.4*r, 0.6 + 0.4*g, 0.6 + 0.4*b)
-//                 }
-//             }
-//         }
-//
-//         // try net instances first
-//         let mut net_instances = Vec::new();
-//         {
-//             let ents = self.net_ents.lock();
-//             if !ents.is_empty() {
-//                 net_instances.reserve(ents.len());
-//                 for e in ents.iter() {
-//                     let p = glam::Vec3::new(e.px, e.py, e.pz);
-//                     let q = glam::Quat::from_xyzw(e.qx, e.qy, e.qz, e.qw);
-//                     let scale = glam::Vec3::new(e.sx, e.sy, e.sz);
-//                     let kind = match e.kind {
-//                         1 => ShapeKind::Sphere { r: e.sx },
-//                         2 => ShapeKind::Box    { hx: e.sx, hy: e.sy, hz: e.sz },
-//                         3 => {
-//                             let hh = 2.0 * e.sy - e.sx;             // sy = (hh + r)/2
-//                             ShapeKind::CapsuleY { r: e.sx, hh }
-//                         }
-//                         _ => ShapeKind::Sphere { r: 0.25 },
-//                     };
-//                     let color = color_for(e.kind, scale, e.id);     // <— use the helper
-//                     net_instances.push(Instance {
-//                         model: trs(p, q, scale),
-//                         color,
-//                         kind,
-//                     });
-//
-//                 }
-//             }
-//         }
-//
-//         let instances =
-//             if !net_instances.is_empty() {
-//                 Self::expand_capsules(net_instances)
-//             } else {
-//                 let w = match self.world.as_ref() { Some(w) => w, None => return };
-//                 Self::expand_capsules(build_instances(w, &self.drawlist))
-//             };
-//         //
-//         // let instances =
-//         //     if !net_instances.is_empty() {
-//         //         net_instances
-//         //     } else {
-//         //         // fall back to local world (your existing path)
-//         //         let w = match self.world.as_ref() { Some(w) => w, None => return };
-//         //         build_instances(w, &self.drawlist)
-//         //     };
-//
-//         match r.render(&instances) {
-//             Ok(()) => {}
-//             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-//                 if let Some(win) = self.window.as_ref() {
-//                     let size = win.inner_size();
-//                     r.resize(size.width.max(1), size.height.max(1));
-//                 }
-//             }
-//             Err(wgpu::SurfaceError::OutOfMemory) => std::process::exit(1),
-//             Err(_) => {}
-//         }
-//     }
-//
-// }
-//
-// impl ApplicationHandler for App {
-//     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-//         if !self.rmb_down { return; }
-//         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-//             if let Some(r) = self.renderer.as_mut() {
-//                 let sens = 0.0018; // tune
-//                 r.camera.add_yaw_pitch(-(dx as f32) * sens, -(dy as f32) * sens);
-//             }
-//         }
-//     }
-//
-//
-//     fn resumed(&mut self, el: &ActiveEventLoop) {
-//         let attrs = WindowAttributes::default()
-//             .with_title("riftphys-vis-tool (3D)")
-//             .with_inner_size(LogicalSize::new(1280.0, 800.0));
-//
-//         let window = Arc::new(el.create_window(attrs).expect("window"));
-//         el.listen_device_events(DeviceEvents::Always);
-//
-//         // renderer first
-//         let mut renderer = pollster::block_on(Renderer::new(window.clone()));
-//         let size = window.inner_size();
-//         renderer.resize(size.width.max(1), size.height.max(1));
-//         renderer.camera.eye   = Vec3::new(-6.0, 4.0, 6.0);
-//         renderer.camera.yaw   = 45_f32.to_radians();
-//         renderer.camera.pitch = (-15_f32).to_radians();
-//
-//         // OPTIONAL net connect (only if env is set)
-//         if std::env::var("RIFT_VIEW_NET").ok().as_deref() == Some("1") {
-//             if let Some(nc) = riftnet_client::NetViewer::connect("127.0.0.1", 49111, self.net_ents.clone()) {
-//                 self.net = Some(nc);
-//                 eprintln!("RiftNet: connected to 127.0.0.1:49111");
-//             } else {
-//                 eprintln!("RiftNet: connect failed (no DLL or server). Running offline.");
-//             }
-//         } else {
-//             eprintln!("RiftNet: disabled (set RIFT_VIEW_NET=1 to enable).");
-//         }
-//
-//         self.renderer = Some(renderer);
-//         self.window   = Some(window);
-//         self.last = Instant::now();
-//
-//         if let Some(w) = self.window.as_ref() { w.request_redraw(); }
-//     }
-//
-//
-//
-//     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-//         if self.window.as_ref().map(|w| w.id()) != Some(id) {
-//             return;
-//         }
-//         match event {
-//             WindowEvent::CloseRequested => el.exit(),
-//             WindowEvent::Resized(sz) => self.on_resize(sz),
-//             WindowEvent::ScaleFactorChanged { .. } => {
-//                 if let Some(win) = self.window.as_ref() {
-//                     self.on_resize(win.inner_size());
-//                 }
-//             }
-//             WindowEvent::RedrawRequested => {
-//                 // dt for camera/world
-//                 let now = Instant::now();
-//                 let dt_real = (now - self.last).as_secs_f32();
-//                 self.last = now;
-//
-//                 self.update_camera(dt_real);
-//                 self.step_world(dt_real);
-//                 self.render();
-//             }
-//             WindowEvent::KeyboardInput { event: ref ke, .. } => self.handle_key(ke, el),
-//             _ => {
-//                 self.handle_mouse(&event);
-//             }
-//         }
-//     }
-//
-//     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-//         if let Some(win) = self.window.as_ref() {
-//             win.request_redraw();
-//         }
-//         if let Some(n) = &self.net { n.poll(); }
-//         if let Some(win) = self.window.as_ref() { win.request_redraw(); }
-//
-//     }
-// }
-//
-// fn main() -> anyhow::Result<()> {
-//     let event_loop = EventLoop::new()?;
-//     let mut app = App::new();
-//     event_loop.run_app(&mut app)?;
-//     Ok(())
-// }
+//! riftphys-vis-tool — 3D Visual Debugger (winit 0.30 + riftphys-render/wgpu 22.0 + egui 0.29)
+use std::sync::Arc;
+use std::{collections::HashSet, time::Instant};
+use glam::{Vec3, Quat};
+use parking_lot::Mutex;
+use winit::{
+    application::ApplicationHandler,
+    dpi::{LogicalSize, PhysicalSize},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{Window, WindowAttributes, WindowId, CursorGrabMode},
+};
+use winit::event::{ElementState, WindowEvent, KeyEvent, MouseButton, DeviceEvent, DeviceId};
+use winit::event_loop::{ActiveEventLoop, EventLoop, DeviceEvents};
+use riftphys_render::{Renderer, Instance, ShapeKind, trs};
+
+use egui_wgpu::Renderer as EguiRenderPass;
+use egui_wgpu::ScreenDescriptor;
+use egui_winit::State as EguiWinitState;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct NetEnt {
+    pub id: u32, pub kind: u32,
+    pub px: f32, pub py: f32, pub pz: f32,
+    pub qx: f32, pub qy: f32, pub qz: f32, pub qw: f32,
+    pub sx: f32, pub sy: f32, pub sz: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct OversightCommand {
+    pub gravity_y: f32,
+    pub drop_height: f32,
+    pub force_reset: u32,
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+struct App {
+    renderer: Option<Renderer>,
+    window: Option<Arc<Window>>,
+    last: Instant,
+    pressed: HashSet<KeyCode>,
+    rmb_down: bool,
+    move_speed: f32,
+    base_speed: f32,
+    speed_step: usize,
+
+    udp_socket: Option<std::net::UdpSocket>,
+    net_ents: Arc<Mutex<Vec<NetEnt>>>,
+
+    oversight_socket: Option<std::net::UdpSocket>,
+    target_gravity: f32,
+    target_drop_height: f32,
+
+    egui_ctx: egui::Context,
+    egui_winit_state: Option<EguiWinitState>,
+    egui_renderer: Option<EguiRenderPass>,
+}
+
+const SPEED_STEPS: [f32; 10] = [1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 35.0, 50.0];
+
+impl App {
+    fn new() -> Self {
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:49111").ok();
+        if let Some(sock) = &udp_socket {
+            sock.set_nonblocking(true).unwrap();
+            eprintln!("Native UDP Listener active on 127.0.0.1:49111");
+        } else {
+            eprintln!("Failed to bind UDP 49111.");
+        }
+
+        let oversight_socket = std::net::UdpSocket::bind("127.0.0.1:0").ok();
+
+        Self {
+            window: None,
+            renderer: None,
+            last: Instant::now(),
+            pressed: HashSet::new(),
+            rmb_down: false,
+            move_speed: 5.0,
+            base_speed: 5.0,
+            speed_step: 0,
+            udp_socket,
+            net_ents: Arc::new(Mutex::new(Vec::new())),
+            oversight_socket,
+            target_gravity: -9.81,
+            target_drop_height: 0.005,
+
+            egui_ctx: egui::Context::default(),
+            egui_winit_state: None,
+            egui_renderer: None,
+        }
+    }
+
+    fn send_oversight(&self, force_reset: u32) {
+        if let Some(sock) = &self.oversight_socket {
+            let cmd = OversightCommand {
+                gravity_y: self.target_gravity,
+                drop_height: self.target_drop_height,
+                force_reset,
+            };
+
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    &cmd as *const _ as *const u8,
+                    std::mem::size_of::<OversightCommand>()
+                )
+            };
+            let _ = sock.send_to(bytes, "127.0.0.1:49112");
+        }
+    }
+
+    fn on_resize(&mut self, size: PhysicalSize<u32>) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.resize(size.width.max(1), size.height.max(1));
+        }
+    }
+
+    fn handle_key(&mut self, ke: &KeyEvent, el: &ActiveEventLoop) {
+        if let PhysicalKey::Code(code) = ke.physical_key {
+            match ke.state {
+                ElementState::Pressed => {
+                    match code {
+                        KeyCode::Escape => { el.exit(); return; }
+                        KeyCode::KeyR   => {
+                            if let Some(r) = self.renderer.as_mut() {
+                                r.camera.eye   = Vec3::new(-6.0, 4.0, 6.0);
+                                r.camera.yaw   = 45_f32.to_radians();
+                                r.camera.pitch = (-15_f32).to_radians();
+                            }
+                        }
+                        KeyCode::BracketLeft => { if self.speed_step > 0 { self.speed_step -= 1; } }
+                        KeyCode::BracketRight => { if self.speed_step + 1 < SPEED_STEPS.len() { self.speed_step += 1; } }
+                        KeyCode::Digit1 => { self.speed_step = 0; }
+                        KeyCode::Digit2 => { self.speed_step = 2; }
+                        KeyCode::Digit3 => { self.speed_step = 4; }
+                        KeyCode::Digit4 => { self.speed_step = 7; }
+                        KeyCode::Digit5 => { self.speed_step = 9; }
+                        _ => {}
+                    }
+                    self.pressed.insert(code);
+                }
+                ElementState::Released => { self.pressed.remove(&code); }
+            }
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &WindowEvent) {
+        let window = match self.window.as_ref() { Some(w) => w, None => return };
+        if let WindowEvent::MouseInput { state, button: MouseButton::Right, .. } = *event {
+            self.rmb_down = state == ElementState::Pressed;
+            let _ = window.set_cursor_grab(if self.rmb_down { CursorGrabMode::Locked } else { CursorGrabMode::None });
+            window.set_cursor_visible(!self.rmb_down);
+        }
+    }
+
+    fn update_camera(&mut self, dt: f32) {
+        let mut dir = Vec3::ZERO;
+        let shift_down = self.pressed.contains(&KeyCode::ShiftLeft) || self.pressed.contains(&KeyCode::ShiftRight);
+
+        if let Some(r) = self.renderer.as_mut() {
+            if self.pressed.contains(&KeyCode::KeyW) { dir += r.camera.forward(); }
+            if self.pressed.contains(&KeyCode::KeyS) { dir -= r.camera.forward(); }
+            if self.pressed.contains(&KeyCode::KeyD) { dir += r.camera.right();   }
+            if self.pressed.contains(&KeyCode::KeyA) { dir -= r.camera.right();   }
+            if self.pressed.contains(&KeyCode::KeyE) { dir += Vec3::Y; }
+            if self.pressed.contains(&KeyCode::KeyQ) { dir -= Vec3::Y; }
+
+            if dir.length_squared() > 1e-6 {
+                let step_scale = SPEED_STEPS[self.speed_step];
+                let boost = if shift_down { 1.5 } else { 1.0 };
+                let speed = self.base_speed * step_scale * boost;
+                r.camera.eye += dir.normalize() * speed * dt;
+            }
+        }
+    }
+
+    fn render(&mut self) {
+        let r = match self.renderer.as_mut() { Some(r) => r, None => return };
+        let egui_state = match self.egui_winit_state.as_mut() { Some(s) => s, None => return };
+        let egui_renderer = match self.egui_renderer.as_mut() { Some(er) => er, None => return };
+        let window = match self.window.as_ref() { Some(w) => w, None => return };
+
+        let mut net_instances = Vec::new();
+        {
+            let ents = self.net_ents.lock();
+            for e in ents.iter() {
+                let p = Vec3::new(e.px, e.py, e.pz);
+                let q = Quat::from_xyzw(e.qx, e.qy, e.qz, e.qw);
+
+                // THE FIX: The base mesh is a 1x1x1 unit cube.
+                // Multiply the physics half-extents by 2.0 to get total visual width.
+                let scale = Vec3::new(e.sx * 2.0, e.sy * 2.0, e.sz * 2.0);
+
+                let kind = match e.kind {
+                    1 => ShapeKind::Sphere { r: e.sx },
+                    2 => ShapeKind::Box    { hx: e.sx, hy: e.sy, hz: e.sz },
+                    3 => ShapeKind::CapsuleY { r: e.sx, hh: e.sy },
+                    _ => ShapeKind::Sphere { r: 0.25 },
+                };
+
+                let color = if e.id == 99 {
+                    Vec3::new(0.25, 0.25, 0.25)
+                } else if e.id == 0 {
+                    Vec3::new(1.0, 0.0, 0.0)
+                } else {
+                    Vec3::new(0.0, 0.5, 1.0)
+                };
+
+                net_instances.push(Instance {
+                    model: trs(p, q, scale),
+                    color,
+                    kind,
+                });
+            }
+        }
+
+        let raw_input = egui_state.take_egui_input(window.as_ref());
+        self.egui_ctx.begin_pass(raw_input);
+
+        let mut local_gravity = self.target_gravity;
+        let mut local_drop = self.target_drop_height;
+        let mut force_reset = 0;
+
+        egui::Window::new("URIEL OVERSIGHT")
+            .fixed_pos(egui::pos2(20.0, 20.0))
+            .show(&self.egui_ctx, |ui| {
+                ui.heading("Physics Parameters");
+                ui.add_space(5.0);
+
+                ui.add(egui::Slider::new(&mut local_gravity, -20.0..=0.0).text("Gravity (y)"));
+                ui.add(egui::Slider::new(&mut local_drop, 0.00..=1.0).text("Drop Height"));
+
+                ui.add_space(10.0);
+
+                if ui.button("EXECUTE FORCED RESET").clicked() {
+                    force_reset = 1;
+                }
+            });
+
+        let changed = (local_gravity != self.target_gravity) || (local_drop != self.target_drop_height);
+        self.target_gravity = local_gravity;
+        self.target_drop_height = local_drop;
+
+        if changed || force_reset == 1 {
+            if let Some(sock) = &self.oversight_socket {
+                let cmd = OversightCommand {
+                    gravity_y: self.target_gravity,
+                    drop_height: self.target_drop_height,
+                    force_reset,
+                };
+
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        &cmd as *const _ as *const u8,
+                        std::mem::size_of::<OversightCommand>()
+                    )
+                };
+                let _ = sock.send_to(bytes, "127.0.0.1:49112");
+            }
+        }
+
+        let full_output = self.egui_ctx.end_pass();
+        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [r.width(), r.height()],
+            pixels_per_point: window.scale_factor() as f32,
+        };
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            egui_renderer.update_texture(r.device(), r.queue(), *id, image_delta);
+        }
+
+        match r.render(&net_instances, egui_renderer, &paint_jobs, &screen_descriptor) {
+            Ok(()) => {}
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                r.resize(window.inner_size().width.max(1), window.inner_size().height.max(1));
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => std::process::exit(1),
+            Err(_) => {}
+        }
+
+        for id in &full_output.textures_delta.free {
+            egui_renderer.free_texture(id);
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if !self.rmb_down { return; }
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if let Some(r) = self.renderer.as_mut() {
+                r.camera.add_yaw_pitch(-(dx as f32) * 0.0018, -(dy as f32) * 0.0018);
+            }
+        }
+    }
+
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let attrs = WindowAttributes::default()
+            .with_title("URIEL OVERSIGHT")
+            .with_inner_size(LogicalSize::new(1280.0, 800.0));
+
+        let window = Arc::new(el.create_window(attrs).expect("window"));
+        el.listen_device_events(DeviceEvents::Always);
+
+        let mut renderer = pollster::block_on(Renderer::new(window.clone()));
+        renderer.resize(window.inner_size().width.max(1), window.inner_size().height.max(1));
+        renderer.camera.eye   = Vec3::new(-6.0, 4.0, 6.0);
+        renderer.camera.yaw   = 45_f32.to_radians();
+        renderer.camera.pitch = (-15_f32).to_radians();
+
+        let egui_winit_state = EguiWinitState::new(
+            self.egui_ctx.clone(),
+            egui::viewport::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
+        let egui_renderer = EguiRenderPass::new(renderer.device(), renderer.format(), None, 1, false);
+
+        self.renderer = Some(renderer);
+        self.window   = Some(window);
+        self.egui_winit_state = Some(egui_winit_state);
+        self.egui_renderer = Some(egui_renderer);
+        self.last = Instant::now();
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self.window.as_ref().map(|w| w.id()) != Some(id) { return; }
+
+        if let Some(state) = self.egui_winit_state.as_mut() {
+            let res = state.on_window_event(self.window.as_ref().unwrap(), &event);
+            if res.consumed { return; }
+        }
+
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Resized(sz) => self.on_resize(sz),
+            WindowEvent::RedrawRequested => {
+                let now = Instant::now();
+                let dt_real = (now - self.last).as_secs_f32();
+                self.last = now;
+
+                self.update_camera(dt_real);
+                self.render();
+            }
+            WindowEvent::KeyboardInput { event: ref ke, .. } => self.handle_key(ke, el),
+            _ => self.handle_mouse(&event),
+        }
+    }
+
+    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        if let Some(sock) = &self.udp_socket {
+            let mut buf = [0u32; 16384];
+            let byte_buf = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, 65536)
+            };
+
+            while let Ok((amt, _)) = sock.recv_from(byte_buf) {
+                let n_ents = amt / std::mem::size_of::<NetEnt>();
+                let slice = unsafe {
+                    std::slice::from_raw_parts(buf.as_ptr() as *const NetEnt, n_ents)
+                };
+                let mut out = self.net_ents.lock();
+                out.clear();
+                out.extend_from_slice(slice);
+            }
+        }
+
+        if let Some(win) = self.window.as_ref() { win.request_redraw(); }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let event_loop = EventLoop::new()?;
+    let mut app = App::new();
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}

@@ -12,6 +12,7 @@ Version 2.0 marks the transition from the experimental V1.0 (MIT) to a proprieta
 * **Kinematic Player Controllers:** Built-in player controllers with collision geometry (capsules), continuous collision detection, and slope-handling parameters, exposed directly to the FFI.
 * **Bulletproof FFI Boundary:** Strict ABI contract utilizing 1-based indexing to prevent zero-index null pointer errors, with explicit terrain sentinel handling.
 
+
 ## Architecture Guidelines
 
 RiftPhys operates on a "build architecture before building code" philosophy. When interfacing with the engine via C/C++:

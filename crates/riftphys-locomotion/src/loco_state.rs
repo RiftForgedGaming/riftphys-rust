@@ -5,24 +5,24 @@ const Q6: f32 = 1.0e-6;
 const US_PER_S: f32 = 1.0e6;
 
 #[inline]
-fn q6(x: f32) -> f32 {
+pub fn q6(x: f32) -> f32 {
     if x.is_finite() { (x * US_PER_S).round() * Q6 } else { 0.0 }
 }
 
 #[inline]
-fn q6_vec3(v: Vec3) -> Vec3 {
+pub fn q6_vec3(v: Vec3) -> Vec3 {
     Vec3::new(q6(v.x), q6(v.y), q6(v.z))
 }
 
 #[inline]
-fn sec_to_us(x: f32) -> u32 {
+pub fn sec_to_us(x: f32) -> u32 {
     if !x.is_finite() { return 0; }
     let v = (x.max(0.0) * US_PER_S).round();
     v.clamp(0.0, u32::MAX as f32) as u32
 }
 
 #[inline]
-fn us_to_q01(us: u32, denom: u32) -> f32 {
+pub fn us_to_q01(us: u32, denom: u32) -> f32 {
     if denom == 0 { return 0.0; }
     q6((us as f32) / (denom as f32))
 }
@@ -60,7 +60,7 @@ pub struct FootClock {
 }
 
 impl FootClock {
-    pub fn new(stance: f32, swing: f32) -> Self {
+      pub fn new(stance: f32, swing: f32) -> Self {
         let stance = q6(stance.max(0.0));
         let swing  = q6(swing.max(0.0));
 
@@ -186,12 +186,21 @@ pub struct LocoState {
 impl LocoState {
     pub fn new(pelvis: u32, left: u32, right: u32, spec: GaitSpec) -> Self {
         let spec = spec.sanitized();
+
+        let mut left_clk = FootClock::new(spec.stance_dur, spec.swing_dur);
+        let mut right_clk = FootClock::new(spec.stance_dur, spec.swing_dur);
+
+        // Offset the right leg by exactly half the cycle to establish an alternating bipedal gait.
+        // This ensures one foot is always grounded while the other executes its swing hermite curve.
+        let half_cycle = (spec.stance_dur + spec.swing_dur) * 0.5;
+        right_clk.step_gate(half_cycle);
+
         Self {
             pelvis,
             left,
             right,
-            left_clk:  FootClock::new(spec.stance_dur, spec.swing_dur),
-            right_clk: FootClock::new(spec.stance_dur, spec.swing_dur),
+            left_clk,
+            right_clk,
             spec,
             left_stance_anchor_ws:  Vec3::ZERO,
             right_stance_anchor_ws: Vec3::ZERO,
@@ -201,7 +210,6 @@ impl LocoState {
             prev_r_stance: false,
         }
     }
-
     pub fn enqueue(&mut self, plan: TransitionPlan) {
         self.pending = Some(plan);
     }

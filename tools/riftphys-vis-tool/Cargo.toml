@@ -1,7 +1,7 @@
-#[package]
-#name = "riftphys-vis-tool"
-#version = "0.1.0"
-#edition = "2021"
+[package]
+name = "riftphys-vis-tool"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
 libloading = "0.8"
@@ -21,12 +21,17 @@ riftphys-controllers = { path = "../../crates/riftphys-controllers" }
 riftphys-viz = { path = "../../crates/riftphys-viz" }
 riftphys-riftnet = { path = "../../crates/riftphys-riftnet" }
 riftphys-materials = { path = "../../crates/riftphys-materials" }
-# Windowing (same as workspace: =0.30.12)
-winit = { version = "0.30.12" }
-wgpu = "0.20"
 
+# Windowing & Graphics (The Golden Triad)
+winit = { version = "0.30.12" }
+wgpu = { workspace = true, features = ["wgsl"] }
 # To block_on async renderer creation
 pollster = "0.3"
 anyhow = "1.0.100"
 parking_lot = "0.12.5"
 bytemuck = "1.24.0"
+
+# Egui suite synced to wgpu 0.22 and winit 0.30
+egui = "0.29"
+egui-wgpu = "0.29"
+egui-winit = "0.29"

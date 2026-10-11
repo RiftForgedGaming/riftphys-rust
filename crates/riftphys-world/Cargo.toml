@@ -15,6 +15,7 @@ riftphys-terrain = { path = "../riftphys-terrain" }
 riftphys-query = { path = "../riftphys-query" }
 riftphys-materials = { path = "../riftphys-materials" }
 riftphys-controllers = { path = "../riftphys-controllers" }
+riftphys-vox = { path = "../riftphys-vox" }
 
 
 riftphys-vehicles = { path = "../riftphys-vehicles" }

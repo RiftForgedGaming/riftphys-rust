@@ -1,0 +1,11 @@
+{
+  "name": "ball_drop",
+  "hz": 240,
+  "ground": {"material": "Concrete", "height": 0.0},
+  "objects": [{"body": "ball", "shape": {"sphere": {"r": 0.033}}, "mass": 0.058, "material": "Rubber"}],
+  "params": [
+    {"name": "restitution", "kind": "restitution", "pair": ["Rubber", "Concrete"], "min": 0.0, "max": 0.95, "init": 0.3},
+    {"name": "mu_k", "kind": "mu_k", "pair": ["Rubber", "Concrete"], "min": 0.05, "max": 1.2, "init": 0.6},
+    {"name": "drag", "kind": "drag", "body": "ball", "min": 0.0, "max": 0.004, "init": 0.0}
+  ]
+}

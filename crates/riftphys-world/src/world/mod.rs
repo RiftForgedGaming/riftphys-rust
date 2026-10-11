@@ -11,5 +11,6 @@ pub mod world;
 pub mod pipeline;
 pub mod islands;
 pub mod sleep;
+mod voxel_env;
 
 pub use world::{World, WorldBuilder, Collider, RayHit, SweepHit, PlayerController};

@@ -19,14 +19,17 @@ members = [
     "crates/riftphys-locomotion",
     "crates/riftphys-io",
     "crates/riftphys-bridge-uriel",
+    "crates/riftphys-uriel",
+    "crates/riftphys-reality",
     "crates/riftphys-riftnet",
-#    "tools/riftphys-vis-tool",
+    "tools/riftphys-vis-tool",
     "crates/riftphys-ffi",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-wgpu   = "0.20"
+# THE FIX: wgpu dropped the leading zero.
+wgpu   = "22.0"
 winit  = "=0.30.12"
 bitvec = "1.0"
 

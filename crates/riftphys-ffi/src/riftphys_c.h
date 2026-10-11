@@ -239,6 +239,15 @@ RPhysResult rphys_player_set_input(RPhysWorld* world, uint32_t player_idx, RPhys
 // Retrieves the resulting pose after physics step, and whether the player is touching the ground
 RPhysResult rphys_player_get_pose(const RPhysWorld* world, uint32_t player_idx, RPhysIsometry* out_pose, RPhysBool* out_grounded);
 
+// Retrieves contact events for the current tick.
+// If `out_buffer` is NULL, it only returns the number of contacts in `out_count`.
+// If `out_buffer` is provided, it copies up to `buffer_capacity` events into it.
+RPhysResult rphys_world_get_contacts(
+    const RPhysWorld* world,
+    RPhysContactEvent* out_buffer,
+    uint32_t buffer_capacity,
+    uint32_t* out_count
+);
 /* ===================== ROLLBACK / SNAPSHOTS ===================== */
 
 typedef struct RPhysWorldSnapshot RPhysWorldSnapshot;
