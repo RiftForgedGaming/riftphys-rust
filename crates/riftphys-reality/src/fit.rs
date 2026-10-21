@@ -86,19 +86,33 @@ fn to_phys(params: &[(String, f32, f32, f32)], u: &[f64]) -> Vec<f32> {
 }
 
 pub fn fit(scene: &dyn Replayable, log: &RealityLog, cfg: &FitConfig) -> Result<FitReport, String> {
-    let params = scene.params();
-    if params.is_empty() { return Err("scene has no params to fit".into()); }
     let ws = scene.windows(log, cfg);
     let (train, test) = split(log, &ws, cfg.holdout_every);
     if train.is_empty() || test.is_empty() {
         return Err(format!("need training and held-out windows (got {} / {} of {})", train.len(), test.len(), ws.len()));
     }
+    fit_windows(scene, log, &train, log, &test, cfg)
+}
+
+/// Fit on every window of `train_log`, score held-out on every window of `test_log` (a benchmark's
+/// own split, e.g. unseen trajectory types).
+pub fn fit_logs(scene: &dyn Replayable, train_log: &RealityLog, test_log: &RealityLog, cfg: &FitConfig) -> Result<FitReport, String> {
+    let (train, test) = (scene.windows(train_log, cfg), scene.windows(test_log, cfg));
+    if train.is_empty() || test.is_empty() {
+        return Err(format!("need training and held-out windows (got {} / {})", train.len(), test.len()));
+    }
+    fit_windows(scene, train_log, &train, test_log, &test, cfg)
+}
+
+fn fit_windows(scene: &dyn Replayable, log: &RealityLog, train: &[Window], test_log: &RealityLog, test: &[Window], cfg: &FitConfig) -> Result<FitReport, String> {
+    let params = scene.params();
+    if params.is_empty() { return Err("scene has no params to fit".into()); }
     let x0: Vec<f32> = params.iter().map(|p| p.3).collect();
     let u0: Vec<f64> = params.iter().map(|(_, lo, hi, init)| ((init - lo) / (hi - lo).max(1e-12)) as f64).collect();
     // Objective: mean RMS over the whole window, training windows only
     let full = HORIZONS.len() - 1;
     let objective = |u: &[f64]| -> f64 {
-        let s = score(scene, log, &to_phys(&params, u), &train, cfg);
+        let s = score(scene, log, &to_phys(&params, u), train, cfg);
         let v = s.rms[full] as f64;
         if v.is_finite() { v } else { 1e9 }
     };
@@ -108,10 +122,10 @@ pub fn fit(scene: &dyn Replayable, log: &RealityLog, cfg: &FitConfig) -> Result<
         names: params.iter().map(|p| p.0.clone()).collect(),
         initial: x0.clone(),
         fitted: x.clone(),
-        train_before: score(scene, log, &x0, &train, cfg),
-        train_after: score(scene, log, &x, &train, cfg),
-        test_before: score(scene, log, &x0, &test, cfg),
-        test_after: score(scene, log, &x, &test, cfg),
+        train_before: score(scene, log, &x0, train, cfg),
+        train_after: score(scene, log, &x, train, cfg),
+        test_before: score(scene, test_log, &x0, test, cfg),
+        test_after: score(scene, test_log, &x, test, cfg),
         evals: r.evals,
     })
 }

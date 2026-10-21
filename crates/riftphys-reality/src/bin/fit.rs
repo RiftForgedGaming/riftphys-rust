@@ -2,8 +2,9 @@
 //!
 //!     riftphys-fit --log ball.jsonl --scene scenes/ball_drop.json [--window 1.0] [--stride 0.25]
 //!                  [--holdout-every 4] [--evals 300] [--seed 1] [--out fitted.json]
+//!                  [--test-log other.jsonl: hold out that whole log instead of every k-th take]
 
-use riftphys_reality::fit::{fit, FitConfig, Replayable, Scores, HORIZONS};
+use riftphys_reality::fit::{fit, fit_logs, FitConfig, Replayable, Scores, HORIZONS};
 use riftphys_reality::log::RealityLog;
 use riftphys_reality::quadrotor::QuadScene;
 use riftphys_reality::scene::Scene;
@@ -41,7 +42,10 @@ fn main() {
         seed: get("--seed").map(|v| v.parse().unwrap()).unwrap_or(d.seed),
     };
     let t0 = std::time::Instant::now();
-    let r = fit(scene.as_ref(), &log, &cfg).unwrap_or_else(|e| panic!("{}", e));
+    let r = match get("--test-log") {
+        Some(p) => fit_logs(scene.as_ref(), &log, &RealityLog::load(&p).unwrap_or_else(|e| panic!("{}", e)), &cfg),
+        None => fit(scene.as_ref(), &log, &cfg),
+    }.unwrap_or_else(|e| panic!("{}", e));
     println!("scene {} | log {} ({} Hz) | {} evaluations in {:.1} s", name, log.source, log.rate_hz, r.evals, t0.elapsed().as_secs_f32());
     println!("\n{:<16}{:>10}{:>10}", "parameter", "initial", "fitted");
     for ((n, a), b) in r.names.iter().zip(&r.initial).zip(&r.fitted) { println!("{:<16}{:>10.4}{:>10.4}", n, a, b); }

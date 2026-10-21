@@ -38,6 +38,11 @@ pub enum QuadParamKind {
     InertiaRollPitch,
     /// Multiplier on yaw inertia (body y)
     InertiaYaw,
+    /// Seconds the logged rotor speeds lag the real ones (estimated speeds are filtered): replay
+    /// uses the log at t + lead
+    RpmLead,
+    /// Rotational damping, N m per rad/s (rotor drag and blade flapping resist body rotation)
+    AngDrag,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +71,10 @@ pub struct QuadScene {
     #[serde(default)]
     pub drag: f32,
     #[serde(default)]
+    pub rpm_lead: f32,
+    #[serde(default)]
+    pub ang_drag: f32,
+    #[serde(default)]
     pub params: Vec<QuadParam>,
     #[serde(default)]
     pub notes: String,
@@ -73,7 +82,7 @@ pub struct QuadScene {
 
 /// Physical values for one evaluation.
 #[derive(Clone, Copy, Debug)]
-pub struct QuadValues { pub k_thrust: f32, pub k_torque: f32, pub drag: f32, pub inertia: Vec3 }
+pub struct QuadValues { pub k_thrust: f32, pub k_torque: f32, pub drag: f32, pub inertia: Vec3, pub rpm_lead: f32, pub ang_drag: f32 }
 
 impl QuadScene {
     pub fn load(path: &str) -> Result<Self, String> {
@@ -84,7 +93,7 @@ impl QuadScene {
     pub fn dt(&self) -> f32 { 1.0 / self.hz as f32 }
 
     pub fn values(&self, x: &[f32]) -> QuadValues {
-        let mut v = QuadValues { k_thrust: self.k_thrust, k_torque: self.k_torque, drag: self.drag, inertia: Vec3::from_array(self.inertia) };
+        let mut v = QuadValues { k_thrust: self.k_thrust, k_torque: self.k_torque, drag: self.drag, inertia: Vec3::from_array(self.inertia), rpm_lead: self.rpm_lead, ang_drag: self.ang_drag };
         for (p, &val) in self.params.iter().zip(x) {
             match p.kind {
                 QuadParamKind::KThrust => v.k_thrust = val,
@@ -92,6 +101,8 @@ impl QuadScene {
                 QuadParamKind::Drag => v.drag = val,
                 QuadParamKind::InertiaRollPitch => { v.inertia.x = self.inertia[0] * val; v.inertia.z = self.inertia[2] * val; }
                 QuadParamKind::InertiaYaw => v.inertia.y = self.inertia[1] * val,
+                QuadParamKind::RpmLead => v.rpm_lead = val,
+                QuadParamKind::AngDrag => v.ang_drag = val,
             }
         }
         v
@@ -119,6 +130,7 @@ impl QuadScene {
             torque += (pose.rot * Vec3::from_array(r.pos)).cross(f) + up * (r.spin * v.k_torque * k2);
         }
         force -= world.get_body_vel(id).lin * v.drag;
+        torque -= world.get_body_vel(id).ang * v.ang_drag;
         world.apply_impulse(id, force * dt);
         world.apply_torque(id, torque * dt);
     }
@@ -181,7 +193,7 @@ impl Replayable for QuadScene {
         let steps = (w.len / dt).ceil() as usize;
         let mut sim = vec![p];
         for k in 0..steps {
-            let rpm = self.rpm_at(log, w.start + (k as f64 + 0.5) * dt)?;
+            let rpm = self.rpm_at(log, w.start + (k as f64 + 0.5) * dt + v.rpm_lead as f64)?;
             self.apply_rotors(&mut world, id, &v, &rpm, dt as f32);
             world.step(dt as f32);
             sim.push(world.get_body_pose(id).pos);

@@ -1,0 +1,101 @@
+{
+  "name": "crazyflie_bl",
+  "hz": 400,
+  "body": "cf",
+  "cmd": "cf",
+  "mass": 0.045,
+  "inertia": [
+    2.3951e-05,
+    3.2347e-05,
+    2.3951e-05
+  ],
+  "rotors": [
+    {
+      "pos": [
+        0.03535,
+        0.0,
+        0.03535
+      ],
+      "spin": -1.0
+    },
+    {
+      "pos": [
+        -0.03535,
+        0.0,
+        0.03535
+      ],
+      "spin": 1.0
+    },
+    {
+      "pos": [
+        -0.03535,
+        0.0,
+        -0.03535
+      ],
+      "spin": -1.0
+    },
+    {
+      "pos": [
+        0.03535,
+        0.0,
+        -0.03535
+      ],
+      "spin": 1.0
+    }
+  ],
+  "k_thrust": 0.0004,
+  "k_torque": 1e-07,
+  "drag": 0.0,
+  "params": [
+    {
+      "name": "k_thrust",
+      "kind": "k_thrust",
+      "min": 0.0002,
+      "max": 0.0008,
+      "init": 0.0003
+    },
+    {
+      "name": "k_torque",
+      "kind": "k_torque",
+      "min": 1e-08,
+      "max": 3e-06,
+      "init": 3e-07
+    },
+    {
+      "name": "drag",
+      "kind": "drag",
+      "min": 0.0,
+      "max": 0.1,
+      "init": 0.0
+    },
+    {
+      "name": "inertia_rp",
+      "kind": "inertia_roll_pitch",
+      "min": 0.3,
+      "max": 10.0,
+      "init": 1.0
+    },
+    {
+      "name": "inertia_yaw",
+      "kind": "inertia_yaw",
+      "min": 0.1,
+      "max": 10.0,
+      "init": 1.0
+    },
+    {
+      "name": "rpm_lead",
+      "kind": "rpm_lead",
+      "min": -0.02,
+      "max": 0.06,
+      "init": 0.0
+    },
+    {
+      "name": "ang_drag",
+      "kind": "ang_drag",
+      "min": 0.0,
+      "max": 0.0005,
+      "init": 0.0
+    }
+  ],
+  "notes": "Crazyflie 2.1 Brushless (idsia-robotics/nanodrone-sysid-benchmark): mass 45 g, J = (2.3951, 2.3951, 3.2347)e-5 kg m^2 (RiftPhys order x roll, y yaw, z pitch), effective arm 35.35 mm; rotors 1 front-right, 2 back-right, 3 back-left, 4 front-left, 1 and 3 positive yaw torque (from the benchmark's PhysQuadModel mixer). Their identified kF 3.72e-8 N/(rad/s)^2 = 4.08e-4 N/krpm^2. Body frame: x forward, y up, z right. Yaw spin signs follow the data, not the benchmark code: regressing gyro-derived body torque on rotor speeds gives the opposite sign and ~8x the code's Kc (matching the paper's kM 7.73e-11); rotors 2 and 4 make positive yaw torque."
+}
