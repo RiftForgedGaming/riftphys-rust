@@ -2,7 +2,7 @@
 
 The contract between RiftPhys scenarios (producer) and argref / URIEL (consumer), for robotics
 training: drones, drone squads and, next, humanoids. It deliberately has the same shape as the
-RiftForged server telemetry contract (`R:/RiftForged/URIEL_Telemetry.MD`): JSON lines tagged by
+RiftForged server telemetry contract (`R:/RiftForged/Specs/URIEL_Telemetry.MD`): JSON lines tagged by
 `t`, raw named state at a fixed sample rate, events at their exact tick, binning left to the
 consumer. One URIEL pipeline serves game and robotics data.
 
