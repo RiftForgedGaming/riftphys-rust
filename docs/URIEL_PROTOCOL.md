@@ -1,19 +1,24 @@
 # URIEL protocol: what RiftPhys writes for URIEL
 
 The contract between RiftPhys scenarios (producer) and argref / URIEL (consumer), for robotics
-training: drones, drone squads and, next, humanoids. It deliberately has the same shape as the
+training: drones, drone squads, humanoids and a seam-tracking welding arm. It deliberately has the same shape as the
 RiftForged server telemetry contract (`R:/RiftForged/Specs/URIEL_Telemetry.MD`): JSON lines tagged by
 `t`, raw named state at a fixed sample rate, events at their exact tick, binning left to the
 consumer. One URIEL pipeline serves game and robotics data.
 
-Status: **v0.1 (2026-10-10).** Producer: `crates/riftphys-uriel` (`riftphys-uriel-rollout`).
-Consumer: argref `tools/riftphys_to_jsonl.py`.
+Status: **v0.2 (2026-11-03)**, additive over v0.1 (2026-10-10): every v0.1 line is still valid and
+v0.1 readers can ignore the new fields. Producer: `crates/riftphys-uriel` (`riftphys-uriel-rollout`,
+`riftphys-uriel-seam`). Consumer: argref `tools/riftphys_to_jsonl.py`.
+
+v0.2 adds sensors (`meta.kinds[].sensors`, `sample.ents[].scan`), the outcome metric
+(`sample.ents[].err`), the episode's ground truth (`episode_start.scene`) and human-in-the-loop
+inputs (`operator` lines), for the fabrication rungs (docs/URIEL_Fabrication_F1.md).
 
 ## Lines
 
-Every line has `t` and `tick` (60 Hz simulation tick). Types: `meta` (first line), `episode_start`,
-`sample` (every `sample_every` ticks), `event`, `episode_end`, and `command` (consumer to
-RiftPhys, closed loop; defined, not yet served).
+Every line has `t` and `tick` (60 Hz control tick). Types: `meta` (first line), `episode_start`,
+`sample` (every `sample_every` ticks), `event`, `operator` (v0.2), `episode_end`, and `command`
+(consumer to RiftPhys, closed loop; defined, not yet served).
 
 ```json
 {"t":"meta","tick":0,"v":"0.1","source":"riftphys","scenario":"drone_hover","sim_hz":60,"sample_every":3,"seed":1,
@@ -40,6 +45,12 @@ RiftPhys, closed loop; defined, not yet served).
 | `act` | actuator units | commands chosen from this sample's state (applied by the step that follows) |
 | `joints` | rad, rad/s | articulated kinds only: `[angle, rate]` per joint, in actuator order |
 | `demo` | actuator units | the expert's command for this sample's state, when a teacher exists: the imitation label. Rollouts execute a noise-perturbed copy (`act`) while recording the clean one (DART), so data covers recovering from mistakes |
+| `scan` | m | v0.2, kinds with a `line_scan` sensor: the range along each ray in ray order, `null` where nothing was hit |
+| `err` | m | v0.2, the outcome metric where the scenario has a ground truth: the entity's tracking error against `target` in the task's frame (seam tracking: `[lateral, height]`). Teachers are baselines, not ceilings: a learner can be scored on `err` directly |
+
+v0.2 sensor spec in `meta.kinds[]`: `"sensors":[{"name":"profiler","type":"line_scan","n":64,
+"fan_m":0.04,"max_range_m":0.25,"unit":"m"}]`. `episode_start.scene` (v0.2) is a scenario-specific
+object holding the ground truth and the seeded disturbances.
 
 A sample is the state *before* the tick's step, together with the commands chosen from it, so
 (state, `demo`) pairs line up for imitation. `tick` is the number of steps already taken.
@@ -58,8 +69,25 @@ reproduce every line, hashes included (tested in `riftphys-uriel`, `rollouts_rep
 | `crash` | | body below 0.12 m or tilted past 80 degrees; the agent stops flying |
 | `reached` | `err_m` | held its target (within 0.15 m, under 0.2 m/s) for 1 s |
 
+| `seam_lost` | `err_m` | v0.2: the tracking error stayed over 5 mm for 0.5 s |
+| `tool_contact` | `link` | v0.2: an arm link touched the workpiece or table |
+| `self_contact` | `links` | v0.2: two non-adjacent arm links touched |
+
 `episode_end.result`: `stable` (every agent on target at the end), `crash` (any agent crashed),
-`timeout`.
+`timeout`; v0.2 adds `completed` (reached the seam's end), `lost`, `collided` and `stopped`
+(operator emergency stop).
+
+### Operator lines (v0.2, human in the loop)
+
+```json
+{"t":"operator","tick":600,"ep":"seam_line_v-0","who":7,"cmd":"override","data":{"lateral_m":0.002,"height_m":0.005}}
+```
+
+An operator input at the exact tick it was acted on: `pause` (travel stops, the arm holds),
+`resume`, `override` (the operator takes the arm and jogs the target by `data` in the task frame;
+the controller's torques are ignored until `resume`) and `stop` (emergency stop: the arm brakes
+and holds, the episode ends `stopped`). In v0.2 the inputs come from a script in the scenario
+(`riftphys-uriel-seam --operator`); serving them live from a socket comes with `command` (M5).
 
 ## Scenarios
 
@@ -86,6 +114,18 @@ with 4 physics/servo substeps (240 Hz) per tick; limb bodies carry 0.08 kg m^2 o
 armature about the joint axis. Fallen: pelvis below 0.6 m or torso tilted past ~53 degrees.
 Teacher: `StandPd`.
 
+### Seam-tracking arm (`seam_line_*`, `seam_ring_*`)
+
+A six-joint welding arm with continuous joints on a fixed base, a laser line profiler on its tool
+and seam workpieces (butt, V, fillet). Entity state is the TCP plus `joints` (wrapped angles),
+`scan`, `target` (ideal TCP on the true seam) and `err`. Kind `arm`, actuators are the six joint
+torques. Control at 60 Hz with 4 servo substeps. See docs/URIEL_Fabrication_F1.md.
+
+```
+riftphys-uriel-seam --out seam.jsonl --episodes 20 [--seam line|ring] [--joint butt|v|fillet] [--noise 0.05] [--operator "pause@6,resume@8"]
+riftphys-uriel-seam --eval --episodes 10            (teacher vs floor on held-out seeds)
+```
+
 ## Engine note: contacts
 
 The contact solver applied twice the impulse it accumulated, so each iteration's push was
@@ -96,6 +136,19 @@ Coulomb friction, the margin solved as a speculative gap, a position-level conta
 interleaved with the joint solve (so joints can't press loaded feet into the ground), and no
 collisions between bodies joined by a joint. Box-box narrowphase (SAT, up to 4 points) was also
 missing. Tests: `contact_resting_test`, `box_box_tests`.
+
+## Engine note: hinges past 90 degrees, terrain grounding, exact rays (v0.2)
+
+Found building the seam-tracking arm (docs/URIEL_Fabrication_F1.md section 7):
+- The position-level D6 solve measured a hinge's locked axes from `2 q_err.xyz`, which mixes in
+  half the hinge's twist. Past ~90 degrees the locked rows pushed the wrong way and a freely
+  swinging arm blew up. With one free or limited rotational axis the locked rows now use
+  `a_free x b_free`. The fidelity report is unchanged; biped push recovery is unchanged at 12 N s
+  (20/20), 10/20 against 12/20 at 20 N s.
+- Step stage 6 froze the downward motion of any body with a terrain contact, speculative ones
+  included (5 cm out). Only touching contacts (within the 5 mm slop) count now.
+- `World::raycast_exact` casts against true shapes; `World::raycast` (RiftForged's FFI ray) still
+  tests bounding boxes and is unchanged.
 
 ## Engine note: inertia
 
@@ -109,5 +162,6 @@ single-instant height check only held for the old (wrong) pendulum period.
 ## Not yet
 
 - `command` lines are defined but not served: closed-loop control (URIEL flying the drone) needs
-  a host that reads commands, over a local socket or `riftnet-rust`.
+  a host that reads commands, over a local socket or `riftnet-rust`. Operator inputs (v0.2) are
+  scripted until then.
 - Biped rollout CLI and demo export; a learned (URIEL) stand policy.

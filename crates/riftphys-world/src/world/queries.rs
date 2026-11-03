@@ -3,13 +3,50 @@
 use super::geom::ray_aabb;
 use super::world::{RayHit, SweepHit, World};
 use riftphys_core::{BodyId, Vec3, iso, Quat};
-use riftphys_geom::{Aabb, Shape};
+use riftphys_geom::{aabb_of, ray_shape, Aabb, Shape};
 use riftphys_query as query;
 use riftphys_collision::environment::EnvCollider;
 
 const TERRAIN_HIT_BODY: BodyId = BodyId(u32::MAX);
 
 impl World {
+    /// Ray cast against the true shapes of colliders and environment primitives (rotated boxes,
+    /// spheres, capsules, cylinders, triangles), where `raycast` tests collider bounding boxes.
+    /// Bodies for which `skip` returns true are ignored (e.g. a sensor's own robot). Read-only:
+    /// the result is a pure function of the world state. Ties go to the lowest collider index,
+    /// then to environments.
+    pub fn raycast_exact(&self, origin: Vec3, dir: Vec3, max_dist: f32, skip: impl Fn(BodyId) -> bool) -> Option<RayHit> {
+        let max_d = max_dist.max(0.0);
+        if max_d <= 0.0 { return None; }
+        let len = dir.length();
+        if !len.is_finite() || len < 1.0e-12 { return None; }
+        let dir = dir / len;
+
+        let mut best: Option<(f32, usize, Vec3)> = None;
+        for (ci, c) in self.colliders.iter().enumerate() {
+            if skip(c.body) { continue; }
+            let pose = self.bodies.pose(c.body.0);
+            if ray_aabb(origin, dir, &aabb_of(&c.shape, &pose), max_d).is_none() { continue; }
+            if let Some((t, n)) = ray_shape(&c.shape, &pose, origin, dir, max_d) {
+                if best.map_or(true, |(bt, _, _)| t < bt) { best = Some((t, ci, n)); }
+            }
+        }
+
+        let ray_end = origin + dir * max_d;
+        let query = Aabb::new(origin.min(ray_end), origin.max(ray_end));
+        let mut env_buffer = Vec::with_capacity(64);
+        for env in &self.environments { env.query_aabb(&query, &mut env_buffer); }
+        for env_col in env_buffer {
+            if let Some((t, n)) = ray_shape(&env_col.shape, &env_col.transform, origin, dir, max_d) {
+                if best.map_or(true, |(bt, _, _)| t < bt) { best = Some((t, usize::MAX, n)); }
+            }
+        }
+
+        let (t, ci, normal) = best?;
+        let body = if ci == usize::MAX { TERRAIN_HIT_BODY } else { self.colliders[ci].body };
+        Some(RayHit { body, toi: (t / max_d).clamp(0.0, 1.0), point: origin + dir * t, normal })
+    }
+
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32, ignore: Option<BodyId>) -> Option<RayHit> {
         let max_d = max_dist.max(0.0);
         if max_d <= 0.0 { return None; }

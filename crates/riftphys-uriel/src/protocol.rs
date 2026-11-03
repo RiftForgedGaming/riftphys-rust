@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.1";
+pub const PROTOCOL_VERSION: &str = "0.2";
 
 /// One actuator of an agent kind, in command order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -20,6 +20,22 @@ pub struct ActuatorSpec {
 pub struct KindSpec {
     pub kind: String,
     pub actuators: Vec<ActuatorSpec>,
+    /// v0.2: sensors this kind carries; their readings appear in each entity's sample.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sensors: Option<Vec<SensorSpec>>,
+}
+
+/// v0.2: a sensor of an agent kind. `line_scan`: `n` rays fanned across `fan_m` at the work,
+/// ranges up to `max_range_m`, reported in `EntState::scan` in ray order.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SensorSpec {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub n: u32,
+    pub fan_m: f32,
+    pub max_range_m: f32,
+    pub unit: String,
 }
 
 /// Per-entity state in a sample. Positions in metres, world frame, y up; `rot` is a unit
@@ -44,6 +60,13 @@ pub struct EntState {
     /// Articulated agents: [angle rad, rate rad/s] per joint, in `KindSpec.actuators` order.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub joints: Option<Vec<[f32; 2]>>,
+    /// v0.2, line-scan sensors: range per ray (m), `null` where nothing was hit.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scan: Option<Vec<Option<f32>>>,
+    /// v0.2, the outcome metric when the scenario has a ground truth: tracking error (m) of the
+    /// entity against `target` in the task's own frame (seam tracking: [lateral, height]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub err: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -66,6 +89,9 @@ pub enum Line {
         scenario: String,
         members: Vec<u32>,
         seed: u64,
+        /// v0.2: the episode's ground truth and seeded disturbances (scenario-specific object).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        scene: Option<serde_json::Value>,
     },
     Sample {
         tick: u64,
@@ -90,6 +116,17 @@ pub enum Line {
         /// `stable` (goal held), `crash`, or `timeout`
         result: String,
         duration_s: f32,
+    },
+    /// v0.2, human in the loop: an operator input at its exact tick (`pause`, `resume`,
+    /// `override` with `data`, `stop`). Scenarios that support an operator record every input
+    /// they act on as this line; serving them live (from a socket) is milestone M5.
+    Operator {
+        tick: u64,
+        ep: String,
+        who: u32,
+        cmd: String,
+        #[serde(default)]
+        data: serde_json::Value,
     },
     /// Closed loop (consumer -> RiftPhys): actuator commands for one entity at a tick.
     Command {

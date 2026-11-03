@@ -103,7 +103,7 @@ impl DroneEnv {
     pub fn start_line(&self, seed: u64) -> Line {
         Line::EpisodeStart {
             tick: 0, ep: self.ep.clone(), scenario: scenario_name(&self.cfg),
-            members: self.scenario.drones.iter().map(|d| d.body.0).collect(), seed,
+            members: self.scenario.drones.iter().map(|d| d.body.0).collect(), seed, scene: None,
         }
     }
 

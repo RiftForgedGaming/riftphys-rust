@@ -33,7 +33,7 @@ pub const K_YAW: f32 = 0.02;
 /// yaw torque = K_YAW * ((F0 + F1) - (F2 + F3)).
 pub fn kind_spec() -> KindSpec {
     let rotor = |n: &str| ActuatorSpec { name: n.to_string(), min: 0.0, max: 1.0, unit: "throttle".to_string() };
-    KindSpec { kind: KIND.to_string(), actuators: vec![rotor("rotor_px"), rotor("rotor_nx"), rotor("rotor_pz"), rotor("rotor_nz")] }
+    KindSpec { kind: KIND.to_string(), actuators: vec![rotor("rotor_px"), rotor("rotor_nx"), rotor("rotor_pz"), rotor("rotor_nz")], sensors: None }
 }
 
 /// Body-frame wrench (thrust along +y, torque) produced by rotor forces.
@@ -179,6 +179,8 @@ impl DroneScenario {
                 act: d.last_act.to_vec(),
                 demo: d.last_demo.map(|a| a.to_vec()),
                 joints: None,
+                scan: None,
+                err: None,
             }
         }).collect()
     }

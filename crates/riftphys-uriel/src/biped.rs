@@ -40,6 +40,7 @@ pub fn kind_spec() -> KindSpec {
     KindSpec {
         kind: KIND.to_string(),
         actuators: JOINT_NAMES.iter().zip(MAX_TORQUE).map(|(n, m)| ActuatorSpec { name: n.to_string(), min: -m, max: m, unit: "N m".to_string() }).collect(),
+        sensors: None,
     }
 }
 
@@ -242,6 +243,8 @@ impl Biped {
             act: self.last_act.to_vec(),
             demo: self.last_demo.map(|d| d.to_vec()),
             joints: Some((0..JOINTS).map(|j| [self.angle(world, j), self.rate(world, j)]).collect()),
+            scan: None,
+            err: None,
         }
     }
 }

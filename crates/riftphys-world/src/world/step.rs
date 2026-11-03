@@ -9,7 +9,7 @@ use riftphys_viz::viz::LedgerEvent;
 
 // We use a safer, tighter margin for melee to prevent ghosting
 // and false speculative contacts from ruining the narrowphase solver.
-const MELEE_CCD_MARGIN: f32 = 0.05;
+pub const MELEE_CCD_MARGIN: f32 = 0.05;
 /// Below this many pairs/colliders, contact generation runs on the calling thread.
 const PAR_MIN: usize = 64;
 /// Penetration left alone by the position-level contact projection (matches the velocity solver's slop).
@@ -243,9 +243,13 @@ impl World {
             if d_lin != Vec3::ZERO { vel.lin += d_lin / dt; }
 
             // FIX 1: MASS RATIO CRUSH (Floor grounding guarantee)
+            // Only contacts that actually touch (true penetration within the slop) ground a body;
+            // speculative contacts reach MELEE_CCD_MARGIN (5 cm) out, and counting them froze any
+            // body that close above terrain (a welding torch could not descend to its seam).
             let mut touching_ground = false;
             for c in &contacts {
-                if c.b_collider == TERRAIN_CI && self.colliders[c.a_collider].body.0 == i {
+                if c.b_collider == TERRAIN_CI && self.colliders[c.a_collider].body.0 == i
+                    && c.depth - MELEE_CCD_MARGIN > -CONTACT_POS_SLOP {
                     touching_ground = true; break;
                 }
             }

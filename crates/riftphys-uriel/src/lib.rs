@@ -6,9 +6,11 @@
 //! - `rollout`: episode runner (seeded, bit-exact replays, per-sample world hash).
 //! - `features`: learner inputs shared by data export and live control.
 
+pub mod arm;
 pub mod biped;
 pub mod drone;
 pub mod features;
 pub mod protocol;
 pub mod rng;
 pub mod rollout;
+pub mod seam;

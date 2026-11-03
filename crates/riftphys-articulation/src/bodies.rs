@@ -355,6 +355,23 @@ fn solve_d6(
     // Rotate the local error vector into world space to match 'axes'
     let e_world = q6v(ra * e_local);
 
+    // With one rotational axis not rigidly locked (a hinge, limited or not), the other two rows
+    // only keep that axis aligned. Measure the misalignment as a_f x b_f, which does not depend
+    // on the twist about it. The quaternion error above mixes the twist into its other
+    // components (by half the twist angle), so past ~90 degrees of twist a locked row pushed
+    // the wrong way and a hinge diverged.
+    let rigid = |r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none();
+    let mut free = None;
+    let mut n_free = 0;
+    for i in 0..3 { if !rigid(&j.r[i]) { free = Some(i); n_free += 1; } }
+    let e_lock = match (n_free, free) {
+        (1, Some(f)) => {
+            let unit = [Vec3::X, Vec3::Y, Vec3::Z][f];
+            q6v(normalize_q6(ra * unit).cross(normalize_q6(rb * unit)))
+        }
+        _ => e_world,
+    };
+
     for i in 0..3 {
         let row = &mut j.r[i];
         if !row.enabled { continue; }
@@ -363,7 +380,7 @@ fn solve_d6(
         if u == Vec3::ZERO { continue; }
 
         // Both vectors are now correctly operating in world space
-        let angle = q6(e_world.dot(u));
+        let angle = q6(if rigid(row) { e_lock.dot(u) } else { e_world.dot(u) });
         let mut target_ang = 0.0f32;
         let mut c_err: Option<f32> = Some(q6(angle - 0.0));
 

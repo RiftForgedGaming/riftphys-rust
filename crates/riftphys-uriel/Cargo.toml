@@ -2,7 +2,7 @@
 name = "riftphys-uriel"
 version = "0.1.0"
 edition = "2021"
-description = "URIEL robotics protocol for RiftPhys: deterministic scenarios (drones, squads), expert demonstrations and JSONL telemetry"
+description = "URIEL robotics protocol for RiftPhys: deterministic scenarios (drones, squads, biped, seam-tracking arm), expert demonstrations and JSONL telemetry"
 
 [lib]
 name = "riftphys_uriel"
@@ -11,6 +11,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "riftphys-uriel-rollout"
 path = "src/bin/rollout.rs"
+
+[[bin]]
+name = "riftphys-uriel-seam"
+path = "src/bin/seam.rs"
 
 [dependencies]
 riftphys-core = { path = "../riftphys-core" }

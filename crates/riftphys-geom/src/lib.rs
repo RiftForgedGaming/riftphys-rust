@@ -13,6 +13,7 @@ pub mod mass;
 pub mod triangle;
 pub mod ray;
 pub mod plane;
+pub mod raycast;
 
 pub use aabb::*;
 pub use mass::*;
@@ -20,3 +21,4 @@ pub use plane::*;
 pub use ray::*;
 pub use shape::*;
 pub use triangle::*;
+pub use raycast::ray_shape;
