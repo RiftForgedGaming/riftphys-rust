@@ -80,6 +80,13 @@ pub struct MatPairProps {
     /// non-penetration, `restitution` for bounce. A compliant pair ignores `restitution`.
     pub stiffness: f32,
     pub dissipation: f32,
+    /// Patch friction, opt in per pair: a manifold of two or more points gets its friction as one
+    /// sliding row at the patch centre (limit mu x total load) and one torsional row about the
+    /// normal (limit mu x total load x the patch's mean radius), as PhysX's patch friction.
+    /// Per-point friction at a face's corners resists spin about the normal as if all the load
+    /// sat at the corners: a cube spinning flat stops in 0.54 of the turn a uniformly pressed face
+    /// takes. false (the default) keeps per-point friction.
+    pub patch_friction: bool,
 }
 
 /// Base single-material table.
@@ -274,7 +281,7 @@ fn mix_pair(a: MatProps, b: MatProps) -> MatPairProps {
     let restitution = q(a.restitution.max(b.restitution));
     let stribeck_v  = q(0.5 * (a.stribeck_v + b.stribeck_v));
 
-    MatPairProps { mu_s, mu_k, restitution, stribeck_v, stiffness: 0.0, dissipation: 0.0 }
+    MatPairProps { mu_s, mu_k, restitution, stribeck_v, stiffness: 0.0, dissipation: 0.0, patch_friction: false }
 }
 
 
@@ -289,6 +296,7 @@ pub fn pair_props(a: MaterialId, b: MaterialId) -> MatPairProps {
             stribeck_v:  q(ov.stribeck_v.unwrap_or(base.stribeck_v)),
             stiffness: 0.0,
             dissipation: 0.0,
+            patch_friction: false,
         }
     } else {
         base

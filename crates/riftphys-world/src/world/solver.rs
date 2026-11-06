@@ -62,6 +62,54 @@ struct ContactConstraint {
     /// force over the step, `soft_jn`, applied once; no rigid normal row, shock or restitution
     soft: bool,
     soft_jn: f32,
+    /// Friction is solved by this point's patch (see `FrictionPatch`), not here
+    patch: bool,
+}
+
+/// One manifold's friction under patch friction (`MatPairProps::patch_friction`): sliding at
+/// the centroid of its points and torsion about the normal, both limited by the manifold's total
+/// normal impulse. `at` is a constraint located at the centroid (lever arms, effective masses).
+struct FrictionPatch {
+    points: Vec<usize>,
+    at: ContactConstraint,
+    /// Mean distance from the centroid over the contact patch (m), the torsional lever arm
+    radius: f32,
+    /// Effective mass for relative rotation about the normal
+    m_tw: f32,
+}
+
+/// Mean distance from the origin over the convex polygon `pts` (plane coordinates, around the
+/// origin). Two points: a uniformly loaded segment, a quarter of its length.
+fn patch_radius(pts: &[(f32, f32)]) -> f32 {
+    if pts.len() < 2 { return 0.0; }
+    let mut p: Vec<(f32, f32)> = pts.to_vec();
+    p.sort_by(|a, b| a.1.atan2(a.0).partial_cmp(&b.1.atan2(b.0)).unwrap_or(std::cmp::Ordering::Equal));
+    let (mut area, mut moment) = (0.0f32, 0.0f32);
+    const N: usize = 6;
+    for i in 0..p.len() {
+        let (a, b) = (p[i], p[(i + 1) % p.len()]);
+        let tri = 0.5 * (a.0 * b.1 - a.1 * b.0).abs();
+        if tri <= 0.0 { continue; }
+        // Integrate |x| over the triangle (origin, a, b): N x N subdivision, centroid rule
+        let sub = tri / (N * N) as f32;
+        for r in 0..N {
+            for c in 0..(N - r) {
+                for up in [true, false] {
+                    if !up && c + r + 1 >= N { continue; }
+                    let (u, v) = if up { (r as f32 + 1.0 / 3.0, c as f32 + 1.0 / 3.0) } else { (r as f32 + 2.0 / 3.0, c as f32 + 2.0 / 3.0) };
+                    let (u, v) = (u / N as f32, v / N as f32);
+                    let x = (a.0 * u + b.0 * v, a.1 * u + b.1 * v);
+                    moment += (x.0 * x.0 + x.1 * x.1).sqrt() * sub;
+                }
+            }
+        }
+        area += tri;
+    }
+    if area > 1e-12 { return moment / area; }
+    // Degenerate (collinear points): a uniformly loaded segment
+    let mut len = 0.0f32;
+    for a in &p { for b in &p { len = len.max(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()); } }
+    0.25 * len
 }
 
 /// One velocity-level row of a D6 joint. Linear rows constrain the anchors' relative velocity
@@ -235,6 +283,7 @@ impl World {
                 restitution_bias: 0.0,
                 soft: pair.stiffness > 0.0,
                 soft_jn: 0.0,
+                patch: false,
             };
             let pen = c.depth - margin;
             cs.depth_bias = if pen > 0.0 { ((pen - slop).max(0.0) * (beta / dt)).min(2.0) } else { pen / dt };
@@ -258,6 +307,35 @@ impl World {
             if v_rel_n < -1.0 { cs.restitution_bias = -pair.restitution * v_rel_n; }
             cs
         }).collect();
+
+        // 1b. Friction patches: manifolds of two or more points on patch-friction pairs
+        let mut constraints = constraints;
+        let mut groups: std::collections::BTreeMap<(usize, usize), Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, c) in contacts.iter().enumerate() {
+            if self.contact_pair_props(c).patch_friction { groups.entry((c.a_collider, c.b_collider)).or_default().push(i); }
+        }
+        let mut patches: Vec<FrictionPatch> = Vec::new();
+        for (_, pts) in groups {
+            if pts.len() < 2 { continue; }
+            let first = constraints[pts[0]];
+            let centroid = pts.iter().fold(Vec3::ZERO, |s, &i| s + contacts[i].point) / pts.len() as f32;
+            let normal = pts.iter().fold(Vec3::ZERO, |s, &i| s + contacts[i].normal).normalize_or_zero();
+            if normal == Vec3::ZERO { continue; }
+            let (t1, t2) = orthonormal_basis(normal);
+            let plane: Vec<(f32, f32)> = pts.iter().map(|&i| { let d = contacts[i].point - centroid; (d.dot(t1), d.dot(t2)) }).collect();
+            let ra = centroid - self.bodies.pose(first.ai).pos;
+            let rb = if first.b_is_terrain { Vec3::ZERO } else { centroid - self.bodies.pose(first.bi).pos };
+            let eff = |d: Vec3| -> f32 {
+                let (ca, cb) = (ra.cross(d), rb.cross(d));
+                let k = first.inv_a + first.inv_b + ca.dot(first.ii_a.mul_vec3(ca)) + cb.dot(first.ii_b.mul_vec3(cb));
+                if k > 1e-9 { 1.0 / k } else { 0.0 }
+            };
+            let kt = normal.dot(first.ii_a.mul_vec3(normal)) + normal.dot(first.ii_b.mul_vec3(normal));
+            let at = ContactConstraint { ra, rb, normal, t1, t2, m_n: eff(normal), m_t1: eff(t1), m_t2: eff(t2), ..first };
+            for &i in &pts { constraints[i].patch = true; }
+            patches.push(FrictionPatch { points: pts, at, radius: patch_radius(&plane), m_tw: if kt > 1e-9 { 1.0 / kt } else { 0.0 } });
+        }
+        let constraints = constraints;
 
         // 2a. Graph Coloring (Level Scheduling) for Contacts
         let mut contact_batches: Vec<Vec<usize>> = Vec::with_capacity(16);
@@ -332,6 +410,8 @@ impl World {
         let joints_ref = &self.joints;
         let num_constraints = constraints.len();
         let constraints_slice = constraints.as_slice();
+        // Accumulated patch friction: [t1, t2, torsion] per patch
+        let mut patch_acc = vec![0.0f32; patches.len() * 3];
         // Compliant contacts: their whole normal impulse, once, before the iterations
         for (c_idx, cs) in constraints.iter().enumerate() {
             if cs.soft && cs.soft_jn > 0.0 {
@@ -398,6 +478,7 @@ impl World {
                         apply_contact_impulse(bodies, cs, cs.normal * (new_jn - old_jn));
                         new_jn
                     };
+                    if cs.patch { return; }
 
                     // Friction: accumulated tangent impulse kept inside the Coulomb disc mu * jn
                     let v_f = contact_rel_vel(bodies, cs);
@@ -412,6 +493,40 @@ impl World {
                     let d = new_t - old_t;
                     apply_contact_impulse(bodies, cs, cs.t1 * d.x + cs.t2 * d.y);
                 });
+            }
+
+            // C. Friction patches (sequential, in patch order): sliding at the centroid and
+            // torsion about the normal, limited by the patch's current total normal impulse
+            if !patches.is_empty() {
+                let bodies = unsafe { bodies_ptr.get_mut() };
+                let acc_jn_slice = unsafe { acc_jn_ptr.get_mut_slice(num_constraints) };
+                for (k, p) in patches.iter().enumerate() {
+                    let jn: f32 = p.points.iter().map(|&i| acc_jn_slice[i]).sum();
+                    let cs = &p.at;
+                    let v = contact_rel_vel(bodies, cs);
+                    let (vt1, vt2) = (v.dot(cs.t1), v.dot(cs.t2));
+                    let slip = (vt1 * vt1 + vt2 * vt2).sqrt();
+                    let mu = cs.mu_k + (cs.mu_s - cs.mu_k) * (-(slip / cs.stribeck_v).powi(2)).exp();
+                    let old_t = Vec3::new(patch_acc[3 * k], patch_acc[3 * k + 1], 0.0);
+                    let new_t = (old_t - Vec3::new(vt1 * cs.m_t1, vt2 * cs.m_t2, 0.0)).clamp_length_max(mu * jn);
+                    patch_acc[3 * k] = new_t.x;
+                    patch_acc[3 * k + 1] = new_t.y;
+                    let d = new_t - old_t;
+                    apply_contact_impulse(bodies, cs, cs.t1 * d.x + cs.t2 * d.y);
+                    // Torsion: relative spin of B about the normal, against mu x load x radius
+                    let wa = if cs.inv_a > 0.0 { bodies.vel(cs.ai).ang } else { Vec3::ZERO };
+                    let wb = if cs.b_is_terrain || cs.inv_b <= 0.0 { Vec3::ZERO } else { bodies.vel(cs.bi).ang };
+                    let w_rel = (wb - wa).dot(cs.normal);
+                    let old_tw = patch_acc[3 * k + 2];
+                    let lim = mu * jn * p.radius;
+                    let new_tw = (old_tw - w_rel * p.m_tw).clamp(-lim, lim);
+                    patch_acc[3 * k + 2] = new_tw;
+                    let dt_w = new_tw - old_tw;
+                    if dt_w != 0.0 {
+                        if cs.inv_a > 0.0 { bodies.apply_angular_impulse(cs.ai, -cs.normal * dt_w); }
+                        if !cs.b_is_terrain && cs.inv_b > 0.0 { bodies.apply_angular_impulse(cs.bi, cs.normal * dt_w); }
+                    }
+                }
             }
         }
 

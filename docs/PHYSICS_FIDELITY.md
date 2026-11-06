@@ -242,11 +242,51 @@ to Hunt-Crossley contact, as Drake's point contact uses:
 - Drake's own values (k 10800, d 0.4, mu 0.10) don't transfer: each engine applies k and friction
   differently, so the parameters must be fitted per engine, as the paper did.
 
+**The rotation gap.** Held out, RiftPhys's rotation error is 17.1 degrees against Drake and
+Bullet's 16.5. Over all tosses it's 16.8.
+
+- **Where rotation error comes from** (compliant fit; `--diagnose` now also prints rotation over
+  time and at rest):
+  - Rotation error jumps from 1.8 to 13 degrees between 0.10 and 0.20 s, at the first edge or corner
+    impact.
+  - At rest, 84% of simulated cubes are on the same face as the real one, with 12.6 degrees of yaw
+    left over (median 10).
+  - The other 16% (92 tosses) land on a different face, at about 93 degrees each: about 15 of the 25
+    final degrees.
+  - Which face comes up is decided at that first impact, and is highly sensitive to small
+    differences in the start state.
+- **Patch friction, tested and rejected for this cube:**
+  - **The physics:** per-point friction at a face's four corners resists spin about the normal as
+    if all the load sat at the corners. A cube spinning flat turns 0.271 rad, which is the
+    corner-load prediction exactly. A uniformly pressed face would turn 0.501 rad.
+  - **The feature:** `MatPairProps::patch_friction` (opt in, PhysX-style) solves a manifold's
+    friction as sliding at its centroid plus torsion over the patch's mean radius, integrated over
+    the contact polygon. It reproduces 0.501 rad. Tests in
+    `riftphys-world/tests/patch_friction_test.rs`: spin-down within 3% for rigid and compliant
+    contact, Coulomb sliding unchanged, bit-exact replay.
+  - **The result:** refitted with it, the real tosses get worse.
+
+  | contact (held out) | position % | rotation deg | e_q |
+  |---|---|---|---|
+  | compliant, per-point friction | 13.2 | 17.1 | 0.29 |
+  | compliant + patch friction (seeds 1 and 2) | 16.7 / 18.6 | 20.4 / 20.3 | 0.35 / 0.35 |
+  | rigid + patch friction | 19.5 | 21.1 | 0.38 |
+
+  This acrylic cube behaves as though its load does sit near the corners, which is plausible for
+  faces that aren't perfectly flat. Patch friction stays opt-in for patches that really are flat
+  or soft.
+- **The gap is within noise.** Rotation errors have a standard deviation of about 19-20 degrees.
+  The standard error of each mean is about 0.8 degrees (Drake: 20 / sqrt 550; RiftPhys on all
+  tosses: 18.9 / sqrt 570) and about 1.1 for the 285 held-out tosses. RiftPhys on all tosses, 16.8,
+  is 0.3 degrees from Drake's 16.5. Held out it's 0.6 degrees behind, and Drake's figure is in
+  sample. Neither difference is statistically meaningful. Comparing per-toss would need the
+  paper's per-toss errors, which aren't published.
+
 ## 3. Next
 
-- **Cube tosses, what's left:** rotation is 0.6 degrees behind Drake and Bullet. The worst tosses
-  (#46, #563) include tracking noise. Next candidates: friction regularization like Drake's (a
-  stiction velocity) and a torsional or rolling friction term.
+- **Cube tosses:** on rotation, RiftPhys is level with Drake and Bullet within noise. To go further,
+  get per-toss errors from the paper's authors (for a paired comparison) and handle the
+  wrong-face landings, which are a start-state sensitivity rather than a model gap.
 - **Compliant contact elsewhere:** offer it per pair to the biped's feet and the seam arm's tool
   where real compliance matters, and fit it once real captures exist.
 - Run on real Blackbird flights: its data host (blackbird-dataset.mit.edu) had no DNS record on

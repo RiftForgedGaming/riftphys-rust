@@ -81,9 +81,10 @@ pub fn table_height(ts: &[Toss]) -> f32 {
 
 /// Contact parameters of the cube on the table: restitution and friction for the rigid model;
 /// stiffness k (N/m per contact point) and dissipation d (s/m) switch the pair to compliant
-/// (Hunt-Crossley) contact, where restitution is unused.
+/// (Hunt-Crossley) contact, where restitution is unused. `patch_friction` solves a face's friction
+/// as one patch (sliding at the centre, torsion over the face) instead of at its corner points.
 #[derive(Clone, Copy, Debug)]
-pub struct Params { pub restitution: f32, pub mu_s: f32, pub mu_k: f32, pub stiffness: f32, pub dissipation: f32 }
+pub struct Params { pub restitution: f32, pub mu_s: f32, pub mu_k: f32, pub stiffness: f32, pub dissipation: f32, pub patch_friction: bool }
 
 /// Which contact model a fit searches.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -91,7 +92,7 @@ pub enum Model { Rigid, Compliant }
 
 impl Params {
     /// The cube's measured values (Acosta et al. Table I): restitution 0.125, friction 0.18, rigid.
-    pub fn measured() -> Self { Self { restitution: 0.125, mu_s: 0.18, mu_k: 0.18, stiffness: 0.0, dissipation: 0.0 } }
+    pub fn measured() -> Self { Self { restitution: 0.125, mu_s: 0.18, mu_k: 0.18, stiffness: 0.0, dissipation: 0.0, patch_friction: false } }
     /// A compliant start: Drake's fitted contact (k 10800 N/m, d 0.4 s/m) with the measured friction.
     pub fn compliant_start() -> Self { Self { stiffness: 10800.0, dissipation: 0.4, ..Self::measured() } }
 
@@ -100,9 +101,9 @@ impl Params {
     fn from_unit(model: Model, x: &[f64]) -> Self {
         let u = |i: usize, lo: f32, hi: f32| lo + (hi - lo) * x[i].clamp(0.0, 1.0) as f32;
         match model {
-            Model::Rigid => Self { restitution: u(0, 0.0, 0.9), mu_s: u(1, 0.02, 1.0), mu_k: u(2, 0.02, 1.0), stiffness: 0.0, dissipation: 0.0 },
+            Model::Rigid => Self { restitution: u(0, 0.0, 0.9), mu_s: u(1, 0.02, 1.0), mu_k: u(2, 0.02, 1.0), stiffness: 0.0, dissipation: 0.0, patch_friction: false },
             Model::Compliant => Self { restitution: 0.0, stiffness: 10f32.powf(u(0, 2.5, 5.5)), dissipation: u(1, 0.0, 5.0),
-                                       mu_s: u(2, 0.02, 1.0), mu_k: u(3, 0.02, 1.0) },
+                                       mu_s: u(2, 0.02, 1.0), mu_k: u(3, 0.02, 1.0), patch_friction: false },
         }
     }
     fn to_unit(&self, model: Model) -> Vec<f64> {
@@ -169,6 +170,7 @@ pub fn trace(t: &Toss, p: &Params, table_y: f32, hz: f32) -> Vec<(Vec3, Quat)> {
     props.mu_s = p.mu_s.max(p.mu_k);
     props.stiffness = p.stiffness;
     props.dissipation = p.dissipation;
+    props.patch_friction = p.patch_friction;
     world.set_pair_props(CUBE, TABLE, props);
     let mut mp = MassProps::from_box_density(Vec3::splat(HALF), MASS / (8.0 * HALF * HALF * HALF));
     mp.inertia = Mat3::from_diagonal(Vec3::splat(INERTIA).into());
@@ -208,13 +210,15 @@ pub fn summary(es: &[TossError]) -> [(f32, f32); 3] {
     [stat(&|e| e.pos_pct), stat(&|e| e.rot_deg), stat(&|e| e.e_q)]
 }
 
-/// Fits the contact parameters of `model` by CMA-ES, minimizing mean e_q over `train`.
+/// Fits the contact parameters of `model` by CMA-ES, minimizing mean e_q over `train`
+/// (`init.patch_friction` is kept as given).
 pub fn fit(train: &[Toss], model: Model, init: &Params, table_y: f32, hz: f32, max_evals: usize, seed: u64) -> (Params, usize) {
+    let with = |x: &[f64]| Params { patch_friction: init.patch_friction, ..Params::from_unit(model, x) };
     let r = cmaes::minimize(|x| {
-        let es = replay_all(train, &Params::from_unit(model, x), table_y, hz);
+        let es = replay_all(train, &with(x), table_y, hz);
         es.iter().map(|e| e.e_q as f64).sum::<f64>() / es.len() as f64
     }, &init.to_unit(model), 0.25, max_evals, seed);
-    (Params::from_unit(model, &r.x), r.evals)
+    (with(&r.x), r.evals)
 }
 
 #[cfg(test)]
