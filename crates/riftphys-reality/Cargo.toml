@@ -17,6 +17,10 @@ name = "riftphys-fit"
 path = "src/bin/fit.rs"
 
 [[bin]]
+name = "riftphys-cube-toss"
+path = "src/bin/cube_toss.rs"
+
+[[bin]]
 name = "riftphys-synth"
 path = "src/bin/synth.rs"
 

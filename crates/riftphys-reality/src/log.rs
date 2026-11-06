@@ -58,6 +58,8 @@ pub struct RealityLog {
     pub cmds: BTreeMap<String, Vec<(f64, Vec<f32>)>>,
     /// Times of `break` events, sorted
     pub breaks: Vec<f64>,
+    /// Every other event (time, name, data) in time order, e.g. a measured start `state`
+    pub events: Vec<(f64, String, serde_json::Value)>,
 }
 
 impl RealityLog {
@@ -80,12 +82,13 @@ impl RealityLog {
                     log.tracks.entry(body).or_default().push(Sample { time, pos: Vec3::from_array(pos), rot: q.normalize() });
                 }
                 RealityLine::Cmd { time, who, act } => log.cmds.entry(who).or_default().push((time, act)),
-                RealityLine::Event { time, e, .. } => if e == "break" { log.breaks.push(time); },
+                RealityLine::Event { time, e, data } => if e == "break" { log.breaks.push(time); } else { log.events.push((time, e, data)); },
             }
         }
         for t in log.tracks.values_mut() { t.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap()); }
         for c in log.cmds.values_mut() { c.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap()); }
         log.breaks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        log.events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         Ok(log)
     }
 
@@ -107,6 +110,7 @@ impl RealityLog {
             for (t, act) in cmds { timed.push((*t, RealityLine::Cmd { time: *t, who: who.clone(), act: act.clone() })); }
         }
         for &t in &self.breaks { timed.push((t, RealityLine::Event { time: t, e: "break".into(), data: serde_json::Value::Null })); }
+        for (t, e, data) in &self.events { timed.push((*t, RealityLine::Event { time: *t, e: e.clone(), data: data.clone() })); }
         timed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         out.extend(timed.into_iter().map(|(_, l)| l));
         out

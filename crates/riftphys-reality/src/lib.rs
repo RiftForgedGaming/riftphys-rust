@@ -9,11 +9,14 @@
 //!   takes, report held-out error before and after (`riftphys-fit`).
 //! - [`synth`]: synthetic logs from known parameters, to check the pipeline (`riftphys-synth`).
 //! - [`quadrotor`]: vehicles replayed from measured rotor speeds (Blackbird-style logs).
+//! - [`cube_toss`]: real cube tosses (ContactNets) scored as Drake, MuJoCo and Bullet were
+//!   (`riftphys-cube-toss`).
 //!
 //! See docs/PHYSICS_FIDELITY.md.
 
 pub mod analytic;
 pub mod cmaes;
+pub mod cube_toss;
 pub mod fit;
 pub mod log;
 pub mod quadrotor;

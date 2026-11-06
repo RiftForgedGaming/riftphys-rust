@@ -153,8 +153,54 @@ tools/blackbird_to_reality.py selftest` covers the bag reader.
 **placeholder**: set it from the Blackbird paper before fitting real flights, and check the
 rotor order against the rpm channels.
 
+### Real cube tosses, against Drake, Bullet and MuJoCo
+
+The first real-world data RiftPhys has been scored on, and the first comparison with other engines
+on the same data.
+
+- **Data:** the ContactNets cube-toss dataset (DAIRLab/contact-nets, BSD-3-Clause; Pfrommer,
+  Halm & Posa, CoRL 2020). 570 tosses of a 10.48 cm, 0.37 kg acrylic cube onto a table, AprilTags
+  at 148 Hz, with measured start velocities.
+- **Reference:** Acosta, Yang & Posa, "Validating Robotics Simulators on Real-World Impacts" (IEEE
+  RA-L 2022, arXiv 2110.00541). They fitted Drake, MuJoCo and Bullet's contact parameters to these
+  tosses and scored them with Eq. 3: e_q = (1/T) sum_t ((2/l) |dp|^2 + angle^2), every toss started
+  from its measured first state, simulated at 1480 Hz.
+- **Pipeline:**
+  - `tools/contactnets_to_reality.py` converts the dataset. It reads PyTorch's legacy `.pt` files
+    with a restricted unpickler, so no torch is needed and a file can't run code. It also confirmed
+    from the data that the stored angular velocity is in the body frame.
+  - `riftphys-cube-toss` replays and scores RiftPhys, and fits restitution and friction with CMA-ES.
+  - `tools/parity/mujoco_cube_toss.py` replays the same tosses in MuJoCo (3.17.0) with the identical
+    metric.
+- **Fitting:** the published engines were fitted on all tosses. RiftPhys is fitted on the 285
+  even-numbered tosses and scored on the 285 odd ones (held out), which is the stricter test.
+
+| engine (contact parameters) | position, % cube width | rotation, degrees | e_q |
+|---|---|---|---|
+| Drake (published, fitted) | 13.5 +- 8.2 | 16.5 +- 20.0 | 0.27 +- 0.57 |
+| Bullet (published, fitted) | 14.9 +- 8.9 | 16.5 +- 20.2 | 0.27 +- 0.57 |
+| MuJoCo (published, fitted) | 25.1 +- 10.8 | 21.7 +- 21.4 | 0.38 +- 0.63 |
+| MuJoCo 3.17.0, published fit, this harness, all | 26.9 +- 15.8 | 22.5 +- 19.9 | 0.42 +- 0.59 |
+| **RiftPhys, fitted on even tosses, held out** | **17.7 +- 11.7** | **17.1 +- 19.3** | **0.30 +- 0.57** |
+| RiftPhys, same fit, all tosses | 17.4 +- 10.5 | 16.8 +- 19.5 | 0.29 +- 0.57 |
+| RiftPhys, the cube's measured values (e 0.125, mu 0.18), all | 25.7 +- 13.6 | 23.0 +- 23.7 | 0.48 +- 0.72 |
+
+What the table shows:
+- **The harness is checked.** MuJoCo run here with the paper's own fitted parameters reproduces its
+  published row to within about 10%. The remaining difference is plausibly 570 tosses against the
+  paper's 550, and this harness's table height (the median rest height less a half-width).
+- **RiftPhys sits close behind Drake and Bullet** on rotation and e_q, and ahead of MuJoCo.
+- **Position error is the gap:** 17.7% against Drake's 13.5% and Bullet's 14.9%.
+- **The fit:** restitution 0.000, mu_s 0.524, mu_k 0.196 (150 evaluations, 143 s). Restitution goes
+  to zero, consistent with the paper's finding that these engines capture inelastic impacts and miss
+  elastic ones.
+- **Reproduce:** convert, then run `riftphys-cube-toss --log cube_tosses.jsonl --fit` and the
+  MuJoCo script.
+
 ## 3. Next
 
+- Close the cube-toss position gap to Drake and Bullet. Look at the worst tosses (tail error),
+  slide-out after landing (Stribeck curve, no position-level friction) and the first impact.
 - Run on real Blackbird flights: its data host (blackbird-dataset.mit.edu) had no DNS record on
   2026-10-11 from local, Google or Cloudflare resolvers. When it is back: one calibration flight
   ("for dynamics, no camera data") first; downloads only with the user's go-ahead.
