@@ -249,7 +249,8 @@ impl World {
             let mut touching_ground = false;
             for c in &contacts {
                 if c.b_collider == TERRAIN_CI && self.colliders[c.a_collider].body.0 == i
-                    && c.depth - MELEE_CCD_MARGIN > -CONTACT_POS_SLOP {
+                    && c.depth - MELEE_CCD_MARGIN > -CONTACT_POS_SLOP
+                    && self.contact_pair_props(c).stiffness <= 0.0 {
                     touching_ground = true; break;
                 }
             }
@@ -338,6 +339,8 @@ impl World {
             let a = self.colliders[c.a_collider].body.0;
             let b = if c.b_collider == TERRAIN_CI { None } else { Some(self.colliders[c.b_collider].body.0) };
             if !movable(a) && !b.map_or(false, movable) { return None; }
+            // Compliant pairs penetrate by design: their normal force is the solver's, not this
+            if self.contact_pair_props(c).stiffness > 0.0 { return None; }
             let pen0 = c.depth - MELEE_CCD_MARGIN;
             let pa = pose_at(a);
             let la = pa.rot.conjugate() * (c.point - pa.pos);

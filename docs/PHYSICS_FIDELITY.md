@@ -181,26 +181,74 @@ on the same data.
 | Bullet (published, fitted) | 14.9 +- 8.9 | 16.5 +- 20.2 | 0.27 +- 0.57 |
 | MuJoCo (published, fitted) | 25.1 +- 10.8 | 21.7 +- 21.4 | 0.38 +- 0.63 |
 | MuJoCo 3.17.0, published fit, this harness, all | 26.9 +- 15.8 | 22.5 +- 19.9 | 0.42 +- 0.59 |
-| **RiftPhys, fitted on even tosses, held out** | **17.7 +- 11.7** | **17.1 +- 19.3** | **0.30 +- 0.57** |
-| RiftPhys, same fit, all tosses | 17.4 +- 10.5 | 16.8 +- 19.5 | 0.29 +- 0.57 |
-| RiftPhys, the cube's measured values (e 0.125, mu 0.18), all | 25.7 +- 13.6 | 23.0 +- 23.7 | 0.48 +- 0.72 |
+| **RiftPhys, compliant contact, fitted on even tosses, held out** | **13.2 +- 9.0** | **17.1 +- 18.9** | **0.29 +- 0.55** |
+| RiftPhys, compliant contact, same fit, all tosses | 13.3 +- 8.5 | 16.8 +- 18.9 | 0.28 +- 0.55 |
+| RiftPhys, rigid contact, fitted on even tosses, held out | 17.7 +- 11.7 | 17.1 +- 19.3 | 0.30 +- 0.57 |
+| RiftPhys, rigid contact, same fit, all tosses | 17.4 +- 10.5 | 16.8 +- 19.5 | 0.29 +- 0.57 |
+| RiftPhys, rigid, the cube's measured values (e 0.125, mu 0.18), all | 25.7 +- 13.6 | 23.0 +- 23.7 | 0.48 +- 0.72 |
 
 What the table shows:
 - **The harness is checked.** MuJoCo run here with the paper's own fitted parameters reproduces its
   published row to within about 10%. The remaining difference is plausibly 570 tosses against the
   paper's 550, and this harness's table height (the median rest height less a half-width).
-- **RiftPhys sits close behind Drake and Bullet** on rotation and e_q, and ahead of MuJoCo.
-- **Position error is the gap:** 17.7% against Drake's 13.5% and Bullet's 14.9%.
-- **The fit:** restitution 0.000, mu_s 0.524, mu_k 0.196 (150 evaluations, 143 s). Restitution goes
-  to zero, consistent with the paper's finding that these engines capture inelastic impacts and miss
-  elastic ones.
-- **Reproduce:** convert, then run `riftphys-cube-toss --log cube_tosses.jsonl --fit` and the
-  MuJoCo script.
+- **With compliant contact, RiftPhys matches Drake and Bullet**, scored on held-out tosses where
+  they were scored on the tosses they were fitted to. Position: 13.2%, against Drake's 13.5% and
+  Bullet's 14.9%. Rotation is within 0.6 degrees and e_q within 0.02. It's well ahead of MuJoCo.
+- **The compliant fit:** k 13591 N/m per contact point, d 3.515 s/m, mu_s 0.220, mu_k 0.186
+  (`--fit --compliant --evals 350 --seed 2`, 92 s). k lands near Drake's 10800.
+- **Fit sensitivity:** with seed 1 and 200 evaluations, CMA-ES stopped at a softer optimum (k 1080,
+  d 2.72, mu_s 0.338, mu_k 0.172). It scores the same e_q (0.29 held out) but 15.7% position. The
+  objective is flat in k, so check more than one seed.
+- **The rigid fit:** restitution 0.000, mu_s 0.524, mu_k 0.196. Restitution goes to zero, consistent
+  with the paper's finding that these engines capture inelastic impacts and miss elastic ones.
+- **Reproduce:** convert, then run `riftphys-cube-toss --log cube_tosses.jsonl --fit [--compliant]`
+  and the MuJoCo script.
+
+**Where the position gap comes from** (`riftphys-cube-toss --diagnose [--params e,mu_s,mu_k]
+[--show N]`, with the fitted parameters):
+
+| phase | finding |
+|---|---|
+| Flight | Accurate: 2.7 mm error just before the first contact, which arrives within a quarter frame of the real one. The dataset's start angular velocities match the measured rotation rate within 1-2% (median). A few tosses, such as #46, have rates that change in free flight, which is tracking noise, not physics. |
+| After landing | This is where the error comes from: 5.5 mm at 0.15 s, 14 mm at 0.3 s, 50 mm at 0.7 s. Simulated cubes travel 255 mm from first contact to rest against the real 284 mm, a 36 mm mean per-toss difference. In toss #46 the simulated cube stops tumbling at its second face landing while the real one keeps rolling. |
+| Friction | Moves the mean travel but not the per-toss scatter: mu 0.15 gives 342 mm, 0.196 gives 255 mm, 0.30 gives 155 mm. The static-friction boost (mu_s) has no effect. |
+| Restitution | Any bounce makes it worse from the first impact on (e 0.125: 7.1 mm at 0.15 s, against 5.5 mm), so the fit picks 0. |
+| Numerics | Not the cause: 740, 1480, 2960 and 5920 Hz give the same travel (255 mm) and the same error curve. The solver already runs 20 + 20 iterations. |
+
+So the gap was the contact model. RiftPhys's contacts were rigid only (restitution and friction).
+Drake, Bullet and MuJoCo were fitted with compliant contact, a stiffness and a dissipation per
+material pair: Drake k 10800 and d 0.4; Bullet k 1800 and c 27; MuJoCo k 3300 and c 45. That
+spreads an impact over a few milliseconds, which is what lets them reproduce edge landings and
+continued tumbling.
+
+**Compliant contact (2026-11-06).** `MatPairProps::stiffness` and `dissipation` switch a material pair
+to Hunt-Crossley contact, as Drake's point contact uses:
+- Each contact point's normal force is k x (1 + d x'), for penetration x and penetration rate x'.
+  It is applied as one impulse per step and never pulls.
+- Friction is the usual Coulomb disc, capped by that force (Stribeck curve as before).
+- The pair skips the rigid normal row, shock propagation, restitution, position-level projection and
+  the terrain grounding guard.
+- Stiffness 0, the default, is the rigid model, unchanged: every scene, test and benchmark gives
+  identical results.
+- Tests in `riftphys-world/tests/compliant_contact_test.rs`:
+  - resting penetration is m g / (4 k) on a box's four corners;
+  - with no dissipation a bounce returns over 90% of its speed, and dissipation removes more the
+    faster the impact;
+  - sliding distance is Coulomb's v^2 / (2 mu g);
+  - steps replay bit-exactly.
+- On the cube tosses (diagnosis with the fitted values): travel after the first contact is 280 mm
+  against the real 284 mm (rigid 255), the per-toss travel difference is 27 mm (rigid 36), and the
+  final pose error is 27 mm (rigid 36).
+- Drake's own values (k 10800, d 0.4, mu 0.10) don't transfer: each engine applies k and friction
+  differently, so the parameters must be fitted per engine, as the paper did.
 
 ## 3. Next
 
-- Close the cube-toss position gap to Drake and Bullet. Look at the worst tosses (tail error),
-  slide-out after landing (Stribeck curve, no position-level friction) and the first impact.
+- **Cube tosses, what's left:** rotation is 0.6 degrees behind Drake and Bullet. The worst tosses
+  (#46, #563) include tracking noise. Next candidates: friction regularization like Drake's (a
+  stiction velocity) and a torsional or rolling friction term.
+- **Compliant contact elsewhere:** offer it per pair to the biped's feet and the seam arm's tool
+  where real compliance matters, and fit it once real captures exist.
 - Run on real Blackbird flights: its data host (blackbird-dataset.mit.edu) had no DNS record on
   2026-10-11 from local, Google or Cloudflare resolvers. When it is back: one calibration flight
   ("for dynamics, no camera data") first; downloads only with the user's go-ahead.

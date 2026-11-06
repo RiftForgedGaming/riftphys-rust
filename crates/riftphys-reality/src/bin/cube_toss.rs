@@ -1,17 +1,89 @@
 //! RiftPhys on real cube tosses (ContactNets), scored as Acosta, Yang & Posa scored Drake, MuJoCo
 //! and Bullet (RA-L 2022, Table V).
 //!
-//!     riftphys-cube-toss --log cube_tosses.jsonl [--hz 1480] [--fit] [--evals 120] [--seed 1]
-//!                        [--out results.json]
+//!     riftphys-cube-toss --log cube_tosses.jsonl [--hz 1480] [--fit [--compliant]] [--evals 120]
+//!                        [--seed 1] [--out results.json]
+//!                        [--diagnose [--params e,mu_s,mu_k[,k,d]] [--show TOSS]]
 //!
 //! Without --fit: the cube's measured parameters (restitution 0.125, friction 0.18), all tosses.
-//! With --fit: CMA-ES on the even-numbered tosses, scored on the odd ones (held out) and on all.
+//! With --fit: CMA-ES on the even-numbered tosses, scored on the odd ones (held out) and on all;
+//! --compliant fits Hunt-Crossley stiffness and dissipation with friction (rigid: restitution and
+//! friction).
 
-use riftphys_reality::cube_toss::{fit, replay_all, summary, table_height, tosses, Params, TossError, PUBLISHED};
+use riftphys_reality::cube_toss::{fit, replay_all, summary, table_height, tosses, Model, Params, Toss, TossError, PUBLISHED};
 use riftphys_reality::log::RealityLog;
 
 fn row(name: &str, s: &[(f32, f32); 3]) -> String {
     format!("{:<34}{:>7.1} +-{:>5.1}{:>8.1} +-{:>5.1}{:>7.2} +-{:>5.2}", name, s[0].0, s[0].1, s[1].0, s[1].1, s[2].0, s[2].1)
+}
+
+/// Where replays go wrong: flight before the first contact, the impact, sliding after it.
+fn diagnose(ts: &[Toss], p: &Params, table_y: f32, hz: f32) {
+    use riftphys_reality::cube_toss::{clearance, pose_error, replay, trace, HALF};
+    let first_contact = |poses: &[(riftphys_core::Vec3, riftphys_core::Quat)]| poses.iter().position(|(q, r)| clearance(*q, *r, table_y) < 0.002);
+    let mean = |v: &[f32]| if v.is_empty() { f32::NAN } else { v.iter().sum::<f32>() / v.len() as f32 };
+    let (mut pre, mut dk, mut slide_r, mut slide_s, mut slide_err, mut rest_p, mut rest_r) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    let buckets = [0.05f64, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7];
+    let mut by_t: Vec<Vec<f32>> = vec![vec![]; buckets.len()];
+    let mut worst: Vec<(f32, u32, f32, f32)> = vec![];
+    for t in ts {
+        let sim = trace(t, p, table_y, hz);
+        let real: Vec<_> = t.pos.iter().zip(&t.rot).map(|(a, b)| (*a, *b)).collect();
+        for (i, b) in buckets.iter().enumerate() {
+            let k = (b / t.dt).round() as usize;
+            if k < sim.len() { by_t[i].push(1000.0 * pose_error(sim[k].0, sim[k].1, real[k].0, real[k].1).0); }
+        }
+        let (Some(kr), Some(ks)) = (first_contact(&real), first_contact(&sim)) else { continue };
+        if kr > 0 { pre.push(1000.0 * pose_error(sim[kr - 1].0, sim[kr - 1].1, real[kr - 1].0, real[kr - 1].1).0); }
+        dk.push(ks as f32 - kr as f32);
+        let flat = |v: riftphys_core::Vec3| riftphys_core::Vec3::new(v.x, 0.0, v.z);
+        let (last_r, last_s) = (real.len() - 1, sim.len() - 1);
+        let sr = flat(real[last_r].0 - real[kr].0);
+        let ss = flat(sim[last_s].0 - sim[ks].0);
+        slide_r.push(1000.0 * sr.length());
+        slide_s.push(1000.0 * ss.length());
+        slide_err.push(1000.0 * (ss - sr).length());
+        let (ep, er) = pose_error(sim[last_s].0, sim[last_s].1, real[last_r].0, real[last_r].1);
+        rest_p.push(1000.0 * ep);
+        rest_r.push(er.to_degrees());
+        let e = replay(t, p, table_y, hz);
+        worst.push((e.e_q, t.index, 1000.0 * flat(real[kr].0 - real[0].0).length(), (real.len() as f64 * t.dt) as f32));
+    }
+    println!("\ndiagnosis with restitution {:.3}, mu_s {:.3}, mu_k {:.3}, stiffness {:.0}, dissipation {:.3}:", p.restitution, p.mu_s, p.mu_k, p.stiffness, p.dissipation);
+    println!("  position error just before the real first contact: mean {:.1} mm (flight: start state, gravity)", mean(&pre));
+    let early = dk.iter().filter(|d| **d < -1.0).count();
+    let late = dk.iter().filter(|d| **d > 1.0).count();
+    println!("  first contact, sim minus real: mean {:+.2} frames; {} early, {} late by more than one frame (of {})", mean(&dk), early, late, dk.len());
+    println!("  horizontal travel from first contact to rest: real {:.1} mm, sim {:.1} mm; difference {:.1} mm", mean(&slide_r), mean(&slide_s), mean(&slide_err));
+    println!("  final pose error: {:.1} mm, {:.1} deg (cube width {:.1} mm)", mean(&rest_p), mean(&rest_r), 2000.0 * HALF);
+    let cells: Vec<String> = buckets.iter().zip(&by_t).map(|(b, v)| format!("{:.2}s {:>5.1}", b, mean(v))).collect();
+    println!("  mean position error (mm) at time since release: {}", cells.join(" | "));
+    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    println!("  worst tosses (e_q, toss, horizontal flight mm, length s): {}",
+        worst.iter().take(8).map(|w| format!("{:.2} #{} {:.0}mm {:.2}s", w.0, w.1, w.2, w.3)).collect::<Vec<_>>().join("; "));
+}
+
+/// One toss frame by frame: real and simulated centre height, lowest-corner clearance, horizontal
+/// speed and spin (finite differences), and the error.
+fn show(t: &Toss, p: &Params, table_y: f32, hz: f32) {
+    use riftphys_reality::cube_toss::{clearance, pose_error, trace};
+    let sim = trace(t, p, table_y, hz);
+    let rate = |a: &[(riftphys_core::Vec3, riftphys_core::Quat)], k: usize| -> (f32, f32) {
+        if k == 0 { return (0.0, 0.0); }
+        let d = a[k].0 - a[k - 1].0;
+        let mut q = a[k].1 * a[k - 1].1.conjugate();
+        if q.w < 0.0 { q = -q; }
+        (((d.x * d.x + d.z * d.z).sqrt() / t.dt as f32), 2.0 * riftphys_core::Vec3::new(q.x, q.y, q.z).length().min(1.0).asin() / t.dt as f32)
+    };
+    let real: Vec<_> = t.pos.iter().zip(&t.rot).map(|(a, b)| (*a, *b)).collect();
+    println!("\ntoss #{}: frame  | real: clear mm  vxz m/s  spin rad/s | sim: clear mm  vxz m/s  spin rad/s | err mm  deg", t.index);
+    for k in (0..real.len()).step_by(3) {
+        let (rv, rw) = rate(&real, k);
+        let (sv, sw) = rate(&sim, k);
+        let (ep, er) = pose_error(sim[k].0, sim[k].1, real[k].0, real[k].1);
+        println!("  {:>4} {:>5.3}s | {:>8.1} {:>8.2} {:>8.1} | {:>8.1} {:>8.2} {:>8.1} | {:>6.1} {:>5.1}", k, k as f64 * t.dt,
+            1000.0 * clearance(real[k].0, real[k].1, table_y), rv, rw, 1000.0 * clearance(sim[k].0, sim[k].1, table_y), sv, sw, 1000.0 * ep, er.to_degrees());
+    }
 }
 
 fn main() {
@@ -43,20 +115,37 @@ fn main() {
         let train: Vec<_> = ts.iter().filter(|t| t.index % 2 == 0).cloned().collect();
         let test: Vec<_> = ts.iter().filter(|t| t.index % 2 == 1).cloned().collect();
         let t1 = std::time::Instant::now();
-        let (p, used) = fit(&train, &measured, table_y, hz, evals, seed);
+        let model = if args.iter().any(|a| a == "--compliant") { Model::Compliant } else { Model::Rigid };
+        let start = if model == Model::Compliant { Params::compliant_start() } else { measured };
+        let (p, used) = fit(&train, model, &start, table_y, hz, evals, seed);
         let pick = |es: &[TossError], set: &[riftphys_reality::cube_toss::Toss]| -> Vec<TossError> {
             let ids: std::collections::BTreeSet<u32> = set.iter().map(|t| t.index).collect();
             ts.iter().zip(es).filter(|(t, _)| ids.contains(&t.index)).map(|(_, e)| *e).collect()
         };
         let fitted = replay_all(&ts, &p, table_y, hz);
-        println!("\nfit on {} even tosses: {} evaluations in {:.0} s -> restitution {:.3}, mu_s {:.3}, mu_k {:.3}",
-            train.len(), used, t1.elapsed().as_secs_f32(), p.restitution, p.mu_s, p.mu_k);
+        println!("\n{:?} fit on {} even tosses: {} evaluations in {:.0} s -> restitution {:.3}, mu_s {:.3}, mu_k {:.3}, stiffness {:.0} N/m, dissipation {:.3} s/m",
+            model, train.len(), used, t1.elapsed().as_secs_f32(), p.restitution, p.mu_s, p.mu_k, p.stiffness, p.dissipation);
         println!("{}", row("RiftPhys, measured, held-out", &summary(&pick(&base, &test))));
         println!("{}", row("RiftPhys, fitted, held-out", &summary(&pick(&fitted, &test))));
         println!("{}", row("RiftPhys, fitted, all", &summary(&fitted)));
-        out["fitted"] = serde_json::json!({ "params": [p.restitution, p.mu_s, p.mu_k], "evals": used,
+        out["fitted"] = serde_json::json!({ "model": format!("{:?}", model), "params": [p.restitution, p.mu_s, p.mu_k, p.stiffness, p.dissipation], "evals": used,
             "held_out": summary(&pick(&fitted, &test)), "all": summary(&fitted),
             "measured_held_out": summary(&pick(&base, &test)) });
+    }
+    if args.iter().any(|a| a == "--diagnose") {
+        let p = match get("--params") {
+            Some(s) => {
+                let v: Vec<f32> = s.split(',').map(|x| x.parse().unwrap()).collect();
+                Params { restitution: v[0], mu_s: v[1], mu_k: v[2], stiffness: *v.get(3).unwrap_or(&0.0), dissipation: *v.get(4).unwrap_or(&0.0) }
+            }
+            None => measured,
+        };
+        diagnose(&ts, &p, table_y, hz);
+        if let Some(n) = get("--show") {
+            let n: u32 = n.parse().unwrap();
+            let t = ts.iter().find(|t| t.index == n).expect("no such toss");
+            show(t, &p, table_y, hz);
+        }
     }
     if let Some(path) = get("--out") {
         std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap()).unwrap();

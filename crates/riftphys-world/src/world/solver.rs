@@ -58,6 +58,10 @@ struct ContactConstraint {
     /// pair still `gap` apart approach by up to gap/dt (speculative contact)
     depth_bias: f32,
     restitution_bias: f32,
+    /// Compliant pair (`MatPairProps::stiffness` > 0): the normal impulse is the Hunt-Crossley
+    /// force over the step, `soft_jn`, applied once; no rigid normal row, shock or restitution
+    soft: bool,
+    soft_jn: f32,
 }
 
 /// One velocity-level row of a D6 joint. Linear rows constrain the anchors' relative velocity
@@ -178,6 +182,13 @@ fn apply_contact_impulse(bodies: &mut riftphys_dynamics::dynamics::Bodies, cs: &
 }
 
 impl World {
+    /// The pair properties a contact is solved with (terrain contacts use the environment's material).
+    pub(super) fn contact_pair_props(&self, c: &Contact) -> mats::MatPairProps {
+        self.pair_props(self.colliders[c.a_collider].material.id,
+                        if c.b_collider == TERRAIN_CI { c.env_material.unwrap_or(mats::MaterialId::Default) }
+                        else { self.colliders[c.b_collider].material.id })
+    }
+
     /// Sequential-impulse contact solve. `margin` is the contact distance the narrowphase added to
     /// every reported depth: true penetration is `depth - margin`, and pairs still apart are
     /// solved speculatively instead of being pushed apart.
@@ -201,9 +212,7 @@ impl World {
             let ii_a = if inv_a > 0.0 { self.bodies.inv_inertia_world(ai) } else { Mat3::ZERO };
             let ii_b = if inv_b > 0.0 { self.bodies.inv_inertia_world(bi) } else { Mat3::ZERO };
 
-            let pair = self.pair_props(self.colliders[c.a_collider].material.id,
-                                        if b_is_terrain { c.env_material.unwrap_or(mats::MaterialId::Default) }
-                                        else { self.colliders[c.b_collider].material.id });
+            let pair = self.contact_pair_props(c);
 
             // Narrowphase normals point A -> B for every pair, terrain included
             let normal = c.normal;
@@ -224,6 +233,8 @@ impl World {
                 normal, t1, t2, mu_s: pair.mu_s, mu_k: pair.mu_k, stribeck_v: pair.stribeck_v.max(1e-4),
                 depth_bias: 0.0,
                 restitution_bias: 0.0,
+                soft: pair.stiffness > 0.0,
+                soft_jn: 0.0,
             };
             let pen = c.depth - margin;
             cs.depth_bias = if pen > 0.0 { ((pen - slop).max(0.0) * (beta / dt)).min(2.0) } else { pen / dt };
@@ -233,6 +244,16 @@ impl World {
             let v_pre = ((vb.lin + vb.ang.cross(rb)) - (va.lin + va.ang.cross(ra))).dot(normal);
             // Approach speed at mid-step (between the start-of-step and after-gravity velocities)
             let v_rel_n = 0.5 * (v_pre + contact_rel_vel(&self.bodies, &cs).dot(normal));
+            if cs.soft {
+                // Hunt-Crossley: f = k x (1 + d x'), x the true penetration, x' its rate (the
+                // mid-step approach speed); never pulls. No rigid row, so nothing to bias.
+                cs.depth_bias = 0.0;
+                if pen > 0.0 {
+                    let f = pair.stiffness * pen * (1.0 + pair.dissipation * (-v_rel_n));
+                    cs.soft_jn = f.max(0.0) * dt;
+                }
+                return cs;
+            }
             // Applied after the solve, only to contacts that carried load (see below)
             if v_rel_n < -1.0 { cs.restitution_bias = -pair.restitution * v_rel_n; }
             cs
@@ -311,6 +332,13 @@ impl World {
         let joints_ref = &self.joints;
         let num_constraints = constraints.len();
         let constraints_slice = constraints.as_slice();
+        // Compliant contacts: their whole normal impulse, once, before the iterations
+        for (c_idx, cs) in constraints.iter().enumerate() {
+            if cs.soft && cs.soft_jn > 0.0 {
+                acc_jn[c_idx] = cs.soft_jn;
+                apply_contact_impulse(&mut self.bodies, cs, cs.normal * cs.soft_jn);
+            }
+        }
 
         for _it in 0..iterations {
             // A. Solve Joints (Batched Parallel)
@@ -360,13 +388,16 @@ impl World {
 
                     let acc_jt_slice = unsafe { acc_jt_ptr.get_mut_slice(num_constraints * 2) };
 
-                    // Normal: accumulated impulse clamped >= 0
-                    let v_rel_n = contact_rel_vel(bodies, cs).dot(cs.normal);
-                    let jn_raw = (cs.depth_bias - v_rel_n) * cs.m_n;
-                    let old_jn = acc_jn_slice[c_idx];
-                    let new_jn = (old_jn + jn_raw).max(0.0);
-                    acc_jn_slice[c_idx] = new_jn;
-                    apply_contact_impulse(bodies, cs, cs.normal * (new_jn - old_jn));
+                    // Normal: accumulated impulse clamped >= 0 (compliant: fixed, applied above)
+                    let new_jn = if cs.soft { acc_jn_slice[c_idx] } else {
+                        let v_rel_n = contact_rel_vel(bodies, cs).dot(cs.normal);
+                        let jn_raw = (cs.depth_bias - v_rel_n) * cs.m_n;
+                        let old_jn = acc_jn_slice[c_idx];
+                        let new_jn = (old_jn + jn_raw).max(0.0);
+                        acc_jn_slice[c_idx] = new_jn;
+                        apply_contact_impulse(bodies, cs, cs.normal * (new_jn - old_jn));
+                        new_jn
+                    };
 
                     // Friction: accumulated tangent impulse kept inside the Coulomb disc mu * jn
                     let v_f = contact_rel_vel(bodies, cs);
@@ -393,7 +424,7 @@ impl World {
             let ha = self.bodies.pose(cs.ai).pos.dot(up);
             if cs.b_is_terrain { f32::NEG_INFINITY } else { ha.min(self.bodies.pose(cs.bi).pos.dot(up)) }
         };
-        let mut order: Vec<usize> = (0..constraints.len()).filter(|&i| constraints[i].inv_a > 0.0 || constraints[i].inv_b > 0.0).collect();
+        let mut order: Vec<usize> = (0..constraints.len()).filter(|&i| !constraints[i].soft && (constraints[i].inv_a > 0.0 || constraints[i].inv_b > 0.0)).collect();
         order.sort_by(|&x, &y| height(&constraints[x]).partial_cmp(&height(&constraints[y])).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y)));
         for &c_idx in &order {
             let mut cs = constraints[c_idx];

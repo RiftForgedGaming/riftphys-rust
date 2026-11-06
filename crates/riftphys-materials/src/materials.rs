@@ -74,6 +74,12 @@ pub struct MatPairProps {
     pub mu_k: f32,        // kinetic plateau (used when v is high)
     pub restitution: f32,
     pub stribeck_v: f32,  // blended; used to compute mu_k(v)
+    /// Compliant (Hunt-Crossley) contact, opt in per pair: normal force per contact point
+    /// k x (1 + d x') for penetration x (m) and penetration rate x' (m/s), with stiffness k (N/m)
+    /// and dissipation d (s/m), as Drake's point contact. 0 (the default) keeps the rigid model:
+    /// non-penetration, `restitution` for bounce. A compliant pair ignores `restitution`.
+    pub stiffness: f32,
+    pub dissipation: f32,
 }
 
 /// Base single-material table.
@@ -268,7 +274,7 @@ fn mix_pair(a: MatProps, b: MatProps) -> MatPairProps {
     let restitution = q(a.restitution.max(b.restitution));
     let stribeck_v  = q(0.5 * (a.stribeck_v + b.stribeck_v));
 
-    MatPairProps { mu_s, mu_k, restitution, stribeck_v }
+    MatPairProps { mu_s, mu_k, restitution, stribeck_v, stiffness: 0.0, dissipation: 0.0 }
 }
 
 
@@ -281,6 +287,8 @@ pub fn pair_props(a: MaterialId, b: MaterialId) -> MatPairProps {
             mu_k:        q(ov.mu_k.unwrap_or(base.mu_k)),
             restitution: q(ov.restitution.unwrap_or(base.restitution)),
             stribeck_v:  q(ov.stribeck_v.unwrap_or(base.stribeck_v)),
+            stiffness: 0.0,
+            dissipation: 0.0,
         }
     } else {
         base

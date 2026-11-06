@@ -79,21 +79,38 @@ pub fn table_height(ts: &[Toss]) -> f32 {
     y[y.len() / 2]
 }
 
-/// Contact parameters of the cube on the table: restitution, static and kinetic friction.
+/// Contact parameters of the cube on the table: restitution and friction for the rigid model;
+/// stiffness k (N/m per contact point) and dissipation d (s/m) switch the pair to compliant
+/// (Hunt-Crossley) contact, where restitution is unused.
 #[derive(Clone, Copy, Debug)]
-pub struct Params { pub restitution: f32, pub mu_s: f32, pub mu_k: f32 }
+pub struct Params { pub restitution: f32, pub mu_s: f32, pub mu_k: f32, pub stiffness: f32, pub dissipation: f32 }
+
+/// Which contact model a fit searches.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Model { Rigid, Compliant }
 
 impl Params {
-    /// The cube's measured values (Acosta et al. Table I): restitution 0.125, friction 0.18.
-    pub fn measured() -> Self { Self { restitution: 0.125, mu_s: 0.18, mu_k: 0.18 } }
-    pub const NAMES: [&'static str; 3] = ["restitution", "mu_s", "mu_k"];
-    pub const BOUNDS: [(f32, f32); 3] = [(0.0, 0.9), (0.02, 1.0), (0.02, 1.0)];
-    fn from_unit(x: &[f64]) -> Self {
-        let m = |i: usize| { let (lo, hi) = Self::BOUNDS[i]; lo + (hi - lo) * x[i].clamp(0.0, 1.0) as f32 };
-        Self { restitution: m(0), mu_s: m(1), mu_k: m(2) }
+    /// The cube's measured values (Acosta et al. Table I): restitution 0.125, friction 0.18, rigid.
+    pub fn measured() -> Self { Self { restitution: 0.125, mu_s: 0.18, mu_k: 0.18, stiffness: 0.0, dissipation: 0.0 } }
+    /// A compliant start: Drake's fitted contact (k 10800 N/m, d 0.4 s/m) with the measured friction.
+    pub fn compliant_start() -> Self { Self { stiffness: 10800.0, dissipation: 0.4, ..Self::measured() } }
+
+    /// Unit-box coordinates searched for each model. Rigid: restitution, mu_s, mu_k. Compliant:
+    /// log10 k in [2.5, 5.5], d in [0, 5], mu_s, mu_k.
+    fn from_unit(model: Model, x: &[f64]) -> Self {
+        let u = |i: usize, lo: f32, hi: f32| lo + (hi - lo) * x[i].clamp(0.0, 1.0) as f32;
+        match model {
+            Model::Rigid => Self { restitution: u(0, 0.0, 0.9), mu_s: u(1, 0.02, 1.0), mu_k: u(2, 0.02, 1.0), stiffness: 0.0, dissipation: 0.0 },
+            Model::Compliant => Self { restitution: 0.0, stiffness: 10f32.powf(u(0, 2.5, 5.5)), dissipation: u(1, 0.0, 5.0),
+                                       mu_s: u(2, 0.02, 1.0), mu_k: u(3, 0.02, 1.0) },
+        }
     }
-    fn to_unit(&self) -> Vec<f64> {
-        [self.restitution, self.mu_s, self.mu_k].iter().zip(Self::BOUNDS).map(|(v, (lo, hi))| ((v - lo) / (hi - lo)) as f64).collect()
+    fn to_unit(&self, model: Model) -> Vec<f64> {
+        let n = |v: f32, lo: f32, hi: f32| ((v - lo) / (hi - lo)).clamp(0.0, 1.0) as f64;
+        match model {
+            Model::Rigid => vec![n(self.restitution, 0.0, 0.9), n(self.mu_s, 0.02, 1.0), n(self.mu_k, 0.02, 1.0)],
+            Model::Compliant => vec![n(self.stiffness.max(1.0).log10(), 2.5, 5.5), n(self.dissipation, 0.0, 5.0), n(self.mu_s, 0.02, 1.0), n(self.mu_k, 0.02, 1.0)],
+        }
     }
 }
 
@@ -108,8 +125,40 @@ pub struct TossError {
     pub e_q: f32,
 }
 
-/// Replays one toss from its measured first state at `SIM_HZ` and scores it at the logged frames.
+/// Replays one toss from its measured first state at `hz` and scores it at the logged frames.
 pub fn replay(t: &Toss, p: &Params, table_y: f32, hz: f32) -> TossError {
+    let sim = trace(t, p, table_y, hz);
+    let (mut pos, mut rot, mut eq) = (0.0f32, 0.0f32, 0.0f32);
+    for (k, (sp, sr)) in sim.iter().enumerate().skip(1) {
+        let (dp, ang) = pose_error(*sp, *sr, t.pos[k], t.rot[k]);
+        pos += dp / (2.0 * HALF);
+        rot += ang;
+        // Eq. 3 as published: (2/l) times the squared distance in metres, plus the angle squared
+        eq += dp * dp / HALF + ang * ang;
+    }
+    let n = (sim.len() - 1) as f32;
+    TossError { pos_pct: 100.0 * pos / n, rot_deg: rot.to_degrees() / n, e_q: eq / n }
+}
+
+/// Position error (m) and rotation angle (rad) between a simulated and a measured pose.
+pub fn pose_error(sp: Vec3, sr: Quat, mp: Vec3, mr: Quat) -> (f32, f32) {
+    let mut dq = sr * mr.conjugate();
+    if dq.w < 0.0 { dq = -dq; }
+    ((sp - mp).length(), 2.0 * Vec3::new(dq.x, dq.y, dq.z).length().atan2(dq.w))
+}
+
+/// Height of the cube's lowest corner above the table.
+pub fn clearance(pos: Vec3, rot: Quat, table_y: f32) -> f32 {
+    let mut lo = f32::MAX;
+    for i in 0..8 {
+        let c = Vec3::new(if i & 1 == 0 { -HALF } else { HALF }, if i & 2 == 0 { -HALF } else { HALF }, if i & 4 == 0 { -HALF } else { HALF });
+        lo = lo.min((pos + rot * c).y);
+    }
+    lo - table_y
+}
+
+/// The simulated pose at every logged frame of a toss (frame 0 = the measured start).
+pub fn trace(t: &Toss, p: &Params, table_y: f32, hz: f32) -> Vec<(Vec3, Quat)> {
     let mut world = World::with_capacity(4, 4);
     world.set_gravity(Vec3::new(0.0, -9.81, 0.0));
     let ground = world.add_body(Isometry { pos: Vec3::new(0.0, table_y - 0.5, 0.0), rot: Quat::IDENTITY }, Velocity::default(), MassProps::infinite(), false);
@@ -118,6 +167,8 @@ pub fn replay(t: &Toss, p: &Params, table_y: f32, hz: f32) -> TossError {
     props.restitution = p.restitution;
     props.mu_k = p.mu_k;
     props.mu_s = p.mu_s.max(p.mu_k);
+    props.stiffness = p.stiffness;
+    props.dissipation = p.dissipation;
     world.set_pair_props(CUBE, TABLE, props);
     let mut mp = MassProps::from_box_density(Vec3::splat(HALF), MASS / (8.0 * HALF * HALF * HALF));
     mp.inertia = Mat3::from_diagonal(Vec3::splat(INERTIA).into());
@@ -127,22 +178,13 @@ pub fn replay(t: &Toss, p: &Params, table_y: f32, hz: f32) -> TossError {
 
     let sub = ((t.dt * hz as f64).round() as usize).max(1);
     let h = (t.dt / sub as f64) as f32;
-    let (mut pos, mut rot, mut eq) = (0.0f32, 0.0f32, 0.0f32);
-    let n = t.pos.len() - 1;
-    for k in 1..=n {
+    let mut out = vec![(t.pos[0], t.rot[0])];
+    for _ in 1..t.pos.len() {
         for _ in 0..sub { world.step(h); }
         let s = world.get_body_pose(cube);
-        let dp = (s.pos - t.pos[k]).length();
-        let mut dq = s.rot * t.rot[k].conjugate();
-        if dq.w < 0.0 { dq = -dq; }
-        let ang = 2.0 * Vec3::new(dq.x, dq.y, dq.z).length().atan2(dq.w);
-        pos += dp / (2.0 * HALF);
-        rot += ang;
-        // Eq. 3 as published: (2/l) times the squared distance in metres, plus the angle squared
-        eq += dp * dp / HALF + ang * ang;
+        out.push((s.pos, s.rot));
     }
-    let n = n as f32;
-    TossError { pos_pct: 100.0 * pos / n, rot_deg: rot.to_degrees() / n, e_q: eq / n }
+    out
 }
 
 /// Replays every toss (in parallel; results in toss order, so totals are deterministic).
@@ -166,13 +208,13 @@ pub fn summary(es: &[TossError]) -> [(f32, f32); 3] {
     [stat(&|e| e.pos_pct), stat(&|e| e.rot_deg), stat(&|e| e.e_q)]
 }
 
-/// Fits the contact parameters by CMA-ES, minimizing mean e_q over `train`.
-pub fn fit(train: &[Toss], init: &Params, table_y: f32, hz: f32, max_evals: usize, seed: u64) -> (Params, usize) {
+/// Fits the contact parameters of `model` by CMA-ES, minimizing mean e_q over `train`.
+pub fn fit(train: &[Toss], model: Model, init: &Params, table_y: f32, hz: f32, max_evals: usize, seed: u64) -> (Params, usize) {
     let r = cmaes::minimize(|x| {
-        let es = replay_all(train, &Params::from_unit(x), table_y, hz);
+        let es = replay_all(train, &Params::from_unit(model, x), table_y, hz);
         es.iter().map(|e| e.e_q as f64).sum::<f64>() / es.len() as f64
-    }, &init.to_unit(), 0.25, max_evals, seed);
-    (Params::from_unit(&r.x), r.evals)
+    }, &init.to_unit(model), 0.25, max_evals, seed);
+    (Params::from_unit(model, &r.x), r.evals)
 }
 
 #[cfg(test)]
@@ -210,7 +252,7 @@ mod tests {
         }
         let e = replay(&t, &p, 0.0, SIM_HZ);
         assert!(e.e_q < 1e-8 && e.pos_pct < 1e-3, "self replay {:?}", e);
-        let other = replay(&t, &Params { restitution: 0.6, mu_s: 0.6, mu_k: 0.5 }, 0.0, SIM_HZ);
+        let other = replay(&t, &Params { restitution: 0.6, mu_s: 0.6, mu_k: 0.5, ..Params::measured() }, 0.0, SIM_HZ);
         assert!(other.e_q > 1e-3, "parameters had no effect: {:?}", other);
         // The cube really hit the table and settled on a face
         assert!((t.pos.last().unwrap().y - HALF).abs() < 0.003, "rest height {}", t.pos.last().unwrap().y);
