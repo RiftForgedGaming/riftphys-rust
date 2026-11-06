@@ -630,11 +630,13 @@ impl SeamEnv {
     /// Whether the torch is on the seam proper (scored).
     pub fn on_seam(&self) -> bool { self.travelling() && self.s_torch() >= 0.0 }
 
-    /// The profiler as read this tick: exact ranges plus seeded noise.
+    /// The profiler as read this tick: exact ranges plus seeded noise. One draw per ray, hit or
+    /// not (a miss discards it), so the noise stream does not depend on which rays hit: two
+    /// episodes from the same seed see the same noise whatever their controllers do.
     fn read_profiler(&mut self) -> Vec<Option<f32>> {
         let clean = self.cfg.profiler.scan(&self.world, &self.arm);
         let noise = self.cfg.noise;
-        clean.into_iter().map(|r| r.map(|r| r + self.rng.range(-noise, noise))).collect()
+        clean.into_iter().map(|r| { let n = self.rng.range(-noise, noise); r.map(|r| r + n) }).collect()
     }
 
     /// The ideal TCP at the TCP's own position along the real seam, and the seam frame there.

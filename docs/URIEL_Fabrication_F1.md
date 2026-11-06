@@ -88,7 +88,9 @@ arm's own links are skipped.
 
 Output per ray: the range in metres, or `null` when nothing is hit within range. Readings are a pure
 function of the world state, so they never change `step_hash`. Sensor noise (default 0.1 mm,
-uniform) is drawn from the episode's seeded `Rng`, never the world's.
+uniform) is drawn from the episode's seeded `Rng`, never the world's: one draw per ray every tick,
+hit or not, so two episodes from the same seed see the same noise whatever their controllers do
+(an exact counterfactual for a learned residual against the teacher alone).
 
 **Seam finder (`find_seam`).** Butt and V: the two groove walls cross half the groove depth; the
 seam is midway between the crossings, at the root depth below the measured plate top. Fillet: the
