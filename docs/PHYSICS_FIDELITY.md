@@ -11,14 +11,15 @@ cargo run --release -p riftphys-reality --bin riftphys-fidelity [-- --hz 60,240 
 ```
 
 Each case compares one measured quantity with its textbook value under a stated tolerance.
-`benchmarks_hold_at_240_hz` (a test) keeps them there; the only accepted gap is listed below.
+`benchmarks_hold_at_240_hz` (a test) keeps them there, with no accepted gaps since SHAKE joint
+projection (2026-11-06).
 
 | Case | 60 Hz | 240 Hz | Tolerance |
 |---|---|---|---|
 | Free fall, 1 s drop | 0.00% | 0.01% | 1% |
-| Simple pendulum period (distance joint) / amplitude after 30 s | 0.03% / 0.983 | 0.04% / 0.999 | 1% / +-0.02 |
-| Hinged rod period (real inertia) / amplitude after 30 s | 0.01% / 0.991 | 0.06% / 0.995 | 1% / +-0.02 |
-| **Large swing** (rod released at 90 degrees), energy after 10 s | **0.43** | **0.77** | +-0.02 (open) |
+| Simple pendulum period (distance joint) / amplitude after 30 s | 0.02% / 1.011 | 0.04% / 0.999 | 1% / +-0.02 |
+| Hinged rod period (real inertia) / amplitude after 30 s | 0.02% / 1.002 | 0.04% / 1.003 | 1% / +-0.02 |
+| **Large swing** (rod released at 90 degrees), energy after 10 s | **0.975** (range 0.973-1.029) | 0.993 | +-0.02 |
 | Sliding to rest from 3 m/s (kinetic friction) | 2.5% | 0.6% | 5% |
 | Static friction holds on a slope below atan(mu_s) | 0 mm | 0 mm | 5 mm |
 | Incline slide, g(sin - mu_k cos) | 2.9% | 4.8% | 5% |
@@ -46,22 +47,25 @@ The first run (before this work) passed 9/18 at 60 Hz and 11/18 at 240 Hz.
 | Semi-implicit Euler: free fall 1.7% long at 60 Hz | Ballistic bodies move with the average of the last step's end velocity and this step's: exact for constant forces, thrust included |
 | A 1000 kg box dropped on a 1 kg box crushed through it | Shock propagation (bottom-up pass, lower body immovable) in the velocity and position solves |
 | Velocity motors added kd x error straight to the velocity (diverges for kd > 2) and the axis was also pinned to 0 at position level, so a motor could not turn a joint | Motor = velocity-level constraint row with impulse cap; velocity-driven axes free at position level |
+| Fast joints kept bleeding energy (large swing 0.43 at 60 Hz): the position solve corrected along directions at the drifted pose while the velocity solve used the start-of-step pose, which is not symplectic | SHAKE joint projection: corrections along the start-of-step directions (docs/JOINT_ENERGY_SPEC.md) |
 
-`world_robotics_test`: 3 failing tests before -> 1 (the large-swing energy test, below). The
-mass-ratio test never had colliders (it measured free fall) and the motor test expected the
-wrong sign (+x rotation carries -y toward -z); both fixed.
+`world_robotics_test`: 3 failing tests before -> 1 (the pendulum energy test) -> 0 with SHAKE
+projection. The mass-ratio test never had colliders (it measured free fall) and the motor test
+expected the wrong sign (+x rotation carries -y toward -z); both fixed.
 
 ### Open gaps
 
-- **Fast joint motion loses energy.** A hinged rod released horizontal keeps 43% of its energy
-  after 10 s at 60 Hz, 77% at 240 Hz, 87% at 480 Hz; small swings are fine (99%). Per-stage
-  measurement puts the loss in velocity projection of maximal-coordinate joints: each step the
-  joint's velocity solve removes the part of the velocity that has turned away from the tangent.
-  Tried without effect: solving locked point rows along the error direction, splitting joint
-  drift out of the velocity (it also broke the biped), half-step gravity for constrained bodies
-  (pendulums then gain energy). Candidate fixes: reduced-coordinate articulations (Featherstone /
-  MuJoCo-style generalized coordinates) or a RATTLE-consistent rigid-body integrator. Matters for
-  robot limbs: fast joints are where fidelity counts.
+- **Fast joint motion lost energy: closed 2026-11-06.**
+  - **Before:** a hinged rod released horizontal kept 43% of its energy after 10 s at 60 Hz and
+    77% at 240 Hz.
+  - **The cause:** the joint position solve corrected along directions measured at the drifted
+    pose, while the velocity solve used the start-of-step pose. That combination is not
+    symplectic.
+  - **The fix:** SHAKE projection corrects along the start-of-step directions. That makes the
+    pair one impulse that lands the bodies on the constraint, a RATTLE-consistent scheme.
+  - **Now:** 0.975 at 60 Hz, bounded within 0.973–1.029 with no trend, and 0.993 at 240 Hz.
+  - Details, plus three smaller joint findings (lever-arm conditioning, the hinge limit's
+    2 sin(φ/2) measure, the compliant-row multiplier), are in docs/JOINT_ENERGY_SPEC.md.
 - **Restitution at 60 Hz overshoots 13%:** a bounce reverses the velocity for the whole step,
   losing the gravity of the part after impact. Use >= 240 Hz for fidelity runs (3.5%).
 - **Static friction is a velocity-level approximation:** no position-level friction, so creep is
@@ -70,7 +74,8 @@ wrong sign (+x rotation carries -y toward -z); both fixed.
 Downstream (same seeds as before): drone M1 unchanged (expert 0.043 m, URIEL DAgger 0.073 m);
 M2 squad DAgger 0.199 m; biped M3 still met (DAgger 92.5%; the stand teacher holds 20/20 at
 12 N s but 12/20 at 20 N s, from 20/20: the old solver's numerical damping helped it recover).
-Physics cost 50 -> 69 us per biped step (velocity-level joint rows).
+Physics cost 50 -> 69 us per biped step (velocity-level joint rows). With SHAKE projection
+(2026-11-06) the stand teacher holds 12/20 at 20 N s again (10/20 just before).
 
 ## 2. Reality logs, replay and fitting
 
@@ -293,4 +298,5 @@ Bullet's 16.5. Over all tosses it's 16.8.
   2026-10-11 from local, Google or Cloudflare resolvers. When it is back: one calibration flight
   ("for dynamics, no camera data") first; downloads only with the user's go-ahead.
 - Own captures once mocap is set up: drops, tosses, sliding blocks, pendulums, then a Crazyflie.
-- Close the fast-joint energy gap (above) before trusting fast limb motion.
+- Joints: block-solve each joint's rows so limits feel the inertia about the pivot (small bobs
+  on long arms), and measure hinge limits in radians (docs/JOINT_ENERGY_SPEC.md, 5.4).

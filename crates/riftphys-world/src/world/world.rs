@@ -106,6 +106,19 @@ pub struct SweepHit {
     pub normal: Vec3,
 }
 
+/// How the position-level joint solve chooses the directions it corrects along. Errors are
+/// always measured at the current iterate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JointProjection {
+    /// Directions at the current iterate (standard PBD/XPBD). Dissipates at first order in dt:
+    /// a hinged pendulum keeps about 90% of its swing energy per period at 62.5 Hz.
+    Pbd,
+    /// Directions at the start of the step, the configuration the velocity solve used (SHAKE).
+    /// Symplectic: free joints keep their energy (no secular drift). The default.
+    #[default]
+    Shake,
+}
+
 /* ---------------- Builder ---------------- */
 
 pub struct WorldBuilder {
@@ -159,6 +172,8 @@ pub struct World {
     pub(super) joints: Joints,
     /// (velocity, position) solver iterations per step; see `set_solver_iterations`
     pub(super) solver_iters: (u32, u32),
+    /// How the position-level joint solve chooses its correction directions
+    pub(super) joint_projection: JointProjection,
     /// Velocities at the start of the current step, before forces (restitution uses the
     /// approach speed, not one that already includes this step's gravity)
     pub(super) pre_step_vel: Vec<Velocity>,
@@ -263,6 +278,7 @@ impl World {
             gravity_proc: GravitySpec::Uniform { g: [g.x, g.y, g.z] },
             joints: Joints::new(),
             solver_iters: (20, 20),
+            joint_projection: JointProjection::default(),
             pre_step_vel: Vec::new(),
             pair_overrides: Vec::new(),
             last_lin_vel: Vec::new(),
@@ -604,6 +620,21 @@ impl World {
         self.solver_iters = (velocity.max(1), position.max(1));
     }
 
+    /// How the position-level joint solve in `step` chooses its correction directions.
+    pub fn set_joint_projection(&mut self, p: JointProjection) { self.joint_projection = p; }
+    pub fn joint_projection(&self) -> JointProjection { self.joint_projection }
+
+    /// The joint solve inside `step`: SHAKE directions from the start-of-step poses `start`
+    /// (indexed by body), or PBD.
+    pub(super) fn solve_joints_in_step(&mut self, dt: f32, start: &[Isometry]) {
+        match self.joint_projection {
+            JointProjection::Shake => self.joints.solve_shake(&mut self.bodies, dt, 1, start),
+            JointProjection::Pbd => self.joints.solve(&mut self.bodies, dt, 1),
+        }
+    }
+
+    /// Position-level joint solve from the current poses (PBD directions; used outside `step`,
+    /// e.g. to settle a pose).
     pub fn solve_joints(&mut self, dt: f32, iterations: u32) {
         // 1. Standard XPBD Solve
         self.joints.solve(&mut self.bodies, dt, iterations);

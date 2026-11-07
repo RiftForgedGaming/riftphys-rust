@@ -155,37 +155,36 @@ fn test_pvr_energy_conservation_pendulum() {
     );
 
     let dt = 0.016f32;
-    let mut initial_energy = 0.0;
 
-    // Capture initial energy state after 1st tick
-    world.step(dt);
-    for event in world.ledger.iter() {
-        if let LedgerEvent::SystemEnergy { total, .. } = event {
-            initial_energy = *total;
+    // Swing energy: the ledger's total minus the potential energy at the bottom of the arc
+    // (y = 15). The ledger measures height from y = 0, and with the pendulum 20 m up that
+    // constant hid three quarters of the loss (97.6% total was 90.3% of the swing).
+    let floor = 80.0 * 9.81 * 15.0;
+    let swing = |world: &World| -> f32 {
+        let mut total = 0.0;
+        for event in world.ledger.iter() {
+            if let LedgerEvent::SystemEnergy { total: t, .. } = event { total = *t; }
         }
-    }
+        total - floor
+    };
 
-    // Run for 300 ticks (5 seconds of isolated swinging)
+    world.step(dt);
+    let initial = swing(&world);
+
+    // 300 ticks (4.8 s, about one period), checked at every tick. Joints use SHAKE projection
+    // (the default): symplectic, so the energy error stays bounded (symplectic Euler's phase
+    // offset, up to about 0.8% here) instead of bleeding away (PBD directions kept 90.3%).
+    let (mut lo, mut hi) = (1.0f32, 1.0f32);
     for _ in 0..300 {
         world.step(dt);
+        let r = swing(&world) / initial;
+        lo = lo.min(r);
+        hi = hi.max(r);
     }
-
-    // Capture final energy
-    let mut final_energy = 0.0;
-    for event in world.ledger.iter() {
-        if let LedgerEvent::SystemEnergy { total, .. } = event {
-            final_energy = *total;
-        }
-    }
-
-    // A rigid body physics engine with an XPBD solver will inevitably bleed *some* energy
-    // due to constraint stabilization and positional projection.
-    // The goal here is to assure the bleed stays strictly within a bounded architectural limit, preventing explosive jitter.
-    let energy_retention = final_energy / initial_energy;
     assert!(
-        energy_retention > 0.98 && energy_retention <= 1.001,
-        "Thermodynamic integrity failure! Initial E: {}, Final E: {} (Retention: {:.3}%)",
-        initial_energy, final_energy, energy_retention * 100.0
+        lo > 0.98 && hi < 1.02,
+        "Thermodynamic integrity failure! Swing energy {:.1} J ranged {:.3}%..{:.3}%",
+        initial, lo * 100.0, hi * 100.0
     );
 }
 

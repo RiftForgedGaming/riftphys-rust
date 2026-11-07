@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: RiftForged Proprietary License
 use rayon::prelude::*;
-use super::world::{Collider, Contact, World, CCD_MAX_MARGIN, TERRAIN_CI};
+use super::world::{Collider, Contact, JointProjection, World, CCD_MAX_MARGIN, TERRAIN_CI};
 use riftphys_core::{StepStage, StepStats, Scalar, Quat, Isometry, Vec3, BodyId};
 use riftphys_geom::{aabb_of, Shape, Aabb};
 use riftphys_collision::narrowphase::collide_shapes;
@@ -213,9 +213,13 @@ impl World {
         // Displacement from contact projection per body (linear, angular): kept out of the
         // derived velocity (split impulse), so pushing a body out of penetration doesn't launch it.
         let mut split = vec![(Vec3::ZERO, Vec3::ZERO); count as usize];
+        // Start-of-step poses (what the velocity solve used), for SHAKE joint directions
+        let start_poses: Vec<Isometry> = if has_joints && self.joint_projection == JointProjection::Shake {
+            (0..count).map(|i| if self.bodies.is_dynamic(i) && self.sleep.is_awake(i as usize) { original_poses[i as usize] } else { self.bodies.pose(i) }).collect()
+        } else { Vec::new() };
         if has_joints || !pos_contacts.is_empty() {
             for _ in 0..self.solver_iters.1 {
-                if has_joints { self.solve_joints(dt, 1); }
+                if has_joints { self.solve_joints_in_step(dt, &start_poses); }
                 self.project_contacts(&pos_contacts, &mut split, false);
             }
             // Shock propagation, as in the velocity solve: bottom-up, lower body immovable
@@ -315,9 +319,12 @@ impl World {
                         let mass = 1.0 / inv_mass;
                         ke_lin_total += 0.5 * mass * vel.lin.length_squared();
 
+                        // 1/2 w . I_world w (dividing by the diagonal of the inverse inertia was
+                        // wrong for a rotated body with unequal principal moments)
                         let inv_i = self.bodies.inv_inertia_world(i);
-                        if inv_i.x_axis.x > 0.0 && inv_i.y_axis.y > 0.0 && inv_i.z_axis.z > 0.0 {
-                            ke_ang_total += 0.5 * ((vel.ang.x * vel.ang.x / inv_i.x_axis.x) + (vel.ang.y * vel.ang.y / inv_i.y_axis.y) + (vel.ang.z * vel.ang.z / inv_i.z_axis.z));
+                        let det = inv_i.determinant();
+                        if det.is_finite() && det > 1e-30 {
+                            ke_ang_total += 0.5 * vel.ang.dot(inv_i.inverse().mul_vec3(vel.ang));
                         }
                         pe_grav_total += mass * g_mag * pose.pos.y;
                     }

@@ -366,9 +366,9 @@ mod tests {
     use super::*;
 
     /// Open gaps, each still measured by the report. Everything else must stay within tolerance.
-    /// - large swing: velocity projection in maximal coordinates removes ~(w dt)^2 of a fast
-    ///   joint's kinetic energy per step (docs/PHYSICS_FIDELITY.md).
-    const KNOWN_GAPS_240HZ: [&str; 1] = ["large swing"];
+    /// (Large swing was one until SHAKE joint projection: 0.77 -> 0.993 at 240 Hz; see
+    /// docs/JOINT_ENERGY_SPEC.md.)
+    const KNOWN_GAPS_240HZ: [&str; 0] = [];
 
     #[test]
     fn benchmarks_hold_at_240_hz() {

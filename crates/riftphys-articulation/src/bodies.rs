@@ -184,7 +184,24 @@ impl Joints {
         }
     }
 
+    /// Position-level joint solve (PBD/XPBD): corrections along the constraint directions at the
+    /// current iterate.
     pub fn solve(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32) {
+        self.solve_impl(bodies, dt, iterations, None);
+    }
+
+    /// Position-level joint solve with SHAKE projection: the error is measured at the current
+    /// iterate, but corrections run along the directions (axes, lever arms, inertias) of `start`,
+    /// the poses at the start of the step that the velocity solve used. Together with that
+    /// velocity solve this is one impulse along the start-of-step constraint gradient, chosen so
+    /// the bodies land on the constraint: symplectic, so a free joint keeps its energy instead of
+    /// bleeding it at first order in dt (a hinged pendulum kept 90% of its swing energy per
+    /// period at 62.5 Hz with `solve`). `start` is indexed by body id.
+    pub fn solve_shake(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, start: &[Isometry]) {
+        self.solve_impl(bodies, dt, iterations, Some(start));
+    }
+
+    fn solve_impl(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, start: Option<&[Isometry]>) {
         if self.kinds.is_empty() { return; }
 
         let dt = q6(dt);
@@ -200,8 +217,14 @@ impl Joints {
         for _ in 0..iterations.max(1) {
             for k in &mut self.kinds {
                 match k {
-                    JointKind::Distance(j) => solve_distance_row(bodies, j, dt, dt2),
-                    JointKind::D6(j)       => solve_d6(bodies, j, dt, dt2, alpha_dt2),
+                    JointKind::Distance(j) => {
+                        let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
+                        solve_distance_row(bodies, j, dt, dt2, s)
+                    }
+                    JointKind::D6(j) => {
+                        let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
+                        solve_d6(bodies, j, dt, dt2, alpha_dt2, s)
+                    }
                 }
             }
         }
@@ -210,7 +233,32 @@ impl Joints {
 
 /* ─────────────────────────  Solvers  ───────────────────────── */
 
-fn solve_distance_row(bodies: &mut Bodies, j: &DistanceJoint, dt: Scalar, dt2: Scalar) {
+/// Largest rotation (radians) a body may make within one step for SHAKE directions to be used.
+/// Beyond it the start-of-step directions are too far from the current ones for the iteration
+/// to converge well, so that joint falls back to current-iterate directions.
+const SHAKE_MAX_TURN: f32 = 0.5;
+
+/// The start-of-step pose of body `id` (its current pose if `start` doesn't cover it).
+#[inline]
+fn frame(start: &[Isometry], bodies: &Bodies, id: u32) -> Isometry {
+    start.get(id as usize).copied().unwrap_or_else(|| bodies.pose(id))
+}
+
+/// Rotation between two orientations, in radians.
+#[inline]
+fn turned(a: Quat, b: Quat) -> f32 {
+    let d = (a * b.conjugate()).w.abs().min(1.0);
+    2.0 * d.acos()
+}
+
+/// World inverse inertia of body `id` at orientation `rot`.
+#[inline]
+fn inv_inertia_at(bodies: &Bodies, id: u32, rot: Quat) -> Mat3 {
+    let r = Mat3::from_quat(rot);
+    r * bodies.inv_inertia_local_of(id) * r.transpose()
+}
+
+fn solve_distance_row(bodies: &mut Bodies, j: &DistanceJoint, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>) {
     let ia = j.a.0;
     let ib = j.b.0;
 
@@ -229,8 +277,14 @@ fn solve_distance_row(bodies: &mut Bodies, j: &DistanceJoint, dt: Scalar, dt2: S
     let len = len2.sqrt();
     if len <= 1.0e-6 { return; }
 
-    let n = normalize_q6(d / len);
-    if n == Vec3::ZERO { return; }
+    let n_cur = normalize_q6(d / len);
+    if n_cur == Vec3::ZERO { return; }
+    // SHAKE: correct along the start-of-step direction
+    let mut n = n_cur;
+    if let Some((sa, sb)) = start {
+        let n0 = normalize_q6(sb.pos - sa.pos);
+        if n0 != Vec3::ZERO && n0.dot(n_cur) > SHAKE_MAX_TURN.cos() { n = n0; }
+    }
 
     let c_val = q6(len - q6(j.rest));
     if c_val.abs() <= 1.0e-6 { return; }
@@ -239,7 +293,8 @@ fn solve_distance_row(bodies: &mut Bodies, j: &DistanceJoint, dt: Scalar, dt2: S
     let denom = q6(w_sum + alpha);
     if denom <= 0.0 { return; }
 
-    let lambda = q6(-c_val / denom);
+    // The error grows along n_cur; a correction along n changes it at the rate n . n_cur
+    let lambda = q6(-c_val / (denom * n.dot(n_cur)));
 
     bodies.apply_position_delta(ia, q6v(-n * q6(lambda * wa)));
     bodies.apply_position_delta(ib, q6v( n * q6(lambda * wb)));
@@ -253,6 +308,7 @@ fn solve_d6(
     dt: Scalar,
     dt2: Scalar,
     alpha_dt2: fn(Scalar, Scalar) -> Scalar,
+    start: Option<(Isometry, Isometry)>,
 ) {
     let pa = bodies.pose(j.a.0);
     let pb = bodies.pose(j.b.0);
@@ -271,8 +327,18 @@ fn solve_d6(
     let wa = q6(bodies.inv_mass_of(j.a.0));
     let wb = q6(bodies.inv_mass_of(j.b.0));
 
-    let iaw: Mat3 = bodies.inv_inertia_world(j.a.0);
-    let ibw: Mat3 = bodies.inv_inertia_world(j.b.0);
+    // Correction directions: the current iterate's (PBD), or the start of the step's (SHAKE).
+    // Errors are always measured at the current iterate.
+    let start = start.filter(|(sa, sb)| turned(sa.rot, pa.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb.rot) < SHAKE_MAX_TURN);
+    let (dir_axes, lever_a, lever_b, iaw, ibw): ([Vec3; 3], Vec3, Vec3, Mat3, Mat3) = match start {
+        Some((sa, sb)) => {
+            let ra0 = sa.rot * j.fa.rot;
+            ([normalize_q6(ra0 * Vec3::X), normalize_q6(ra0 * Vec3::Y), normalize_q6(ra0 * Vec3::Z)],
+             q6v(sa.rot * j.fa.pos), q6v(sb.rot * j.fb.pos),
+             inv_inertia_at(bodies, j.a.0, sa.rot), inv_inertia_at(bodies, j.b.0, sb.rot))
+        }
+        None => (axes, xa - pa.pos, xb - pb.pos, bodies.inv_inertia_world(j.a.0), bodies.inv_inertia_world(j.b.0)),
+    };
 
     let d = q6v(xb - xa);
 
@@ -282,6 +348,7 @@ fn solve_d6(
 
         let u = axes[i];
         if u == Vec3::ZERO { continue; }
+        let un = dir_axes[i];
 
         let coord = q6(d.dot(u));
         let mut target_pos = 0.0f32;
@@ -321,8 +388,8 @@ fn solve_d6(
 
         let bias_vel = 0.0f32;
 
-        let ra_u = q6v((xa - pa.pos).cross(u));
-        let rb_u = q6v((xb - pb.pos).cross(u));
+        let ra_u = q6v(lever_a.cross(un));
+        let rb_u = q6v(lever_b.cross(un));
 
         let w_rot_a = q6(ra_u.dot(iaw * ra_u));
         let w_rot_b = q6(rb_u.dot(ibw * rb_u));
@@ -337,8 +404,8 @@ fn solve_d6(
         let dl = q6(-(c + q6(alpha * lambda_old)) / denom);
         row.lambda_acc = q6(lambda_old + dl);
 
-        bodies.apply_position_delta(j.a.0, q6v(-u * q6(dl * wa)));
-        bodies.apply_position_delta(j.b.0, q6v( u * q6(dl * wb)));
+        bodies.apply_position_delta(j.a.0, q6v(-un * q6(dl * wa)));
+        bodies.apply_position_delta(j.b.0, q6v( un * q6(dl * wb)));
 
         bodies.apply_orientation_delta(j.a.0, q6v(-(iaw * ra_u) * dl));
         bodies.apply_orientation_delta(j.b.0, q6v( (ibw * rb_u) * dl));
@@ -378,6 +445,7 @@ fn solve_d6(
 
         let u = axes[i];
         if u == Vec3::ZERO { continue; }
+        let un = dir_axes[i];
 
         // Both vectors are now correctly operating in world space
         let angle = q6(if rigid(row) { e_lock.dot(u) } else { e_world.dot(u) });
@@ -416,7 +484,7 @@ fn solve_d6(
 
         let bias_vel = 0.0f32;
 
-        let w = q6(u.dot(iaw * u) + u.dot(ibw * u));
+        let w = q6(un.dot(iaw * un) + un.dot(ibw * un));
         let alpha = alpha_dt2(row.compliance, dt2);
         let denom = q6(w + alpha);
         if denom <= 0.0 { continue; }
@@ -426,8 +494,8 @@ fn solve_d6(
         let dl = q6(-(c + q6(alpha * lambda_old)) / denom);
         row.lambda_acc = q6(lambda_old + dl);
 
-        bodies.apply_orientation_delta(j.a.0, q6v(-(iaw * u) * dl));
-        bodies.apply_orientation_delta(j.b.0, q6v( (ibw * u) * dl));
+        bodies.apply_orientation_delta(j.a.0, q6v(-(iaw * un) * dl));
+        bodies.apply_orientation_delta(j.b.0, q6v( (ibw * un) * dl));
 
         let _ = target_ang;
     }
