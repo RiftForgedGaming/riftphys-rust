@@ -1609,3 +1609,76 @@ fn player_controller_hits_heightfield_and_grounds() {
         assert!(pose_out.pos.y > 1.4 && pose_out.pos.y < 1.6, "Player sank into or hovered over ground. Y: {}", pose_out.pos.y);
     }
 }
+/* ===================== ROLLBACK (AT_REST_SPEC D2) ===================== */
+
+/// A static ground, a 3-box stack and a box dropped beside it. Returns the world and the id of
+/// the stack's top box.
+unsafe fn rollback_scene() -> (W, u32) {
+    let w = mk_world();
+    let ground = RPhysBoxBodyDesc {
+        pose: mk_identity_iso(0.0, -0.5, 0.0), vel: mk_zero_vel(), hx: 50.0, hy: 0.5, hz: 50.0,
+        mass: 0.0, body_type: RPHYS_BODY_STATIC, material: mk_default_mat(), user_tag: 0,
+    };
+    let mut id: u32 = 0;
+    assert_eq!(rphys_add_box_body(w.0, &ground, &mut id), RPHYS_OK, "err={}", last_err());
+    for i in 0..3 {
+        let b = RPhysBoxBodyDesc {
+            pose: mk_identity_iso(0.0, 0.1 + 0.205 * i as f32, 0.0), vel: mk_zero_vel(), hx: 0.2, hy: 0.1, hz: 0.2,
+            mass: 5.0, body_type: RPHYS_BODY_DYNAMIC, material: mk_default_mat(), user_tag: 0,
+        };
+        assert_eq!(rphys_add_box_body(w.0, &b, &mut id), RPHYS_OK, "err={}", last_err());
+    }
+    let top = id;
+    let drop = RPhysBoxBodyDesc {
+        pose: mk_identity_iso(3.0, 4.0, 0.0), vel: mk_zero_vel(), hx: 0.2, hy: 0.2, hz: 0.2,
+        mass: 2.0, body_type: RPHYS_BODY_DYNAMIC, material: mk_default_mat(), user_tag: 0,
+    };
+    assert_eq!(rphys_add_box_body(w.0, &drop, &mut id), RPHYS_OK, "err={}", last_err());
+    (w, top)
+}
+
+unsafe fn hashes(w: &W, n: usize) -> Vec<[u8; RPHYS_STEP_HASH_BYTES]> {
+    (0..n).map(|_| {
+        let mut h = RPhysHash32 { bytes: [0u8; RPHYS_STEP_HASH_BYTES] };
+        assert_eq!(rphys_world_step_and_hash(w.0, 1.0 / 60.0, &mut h), RPHYS_OK, "err={}", last_err());
+        h.bytes
+    }).collect()
+}
+
+/// Snapshot after `settle` steps, nudge the top box, step 90, restore, nudge it the same way,
+/// step 90 again: every hash must match. The snapshot carries the warm-start cache, last
+/// velocities and sleep state; without them the first step after the restore starts every
+/// contact cold. The nudge wakes a sleeping stack, so its carried entries are used.
+unsafe fn rollback_replays(settle: usize, expect_asleep: bool) {
+    let (w, top) = rollback_scene();
+    let nudge = || assert_eq!(rphys_body_apply_impulse(w.0, top, RPhysVec3 { x: 0.3, y: 0.0, z: 0.0 }), RPHYS_OK, "err={}", last_err());
+    hashes(&w, settle);
+    {
+        let st = w.0.as_ref().unwrap().state.lock().unwrap();
+        assert!(st.world.warm_contacts() > 0, "nothing in the warm-start cache to carry");
+        assert_eq!(st.world.num_sleeping() > 0, expect_asleep, "{} bodies asleep", st.world.num_sleeping());
+    }
+    let snap = rphys_world_snapshot_create(w.0 as *const RPhysWorld);
+    assert!(!snap.is_null(), "err={}", last_err());
+    nudge();
+    let first = hashes(&w, 90);
+    assert_eq!(rphys_world_snapshot_restore(w.0, snap), RPHYS_OK, "err={}", last_err());
+    nudge();
+    let again = hashes(&w, 90);
+    rphys_world_snapshot_free(snap);
+    for (k, (a, b)) in first.iter().zip(&again).enumerate() {
+        assert_eq!(a, b, "step {} after the restore differs from the original run", k + 1);
+    }
+}
+
+#[test]
+fn rollback_replays_a_warm_resting_stack() {
+    // 15 steps: the stack is in contact (warm), the dropped box still falling, nothing asleep
+    unsafe { rollback_replays(15, false) }
+}
+
+#[test]
+fn rollback_replays_with_part_of_the_scene_asleep() {
+    // 400 steps: the stack has fallen asleep
+    unsafe { rollback_replays(400, true) }
+}

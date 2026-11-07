@@ -199,6 +199,9 @@ RPhysResult  rphys_body_remove     (RPhysWorld* world, uint32_t body_id);
 
 // state
 RPhysResult  rphys_body_get_pose      (const RPhysWorld* world, uint32_t body_id, RPhysIsometry* out_pose);
+/* Teleports the body: its contacts' and joints' warm-start impulses are dropped, so the next step
+   starts them cold. Animating a kinematic body (a moving platform) with this every tick keeps
+   whatever rides on it from warm-starting; set its velocity instead where possible. */
 RPhysResult  rphys_body_set_pose      (RPhysWorld* world, uint32_t body_id, const RPhysIsometry* pose);
 RPhysResult  rphys_body_get_velocity  (const RPhysWorld* world, uint32_t body_id, RPhysVelocity* out_vel);
 RPhysResult  rphys_body_set_velocity  (RPhysWorld* world, uint32_t body_id, const RPhysVelocity* vel);

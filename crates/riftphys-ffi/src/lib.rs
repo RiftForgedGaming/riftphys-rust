@@ -1698,6 +1698,10 @@ pub struct RPhysWorldSnapshot {
     pub players: Vec<riftphys_world::world::PlayerController>,
     pub body_poses: Vec<riftphys_core::Isometry>,
     pub body_vels: Vec<riftphys_core::Velocity>,
+    /// Warm-start cache, last velocities and sleep state: without them the first step after a
+    /// restore starts every contact and joint cold and differs from the original run
+    /// (AT_REST_SPEC D2)
+    pub carried: riftphys_world::world::CarriedState,
 }
 
 #[no_mangle]
@@ -1736,6 +1740,7 @@ pub unsafe extern "C" fn rphys_world_snapshot_create(world: *const RPhysWorld) -
             players: st.world.players.clone(),
             body_poses: poses,
             body_vels: vels,
+            carried: st.world.carried_state(),
         }))
     })) {
         Ok(ptr) => ptr,
@@ -1769,11 +1774,8 @@ pub unsafe extern "C" fn rphys_world_snapshot_restore(
         st.world.set_tick(snap.tick);
         st.world.players = snap.players.clone();
 
-        // 2. Erase future data to guarantee determinism
-        st.world.clear_solver_caches();
-        st.world.wake_all_bodies();
-
-        // 3. Inject historical coordinates
+        // 2. Inject historical coordinates. Bodies removed since the snapshot can't come back,
+        // so a rollback across a despawn isn't exact.
         for i in 0..snap.body_poses.len() {
             let bid = riftphys_core::BodyId(i as u32);
             if st.world.body_alive(bid) {
@@ -1781,6 +1783,10 @@ pub unsafe extern "C" fn rphys_world_snapshot_restore(
                 st.world.set_body_vel(bid, snap.body_vels[i]);
             }
         }
+
+        // 3. Carried state last: set_body_pose drops warm-start entries and set_body_vel writes
+        // the last velocity, so this overwrites both (and the sleep state)
+        st.world.restore_carried_state(&snap.carried);
 
         RPHYS_OK
     })

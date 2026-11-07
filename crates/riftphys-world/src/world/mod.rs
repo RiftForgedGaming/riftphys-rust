@@ -13,4 +13,4 @@ pub mod islands;
 pub mod sleep;
 mod voxel_env;
 
-pub use world::{World, JointProjection, WorldBuilder, Collider, RayHit, SweepHit, PlayerController};
+pub use world::{World, JointProjection, WorldBuilder, Collider, RayHit, SweepHit, PlayerController, CarriedState};

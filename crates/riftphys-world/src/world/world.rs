@@ -145,11 +145,46 @@ pub(super) struct AccelComp {
     pub(super) forward_dir_world: Option<Vec3>,
 }
 
-#[derive(Copy, Clone, Default)]
-pub(super) struct WarmImp {
+/// Key of a warm-start entry (AT_REST_SPEC R1): (body A, body B, collider ordinal within A,
+/// collider ordinal within B). Terrain is B = `u32::MAX`, ordinal 0. Body ids, not collider
+/// indices: `remove_body` shifts every later collider index, and body ids are never reused.
+pub(super) type WarmKey = (u32, u32, u32, u32);
+
+/// One contact's impulses at the end of last step's iterations (before the shock pass).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct WarmContact {
+    /// Contact point in body A's frame, at the pose the solve ran at (matching tolerance applies here)
+    pub(super) la: Vec3,
     pub(super) jn: f32,
-    pub(super) jt1: f32,
-    pub(super) jt2: f32,
+    /// Friction impulse as a world vector
+    pub(super) jt: Vec3,
+}
+
+/// One friction patch's accumulators: sliding impulse (world vector) and torsion about the normal.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct WarmPatch {
+    pub(super) jt: Vec3,
+    pub(super) tw: f32,
+}
+
+/// One D6 joint row's impulse at the end of last step's iterations, with its row tag.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct WarmRow {
+    pub(super) tag: u8,
+    pub(super) lam: f32,
+}
+
+/// State a step reads that body poses and velocities don't hold: the contact warm-start cache,
+/// the ballistic update's last velocities and the sleep state. A rollback snapshot must carry it
+/// (AT_REST_SPEC D2); restore it after setting poses and velocities, which overwrite parts of it.
+#[derive(Clone, Debug, Default)]
+pub struct CarriedState {
+    warm: BTreeMap<WarmKey, Vec<WarmContact>>,
+    warm_patches: BTreeMap<WarmKey, WarmPatch>,
+    warm_joints: BTreeMap<u32, Vec<WarmRow>>,
+    last_lin_vel: Vec<Vec3>,
+    awake: Vec<u8>,
+    sleep_ticks: Vec<u16>,
 }
 
 /* ---------------- World ---------------- */
@@ -201,7 +236,13 @@ pub struct World {
     /// or more run in parallel. Lets tests prove they reach the parallel solver paths.
     pub(super) last_max_batch: (usize, usize),
 
-    pub(super) warm_cache: BTreeMap<(u32, u32), WarmImp>,
+    /// Contact warm start (AT_REST_SPEC R1): last step's contacts per key, in contact order
+    pub(super) warm: BTreeMap<WarmKey, Vec<WarmContact>>,
+    pub(super) warm_patches: BTreeMap<WarmKey, WarmPatch>,
+    /// D6 joint rows' impulses per joint index, for warm starting
+    pub(super) warm_joints: BTreeMap<u32, Vec<WarmRow>>,
+    /// Contacts the last solve matched to a warm entry
+    pub(super) last_warm_matched: usize,
     pub(super) last_normal_impulse: Vec<f32>,
 
     pub(super) prov_impulses_sum: f32,
@@ -296,7 +337,10 @@ impl World {
             players: Vec::new(),
             last_frame_contacts: Vec::with_capacity(colliders * 4),
             last_max_batch: (0, 0),
-            warm_cache: BTreeMap::new(),
+            warm: BTreeMap::new(),
+            warm_patches: BTreeMap::new(),
+            warm_joints: BTreeMap::new(),
+            last_warm_matched: 0,
             last_normal_impulse: vec![0.0; bodies],
             prov_impulses_sum: 0.0,
             prov_ccd_hits: 0,
@@ -339,7 +383,10 @@ impl World {
         self.accel_comps[i] = Some(AccelComp { aero, prop, ref_area_m2, throttle01, forward_dir_world });
     }
 
+    /// Moves a body. Its warm-start entries are dropped: anchors are matched in body A's frame,
+    /// so a teleported body would otherwise be warm-started with its old place's load.
     pub fn set_body_pose(&mut self, id: BodyId, pose: Isometry) {
+        self.drop_warm_of(id.0);
         self.bodies.set_pose(id.0, pose);
         for c in &mut self.colliders {
             if c.body == id { c.aabb = aabb_of(&c.shape, &pose); }
@@ -394,12 +441,12 @@ impl World {
             self.epoch_id = gravity_epoch_id(&spec);
             self.gravity_proc = spec;
             if let GravitySpec::Uniform { g } = spec { self.gravity = Vec3::new(g[0], g[1], g[2]); }
-            self.warm_cache.clear();
+            self.clear_warm();
         }
         if let Some(desc) = self.pending_epoch.take() {
             self.epoch_id = epoch_id(&desc);
             self.set_gravity(Vec3::new(desc.gravity_g[0], desc.gravity_g[1], desc.gravity_g[2]));
-            self.warm_cache.clear();
+            self.clear_warm();
         }
     }
 
@@ -501,7 +548,9 @@ impl World {
 
         self.guards.retain(|g| g.eff != id);
         self.balances.retain(|b| b.pelvis != id && b.left != id && b.right != id);
-        self.warm_cache.clear();
+        // Only this body's entries: clearing everything would cold-start every stack in the
+        // world whenever debris despawns
+        self.drop_warm_of(id.0);
         true
     }
 
@@ -594,7 +643,69 @@ impl World {
     }
 
     pub fn set_tick(&mut self, tick: u64) { self.tick = tick; }
-    pub fn clear_solver_caches(&mut self) { self.warm_cache.clear(); self.last_normal_impulse.fill(0.0); }
+    pub fn clear_solver_caches(&mut self) { self.clear_warm(); self.last_normal_impulse.fill(0.0); }
+
+    pub(super) fn clear_warm(&mut self) { self.warm.clear(); self.warm_patches.clear(); self.warm_joints.clear(); }
+
+    /// Drops every warm-start entry whose key holds body `b`.
+    pub(super) fn drop_warm_of(&mut self, b: u32) {
+        self.warm.retain(|k, _| k.0 != b && k.1 != b);
+        self.warm_patches.retain(|k, _| k.0 != b && k.1 != b);
+        let kinds = self.joints.kinds();
+        self.warm_joints.retain(|&j, _| match kinds.get(j as usize) {
+            Some(JointKind::D6(d)) => d.a.0 != b && d.b.0 != b,
+            Some(JointKind::Distance(d)) => d.a.0 != b && d.b.0 != b,
+            None => false,
+        });
+    }
+
+    /// Number of contacts in the warm-start cache (diagnostics and tests).
+    pub fn warm_contacts(&self) -> usize { self.warm.values().map(Vec::len).sum() }
+
+    /// Contacts the last step's solve started warm (diagnostics and tests).
+    pub fn warm_matched(&self) -> usize { self.last_warm_matched }
+
+    /// The state a step carries besides body poses and velocities (see `CarriedState`).
+    pub fn carried_state(&self) -> CarriedState {
+        use std::sync::atomic::Ordering::Relaxed;
+        CarriedState {
+            warm: self.warm.clone(),
+            warm_patches: self.warm_patches.clone(),
+            warm_joints: self.warm_joints.clone(),
+            last_lin_vel: self.last_lin_vel.clone(),
+            awake: self.sleep.awake.iter().map(|a| a.load(Relaxed)).collect(),
+            sleep_ticks: self.sleep.sleep_ticks.iter().map(|t| t.load(Relaxed)).collect(),
+        }
+    }
+
+    /// Restores `carried_state()`. Call it after setting poses and velocities: `set_body_pose`
+    /// drops warm entries and `set_body_vel` writes the last velocity.
+    pub fn restore_carried_state(&mut self, s: &CarriedState) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.warm = s.warm.clone();
+        self.warm_patches = s.warm_patches.clone();
+        self.warm_joints = s.warm_joints.clone();
+        for (i, v) in s.last_lin_vel.iter().enumerate() {
+            if let Some(x) = self.last_lin_vel.get_mut(i) { *x = *v; }
+        }
+        for (i, (a, t)) in s.awake.iter().zip(&s.sleep_ticks).enumerate() {
+            if i < self.sleep.awake.len() {
+                self.sleep.awake[i].store(*a, Relaxed);
+                self.sleep.sleep_ticks[i].store(*t, Relaxed);
+            }
+        }
+        // A body removed since the snapshot can't come back: drop its entries, or they would be
+        // kept as an idle pair's every step from here on. One pass over the cache.
+        let alive = |b: u32| b == u32::MAX || self.alive.get(b as usize).copied().unwrap_or(0) != 0;
+        self.warm.retain(|k, _| alive(k.0) && alive(k.1));
+        self.warm_patches.retain(|k, _| alive(k.0) && alive(k.1));
+        let kinds = self.joints.kinds();
+        self.warm_joints.retain(|&j, _| match kinds.get(j as usize) {
+            Some(JointKind::D6(d)) => alive(d.a.0) && alive(d.b.0),
+            Some(JointKind::Distance(d)) => alive(d.a.0) && alive(d.b.0),
+            None => false,
+        });
+    }
     pub fn wake_all_bodies(&mut self) {
         for i in 0..self.bodies.len() { if self.bodies.is_dynamic(i as u32) { self.sleep.wake(i); } }
     }

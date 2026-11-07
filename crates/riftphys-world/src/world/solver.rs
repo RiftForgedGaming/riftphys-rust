@@ -2,9 +2,15 @@
 use rayon::prelude::*;
 use super::geom::orthonormal_basis;
 use riftphys_core::{Mat3, Vec3};
-use super::world::{Contact, World, TERRAIN_CI};
+use super::world::{Contact, World, TERRAIN_CI, WarmContact, WarmKey, WarmPatch, WarmRow};
 use super::islands::Island;
 use riftphys_materials::materials as mats;
+use std::collections::BTreeMap;
+
+/// A new contact takes last step's entry of the same key whose anchor (body A's frame) is
+/// nearest, within this distance (AT_REST_SPEC R1). Box anchors are corners, so 1 cm is far
+/// below any feature spacing.
+const WARM_MATCH_TOL: f32 = 0.01;
 
 /// Below this many items a batch runs on the calling thread: rayon's fork/join costs more than
 /// the work for small scenes (it made a 9-body biped ~10x slower). Level scheduling makes the
@@ -127,6 +133,9 @@ struct JointRow {
     m_eff: f32,
     target: f32,
     lam_min: f32, lam_max: f32,
+    /// Which row of its joint this is: angular (bit 4), axis (bits 2-3), kind (bits 0-1:
+    /// equality, motor, lower limit, upper limit). Warm starting matches rows by it.
+    tag: u8,
 }
 
 #[inline(always)]
@@ -181,13 +190,14 @@ fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulati
                 wa + wb + ca.dot(ia.mul_vec3(ca)) + cb.dot(ib.mul_vec3(cb))
             };
             if k <= 1e-9 { continue; }
-            let base = JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / k, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY };
+            let tag = ((angular as u8) << 4) | ((i as u8) << 2);
+            let base = JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / k, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, tag };
             if let Some(drive) = row.drive {
                 // Motor: drive the relative velocity to the target with at most max_impulse per
                 // step (a constraint motor; adding kd x error straight to the velocity diverged
                 // for kd > 2). Limits still apply through their own rows.
                 let cap = drive.max_impulse.abs();
-                out.push(JointRow { target: drive.target, lam_min: -cap, lam_max: cap, ..base });
+                out.push(JointRow { target: drive.target, lam_min: -cap, lam_max: cap, tag: tag | 1, ..base });
             }
             match row.limit {
                 None if row.drive.is_some() => {}
@@ -197,12 +207,27 @@ fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulati
                     let x = if angular { riftphys_articulation::bodies::d6_row_angle(j, rot_a, rot_b, i) } else { d.dot(u) };
                     // Approach the stop by at most what is left this step; never push out here
                     // (the position solve removes any violation)
-                    out.push(JointRow { target: ((lim.min - x) / dt).min(0.0), lam_min: 0.0, ..base });
-                    out.push(JointRow { target: ((lim.max - x) / dt).max(0.0), lam_max: 0.0, lam_min: f32::NEG_INFINITY, ..base });
+                    out.push(JointRow { target: ((lim.min - x) / dt).min(0.0), lam_min: 0.0, tag: tag | 2, ..base });
+                    out.push(JointRow { target: ((lim.max - x) / dt).max(0.0), lam_max: 0.0, lam_min: f32::NEG_INFINITY, tag: tag | 3, ..base });
                 }
             }
         }
     }
+}
+
+/// Friction coefficient at tangential slip speed `slip`: Stribeck curve from mu_s at rest toward
+/// mu_k when sliding.
+#[inline(always)]
+fn mu_dynamic(cs: &ContactConstraint, slip: f32) -> f32 {
+    cs.mu_k + (cs.mu_s - cs.mu_k) * (-(slip / cs.stribeck_v).powi(2)).exp()
+}
+
+/// Tangential slip speed at the contact.
+#[inline(always)]
+fn slip_speed(bodies: &riftphys_dynamics::dynamics::Bodies, cs: &ContactConstraint) -> f32 {
+    let v = contact_rel_vel(bodies, cs);
+    let (vt1, vt2) = (v.dot(cs.t1), v.dot(cs.t2));
+    (vt1 * vt1 + vt2 * vt2).sqrt()
 }
 
 /// Relative velocity of B with respect to A at the contact point.
@@ -380,7 +405,6 @@ impl World {
             }
         }
         let mut row_acc = vec![0.0f32; joint_rows.len()];
-        let row_acc_ptr = UnsafeAcc(row_acc.as_mut_ptr());
         let num_rows = joint_rows.len();
         let joint_rows_ref = joint_rows.as_slice();
         let row_range_ref = row_range.as_slice();
@@ -407,11 +431,8 @@ impl World {
 
         // 3. The Global Parallel Solve
         let mut acc_jn = vec![0.0f32; constraints.len()];
-        let acc_jn_ptr = UnsafeAcc(acc_jn.as_mut_ptr());
         // Accumulated friction impulse per contact, [t1, t2]
         let mut acc_jt = vec![0.0f32; constraints.len() * 2];
-        let acc_jt_ptr = UnsafeAcc(acc_jt.as_mut_ptr());
-        let bodies_ptr = UnsafeSyncBodies(&mut self.bodies as *mut _);
         let joints_ref = &self.joints;
         let num_constraints = constraints.len();
         let constraints_slice = constraints.as_slice();
@@ -424,6 +445,93 @@ impl World {
                 apply_contact_impulse(&mut self.bodies, cs, cs.normal * cs.soft_jn);
             }
         }
+
+        // Warm start, joints: each D6 row starts from last step's impulse if the joint still has
+        // the same rows, clamped to the row's bounds. Serial, in joint order. Starting cold let
+        // gravity's load on a standing biped go unconverged every step, and the position solve
+        // corrected the remainder by dragging its light feet along the ground.
+        for (j_idx, &(s, e)) in row_range.iter().enumerate() {
+            if e == s { continue; }
+            let Some(prev) = self.warm_joints.get(&(j_idx as u32)) else { continue };
+            if prev.len() != e - s || prev.iter().zip(&joint_rows[s..e]).any(|(p, r)| p.tag != r.tag) { continue; }
+            for (k, p) in (s..e).zip(prev) {
+                let r = &joint_rows[k];
+                let lam = p.lam.clamp(r.lam_min, r.lam_max);
+                row_acc[k] = lam;
+                if lam != 0.0 { joint_row_apply(&mut self.bodies, r, lam); }
+            }
+        }
+
+        // Warm start (AT_REST_SPEC R1): each rigid contact starts from last step's impulses
+        // at the nearest matching anchor. Matched and applied serially, in contact order (float
+        // sums depend on order), never through `run_batch`, so replay stays exact.
+        let ord = collider_ordinals(&self.colliders, num_bodies);
+        let keys: Vec<WarmKey> = contacts.iter().map(|c| {
+            let a = &self.colliders[c.a_collider];
+            if c.b_collider == TERRAIN_CI { return (a.body.0, u32::MAX, ord[c.a_collider], 0); }
+            debug_assert!(c.a_collider < c.b_collider, "contact pair out of order: {} {}", c.a_collider, c.b_collider);
+            (a.body.0, self.colliders[c.b_collider].body.0, ord[c.a_collider], ord[c.b_collider])
+        }).collect();
+        // Contact points in body A's frame, at the poses this solve runs at
+        let anchors: Vec<Vec3> = contacts.iter().zip(&constraints).map(|(c, cs)| {
+            let pa = self.bodies.pose(cs.ai);
+            pa.rot.conjugate() * (c.point - pa.pos)
+        }).collect();
+        self.last_warm_matched = 0;
+        {
+            let mut used: BTreeMap<WarmKey, Vec<bool>> = BTreeMap::new();
+            for (c_idx, cs) in constraints.iter().enumerate() {
+                if cs.soft { continue; }
+                let Some(entries) = self.warm.get(&keys[c_idx]) else { continue };
+                let taken = used.entry(keys[c_idx]).or_insert_with(|| vec![false; entries.len()]);
+                // Nearest unused entry within the tolerance; ties go to the lowest index
+                let mut best: Option<(f32, usize)> = None;
+                for (k, e) in entries.iter().enumerate() {
+                    if taken[k] { continue; }
+                    let d = (e.la - anchors[c_idx]).length_squared();
+                    if d <= WARM_MATCH_TOL * WARM_MATCH_TOL && best.map_or(true, |(bd, _)| d < bd) { best = Some((d, k)); }
+                }
+                let Some((_, k)) = best else { continue };
+                taken[k] = true;
+                self.last_warm_matched += 1;
+                let e = entries[k];
+                acc_jn[c_idx] = e.jn;
+                let mut imp = cs.normal * e.jn;
+                if !cs.patch {
+                    // Projected on the new tangents, clamped as the iterations clamp it
+                    let mu = mu_dynamic(cs, slip_speed(&self.bodies, cs));
+                    let t = Vec3::new(e.jt.dot(cs.t1), e.jt.dot(cs.t2), 0.0).clamp_length_max(mu * e.jn);
+                    acc_jt[2 * c_idx] = t.x;
+                    acc_jt[2 * c_idx + 1] = t.y;
+                    imp += cs.t1 * t.x + cs.t2 * t.y;
+                }
+                apply_contact_impulse(&mut self.bodies, cs, imp);
+            }
+        }
+        // Patches: their sliding and torsion accumulators, limited by the warm normal load
+        // (compliant pairs are left cold, like their points)
+        for (k, p) in patches.iter().enumerate() {
+            if p.at.soft { continue; }
+            let Some(wp) = self.warm_patches.get(&keys[p.points[0]]).copied() else { continue };
+            let cs = &p.at;
+            let jn: f32 = p.points.iter().map(|&i| acc_jn[i]).sum();
+            let mu = mu_dynamic(cs, slip_speed(&self.bodies, cs));
+            let t = Vec3::new(wp.jt.dot(cs.t1), wp.jt.dot(cs.t2), 0.0).clamp_length_max(mu * jn);
+            let lim = mu * jn * p.radius;
+            let tw = wp.tw.clamp(-lim, lim);
+            patch_acc[3 * k] = t.x;
+            patch_acc[3 * k + 1] = t.y;
+            patch_acc[3 * k + 2] = tw;
+            apply_contact_impulse(&mut self.bodies, cs, cs.t1 * t.x + cs.t2 * t.y);
+            if tw != 0.0 {
+                if cs.inv_a > 0.0 { self.bodies.apply_angular_impulse(cs.ai, -cs.normal * tw); }
+                if !cs.b_is_terrain && cs.inv_b > 0.0 { self.bodies.apply_angular_impulse(cs.bi, cs.normal * tw); }
+            }
+        }
+        let acc_jn_ptr = UnsafeAcc(acc_jn.as_mut_ptr());
+        let acc_jt_ptr = UnsafeAcc(acc_jt.as_mut_ptr());
+        let row_acc_ptr = UnsafeAcc(row_acc.as_mut_ptr());
+        let bodies_ptr = UnsafeSyncBodies(&mut self.bodies as *mut _);
 
         for _it in 0..iterations {
             // A. Solve Joints (Batched Parallel)
@@ -492,7 +600,7 @@ impl World {
                     let v_f = contact_rel_vel(bodies, cs);
                     let (vt1, vt2) = (v_f.dot(cs.t1), v_f.dot(cs.t2));
                     let slip = (vt1 * vt1 + vt2 * vt2).sqrt();
-                    let mu = cs.mu_k + (cs.mu_s - cs.mu_k) * (-(slip / cs.stribeck_v).powi(2)).exp();
+                    let mu = mu_dynamic(cs, slip);
                     let old_t = Vec3::new(acc_jt_slice[2 * c_idx], acc_jt_slice[2 * c_idx + 1], 0.0);
                     let new_t = (old_t - Vec3::new(vt1 * cs.m_t1, vt2 * cs.m_t2, 0.0))
                         .clamp_length_max(mu * new_jn);
@@ -514,7 +622,7 @@ impl World {
                     let v = contact_rel_vel(bodies, cs);
                     let (vt1, vt2) = (v.dot(cs.t1), v.dot(cs.t2));
                     let slip = (vt1 * vt1 + vt2 * vt2).sqrt();
-                    let mu = cs.mu_k + (cs.mu_s - cs.mu_k) * (-(slip / cs.stribeck_v).powi(2)).exp();
+                    let mu = mu_dynamic(cs, slip);
                     let old_t = Vec3::new(patch_acc[3 * k], patch_acc[3 * k + 1], 0.0);
                     let new_t = (old_t - Vec3::new(vt1 * cs.m_t1, vt2 * cs.m_t2, 0.0)).clamp_length_max(mu * jn);
                     patch_acc[3 * k] = new_t.x;
@@ -536,6 +644,41 @@ impl World {
                     }
                 }
             }
+        }
+
+        // Warm-start cache for next step: the impulses as the iterations left them. Stored before
+        // the shock pass, whose frozen-body jn on a light body under a heavy one is far larger
+        // than a solve with real masses gives, and before restitution, so a bounce isn't stored.
+        let mut warm: BTreeMap<WarmKey, Vec<WarmContact>> = BTreeMap::new();
+        for (c_idx, cs) in constraints.iter().enumerate() {
+            if cs.soft { continue; }
+            let jt = cs.t1 * acc_jt[2 * c_idx] + cs.t2 * acc_jt[2 * c_idx + 1];
+            if acc_jn[c_idx] == 0.0 && jt == Vec3::ZERO { continue; }
+            warm.entry(keys[c_idx]).or_default().push(WarmContact { la: anchors[c_idx], jn: acc_jn[c_idx], jt });
+        }
+        let mut warm_patches: BTreeMap<WarmKey, WarmPatch> = BTreeMap::new();
+        for (k, p) in patches.iter().enumerate() {
+            if p.at.soft { continue; }
+            let jt = p.at.t1 * patch_acc[3 * k] + p.at.t2 * patch_acc[3 * k + 1];
+            warm_patches.insert(keys[p.points[0]], WarmPatch { jt, tw: patch_acc[3 * k + 2] });
+        }
+        // Pairs where neither body is awake keep their entries even when not solved this step,
+        // so a sleeping stack wakes warm. A removed body isn't idle: its entries go.
+        let idle = |b: u32| b == u32::MAX || (self.alive.get(b as usize).copied().unwrap_or(0) != 0
+            && (!self.bodies.is_dynamic(b) || !self.sleep.is_awake(b as usize)));
+        for (k, v) in &self.warm {
+            if idle(k.0) && idle(k.1) && !warm.contains_key(k) { warm.insert(*k, v.clone()); }
+        }
+        for (k, v) in &self.warm_patches {
+            if idle(k.0) && idle(k.1) && !warm_patches.contains_key(k) { warm_patches.insert(*k, *v); }
+        }
+        self.warm = warm;
+        self.warm_patches = warm_patches;
+        // Joints solved this step replace their rows; the rest (asleep) keep theirs
+        for (j_idx, &(s, e)) in row_range.iter().enumerate() {
+            if e == s { continue; }
+            let rows = (s..e).map(|k| WarmRow { tag: joint_rows[k].tag, lam: row_acc[k] }).collect();
+            self.warm_joints.insert(j_idx as u32, rows);
         }
 
         // 3a. Shock propagation (Guendelman et al. 2003): one more normal pass, bottom-up along
@@ -586,4 +729,16 @@ impl World {
             contact.impulse = acc_jn[i];
         }
     }
+}
+
+/// Each collider's ordinal among its body's colliders, in collider order.
+fn collider_ordinals(colliders: &[super::world::Collider], num_bodies: usize) -> Vec<u32> {
+    let mut next = vec![0u32; num_bodies];
+    colliders.iter().map(|c| {
+        let b = c.body.0 as usize;
+        if b >= next.len() { next.resize(b + 1, 0); }
+        let o = next[b];
+        next[b] += 1;
+        o
+    }).collect()
 }

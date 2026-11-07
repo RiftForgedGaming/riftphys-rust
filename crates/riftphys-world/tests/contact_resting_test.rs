@@ -64,7 +64,8 @@ fn stacked_boxes_hold() {
     let ids: Vec<BodyId> = (0..3)
         .map(|i| add_dynamic(&mut w, Vec3::new(0.0, 0.1 + 0.2 * i as f32 + 0.01 * i as f32, 0.0), Quat::IDENTITY, h, 5.0, Shape::Box { hx: h.x, hy: h.y, hz: h.z }))
         .collect();
-    for _ in 0..240 { w.step(DT); }
+    // 30 s kept awake: a stack that only lasts 4 s isn't holding (AT_REST_SPEC R1)
+    for _ in 0..1800 { w.step(DT); }
     for (i, id) in ids.iter().enumerate() {
         let p = w.get_body_pose(*id).pos;
         let want = 0.1 + 0.2 * i as f32;

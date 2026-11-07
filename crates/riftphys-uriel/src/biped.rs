@@ -270,10 +270,12 @@ pub struct StandPd {
 }
 
 impl Default for StandPd {
+    /// Balance gains retuned for AT_REST_SPEC R1 (D1): warm-started contacts hold the feet, so
+    /// the ankle and hip strategies have to do what sliding feet used to. Joint PD unchanged.
     fn default() -> Self {
         Self {
             kp: [300.0, 300.0, 150.0], kd: [30.0, 30.0, 15.0],
-            k_com: 800.0, k_com_v: 150.0, k_torso: 400.0, k_torso_v: 60.0,
+            k_com: 1400.0, k_com_v: 280.0, k_torso: 2250.0, k_torso_v: 75.0,
             pose: [-0.1, 0.2, -0.1], ankle_sign: 1.0, hip_sign: -1.0,
         }
     }
@@ -418,6 +420,41 @@ mod tests {
         }
     }
 
+    /// AT_REST_SPEC D1 gate: with contacts and joint rows warm-started the feet no longer slide
+    /// to absorb a push, and the old gains stood 11/20 at 20 N s. Retuned (coordinate search on
+    /// the balance gains, seeds 1000-1019 at 20 and 30 N s; joint PD unchanged, so
+    /// `joint_pd_only` is the same base): 19/20 on those seeds, 35/40 on held-out seeds
+    /// 2000-2039. The gate uses the held-out seeds, which the search never scored.
+    #[test]
+    fn push_recovery_20_holds() {
+        let cfg = BipedConfig { push_impulse: 20.0, ..Default::default() };
+        let ok = (2000..2040).filter(|&s| stand_time(&StandPd::default(), &cfg, s, 10.0) >= 10.0).count();
+        assert!(ok >= 32, "20 N s pushes, held-out seeds: {}/40 stood 10 s (gate 32; measured 35)", ok);
+    }
+
+    /// AT_REST_SPEC R1 gate: the biped standing still (no push, no lean) under StandPd. It settles
+    /// its posture over the first few seconds (the pelvis moves about 5 mm), then holds: over the
+    /// next 60 s the pelvis moves under 1 mm and the feet under 0.1 mm. With contacts and joint
+    /// rows started cold every step, the feet slid at 4-5 cm/s.
+    #[test]
+    fn standing_holds_still() {
+        let cfg = BipedConfig { push_rate: 0.0, start_lean: 0.0, ..Default::default() };
+        let ctl = StandPd::default();
+        let mut rng = Rng::new(7);
+        let mut world = World::with_capacity(32, 32);
+        let mut b = Biped::build(&mut world, &cfg, &mut rng);
+        for _ in 0..10 * CONTROL_HZ { b.tick(&mut world, |w, b| ctl.command(w, b)); }
+        let p0 = world.get_body_pose(b.pelvis).pos;
+        let f0 = b.foot.map(|f| world.get_body_pose(f).pos);
+        let (mut pelvis, mut feet) = (0.0f32, 0.0f32);
+        for _ in 0..60 * CONTROL_HZ {
+            b.tick(&mut world, |w, b| ctl.command(w, b));
+            pelvis = pelvis.max((world.get_body_pose(b.pelvis).pos - p0).length());
+            for s in 0..2 { feet = feet.max((world.get_body_pose(b.foot[s]).pos - f0[s]).length()); }
+        }
+        assert!(pelvis < 1e-3 && feet < 1e-4, "standing 60 s: pelvis moved {:.3e} m, feet {:.3e} m", pelvis, feet);
+    }
+
     /// PRECISION_SPEC P1 at rest: the biped standing still (no push, no lean) under StandPd for
     /// 60 s after settling 2 s. Reports whether it fell and the pelvis's largest drift.
     #[test]
@@ -430,14 +467,16 @@ mod tests {
         let mut b = Biped::build(&mut world, &cfg, &mut rng);
         for _ in 0..2 * CONTROL_HZ { b.tick(&mut world, |w, b| ctl.command(w, b)); }
         let p0 = world.get_body_pose(b.pelvis).pos;
-        let (mut worst, mut min_y) = (0.0f32, f32::MAX);
+        let f0 = b.foot.map(|f| world.get_body_pose(f).pos);
+        let (mut worst, mut min_y, mut feet) = (0.0f32, f32::MAX, 0.0f32);
         for _ in 0..60 * CONTROL_HZ {
             b.tick(&mut world, |w, b| ctl.command(w, b));
             let p = world.get_body_pose(b.pelvis).pos;
             worst = worst.max((p - p0).length());
             min_y = min_y.min(p.y);
+            for s in 0..2 { feet = feet.max((world.get_body_pose(b.foot[s]).pos - f0[s]).length()); }
         }
-        println!("biped standing still 60 s: pelvis drift {:.3e} m, pelvis y {:.4} -> min {:.4}", worst, p0.y, min_y);
+        println!("biped standing still 60 s: pelvis drift {:.3e} m, feet {:.3e} m, pelvis y {:.4} -> min {:.4}", worst, feet, p0.y, min_y);
     }
 }
 
