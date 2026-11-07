@@ -1,9 +1,9 @@
 // riftphys-aero/src/isa.rs
 
+// Not rounded (PRECISION_SPEC P1); non-finite values become 0.
 #[inline]
-fn q6(x: f32) -> f32 {
-    if !x.is_finite() { return 0.0; }
-    (x * 1.0e6_f32).round() * 1.0e-6_f32
+fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 /// Simple ISA-ish density model (troposphere-ish).
@@ -43,6 +43,6 @@ impl ISA {
         let base = a.max(0.0);
         let rho = self.rho0 * base.powf(exp);
 
-        q6(rho.max(0.0))
+        fin(rho.max(0.0))
     }
 }

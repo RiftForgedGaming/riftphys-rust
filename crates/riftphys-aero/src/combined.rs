@@ -3,10 +3,10 @@ use std::sync::Arc;
 use riftphys_core::StepCtx;
 use riftphys_core::models::{AeroModel, AeroQuery};
 
+// Not rounded (PRECISION_SPEC P1); non-finite values become 0.
 #[inline]
-fn q6(x: f32) -> f32 {
-    if !x.is_finite() { return 0.0; }
-    (x * 1.0e6_f32).round() * 1.0e-6_f32
+fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 /// Deterministic composition wrapper.
@@ -45,16 +45,16 @@ impl AeroModel for CombinedAero {
         for p in &self.parts {
             let a = p.accel_contrib(ctx, q);
             // quantize per-part contribution
-            let px = q6(a[0]);
-            let py = q6(a[1]);
-            let pz = q6(a[2]);
+            let px = fin(a[0]);
+            let py = fin(a[1]);
+            let pz = fin(a[2]);
 
             // quantize running sum each step
-            ax = q6(ax + px);
-            ay = q6(ay + py);
-            az = q6(az + pz);
+            ax = fin(ax + px);
+            ay = fin(ay + py);
+            az = fin(az + pz);
         }
 
-        [q6(ax), q6(ay), q6(az)]
+        [fin(ax), fin(ay), fin(az)]
     }
 }

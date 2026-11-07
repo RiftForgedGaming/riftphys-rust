@@ -14,6 +14,19 @@ pub fn q6_vec3(v: Vec3) -> Vec3 {
     Vec3::new(q6(v.x), q6(v.y), q6(v.z))
 }
 
+/// Non-finite values become 0; otherwise unchanged. Gait outputs (targets, heading, step
+/// lengths) go through this, not `q6` (PRECISION_SPEC P1). The clock stays on integer
+/// microseconds, and parameters are still rounded as inputs.
+#[inline]
+pub fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
+#[inline]
+pub fn fin_vec3(v: Vec3) -> Vec3 {
+    Vec3::new(fin(v.x), fin(v.y), fin(v.z))
+}
+
 #[inline]
 pub fn sec_to_us(x: f32) -> u32 {
     if !x.is_finite() { return 0; }
@@ -137,14 +150,14 @@ pub enum Phase {
 
 #[inline]
 fn hermite(p0: Vec3, v0: Vec3, p1: Vec3, v1: Vec3, s: f32) -> Vec3 {
-    let s = q6(s.clamp(0.0, 1.0));
+    let s = fin(s.clamp(0.0, 1.0));
     let s2 = s * s;
     let s3 = s2 * s;
     let h00 =  2.0 * s3 - 3.0 * s2 + 1.0;
     let h10 =        s3 - 2.0 * s2 + s;
     let h01 = -2.0 * s3 + 3.0 * s2;
     let h11 =        s3 -       s2;
-    q6_vec3(h00 * p0 + h10 * v0 + h01 * p1 + h11 * v1)
+    fin_vec3(h00 * p0 + h10 * v0 + h01 * p1 + h11 * v1)
 }
 
 // Legacy X+ swing helper
@@ -233,15 +246,15 @@ impl LocoState {
                     TransitionPlan::Turn(TurnPlan { mut yaw_total_rad, mut steps }) => {
                         steps = steps.max(1);
                         yaw_total_rad = q6(yaw_total_rad);
-                        let per_step = q6(yaw_total_rad / steps as f32);
+                        let per_step = fin(yaw_total_rad / steps as f32);
 
                         out.yaw_delta_rad = per_step;
-                        self.heading_yaw_rad = q6(self.heading_yaw_rad + per_step);
+                        self.heading_yaw_rad = fin(self.heading_yaw_rad + per_step);
 
                         let remaining = steps - 1;
                         if remaining > 0 {
                             self.pending = Some(TransitionPlan::Turn(TurnPlan {
-                                yaw_total_rad: q6(yaw_total_rad - per_step),
+                                yaw_total_rad: fin(yaw_total_rad - per_step),
                                 steps: remaining,
                             }));
                         } else {
@@ -272,9 +285,9 @@ impl LocoState {
             out.right_step_len = self.spec.step_len;
         }
 
-        out.yaw_delta_rad  = q6(out.yaw_delta_rad);
-        out.left_step_len  = q6(out.left_step_len);
-        out.right_step_len = q6(out.right_step_len);
+        out.yaw_delta_rad  = fin(out.yaw_delta_rad);
+        out.left_step_len  = fin(out.left_step_len);
+        out.right_step_len = fin(out.right_step_len);
 
         self.prev_l_stance = l_stance_now;
         self.prev_r_stance = r_stance_now;
@@ -283,10 +296,9 @@ impl LocoState {
     }
 
     pub fn heading_dir(&self) -> Vec3 {
-        // Still uses trig under the hood; quantize output to keep it from drifting across long runs.
-        let yaw = q6(self.heading_yaw_rad);
+        let yaw = fin(self.heading_yaw_rad);
         let q = Quat::from_rotation_y(yaw);
-        q6_vec3(q * Vec3::X)
+        fin_vec3(q * Vec3::X)
     }
 }
 
@@ -331,7 +343,7 @@ pub fn swing_target_dir(
 
     let dir = dir_ws.normalize_or_zero();
     if dir.length_squared() < 1.0e-12 {
-        return q6_vec3(p_stance);
+        return fin_vec3(p_stance);
     }
 
     let p0  = p_stance;

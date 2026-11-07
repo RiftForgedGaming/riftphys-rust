@@ -1,7 +1,7 @@
 // File: crates/riftphys-terrain/src/terrain.rs
 
 use glam::{UVec2, Vec2};
-use riftphys_core::det::{q6, q6_unit_vec3, safe_contact_dist};
+use riftphys_core::det::{q6, safe_contact_dist};
 use riftphys_core::types::Vec3;
 use riftphys_materials::materials::MaterialId;
 use riftphys_collision::environment::{SpatialEnvironment, EnvCollider};
@@ -209,8 +209,9 @@ impl HeightField {
         let x0 = fx.floor() as i32; let x1 = (x0 + 1).min(nx - 1);
         let z0 = fz.floor() as i32; let z1 = (z0 + 1).min(nz - 1);
 
-        let tx = q6(fx - x0 as f32);
-        let tz = q6(fz - z0 as f32);
+        // Sampling is not rounded (PRECISION_SPEC P1); the heights themselves were, on load.
+        let tx = fx - x0 as f32;
+        let tz = fz - z0 as f32;
 
         let h00 = self.h(x0, z0);
         let h10 = self.h(x1, z0);
@@ -219,7 +220,8 @@ impl HeightField {
 
         let a = h00 * (1.0 - tx) + h10 * tx;
         let b = h01 * (1.0 - tx) + h11 * tx;
-        q6(a * (1.0 - tz) + b * tz)
+        let y = a * (1.0 - tz) + b * tz;
+        if y.is_finite() { y } else { 0.0 }
     }
 
     pub fn sample_normal(&self, x: f32, z: f32) -> Vec3 {
@@ -241,7 +243,8 @@ impl HeightField {
         let ddz = (hz1 - hz0) * (0.5 / sz);
 
         let n = Vec3::new(-ddx, 1.0, -ddz);
-        q6_unit_vec3(n)
+        let n = n.normalize_or_zero();
+        if n.is_finite() && n != Vec3::ZERO { n } else { Vec3::Y }
     }
 
     #[inline]

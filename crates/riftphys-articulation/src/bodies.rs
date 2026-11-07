@@ -2,25 +2,25 @@
 use riftphys_core::{BodyId, Isometry, JointId, Mat3, Quat, Scalar, Vec3};
 use riftphys_dynamics::dynamics::Bodies;
 
-/* ─────────────────────────  Quantization ───────────────────────── */
+/* ─────────────────────────  Sanitation ───────────────────────── */
+// Nothing here is rounded (PRECISION_SPEC P1); non-finite values become 0.
 
 #[inline]
-fn q6(x: f32) -> f32 {
-    if !x.is_finite() { return 0.0; }
-    (x * 1.0e6_f32).round() * 1.0e-6_f32
+fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 #[inline]
-fn q6v(v: Vec3) -> Vec3 {
-    Vec3::new(q6(v.x), q6(v.y), q6(v.z))
+fn fin_v(v: Vec3) -> Vec3 {
+    Vec3::new(fin(v.x), fin(v.y), fin(v.z))
 }
 
 #[inline]
-fn normalize_q6(v: Vec3) -> Vec3 {
-    let v = q6v(v);
+fn normalize_fin(v: Vec3) -> Vec3 {
+    let v = fin_v(v);
     let len2 = v.length_squared();
     if len2 > 1.0e-12 {
-        q6v(v * (1.0 / len2.sqrt()))
+        v * (1.0 / len2.sqrt())
     } else {
         Vec3::ZERO
     }
@@ -123,8 +123,8 @@ impl Joints {
     }
     pub fn set_distance_params(&mut self, id: JointId, rest: f32, compliance: f32) {
         if let Some(JointKind::Distance(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
-            j.rest = q6(rest);
-            j.compliance = q6(compliance).max(0.0);
+            j.rest = fin(rest);
+            j.compliance = fin(compliance).max(0.0);
         }
     }
 
@@ -132,8 +132,8 @@ impl Joints {
         self.kinds.push(JointKind::Distance(DistanceJoint {
             a,
             b,
-            rest: q6(rest),
-            compliance: q6(compliance).max(0.0),
+            rest: fin(rest),
+            compliance: fin(compliance).max(0.0),
             lambda_acc: 0.0,
         }));
         JointId((self.kinds.len() as u32) - 1)
@@ -232,7 +232,7 @@ impl Joints {
         if self.kinds.is_empty() { return; }
         let is_frozen = |id: u32| frozen.get(id as usize).copied().unwrap_or(false);
 
-        let dt = q6(dt);
+        let dt = fin(dt);
         if !(dt > 0.0) { return; }
         // Not quantized: on the 1e-6 grid dt^2 itself was off by 2% at 240 Hz and 8% at 960 Hz
         // (1.736e-5 -> 1.7e-5, 1.085e-6 -> 1e-6), and every compliance with it.
@@ -240,8 +240,8 @@ impl Joints {
 
         #[inline]
         fn alpha_dt2(c: Scalar, dt2: Scalar) -> Scalar {
-            let c = q6(c).max(0.0);
-            if c <= 0.0 { 0.0 } else { q6(c / dt2) }
+            let c = fin(c).max(0.0);
+            if c <= 0.0 { 0.0 } else { fin(c / dt2) }
         }
 
         for _ in 0..iterations.max(1) {
@@ -296,7 +296,7 @@ fn solve_distance_row(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt
 
     let wa = bodies.inv_mass_of(ia);
     let wb = bodies.inv_mass_of(ib);
-    let w_sum = q6(wa + wb);
+    let w_sum = fin(wa + wb);
     if w_sum <= 0.0 { return; }
 
     let pa = bodies.pose(ia).pos;
@@ -309,32 +309,32 @@ fn solve_distance_row(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt
     let len = len2.sqrt();
     if len <= 1.0e-6 { return; }
 
-    let n_cur = normalize_q6(d / len);
+    let n_cur = normalize_fin(d / len);
     if n_cur == Vec3::ZERO { return; }
     // SHAKE: correct along the start-of-step direction
     let mut n = n_cur;
     if let Some((sa, sb)) = start {
-        let n0 = normalize_q6(sb.pos - sa.pos);
+        let n0 = normalize_fin(sb.pos - sa.pos);
         if n0 != Vec3::ZERO && n0.dot(n_cur) > SHAKE_MAX_TURN.cos() { n = n0; }
     }
 
-    let c_val = q6(len - q6(j.rest));
+    let c_val = fin(len - fin(j.rest));
 
-    let alpha = if j.compliance <= 0.0 { 0.0 } else { q6(q6(j.compliance).max(0.0) / dt2) };
-    let denom = q6(w_sum + alpha);
+    let alpha = if j.compliance <= 0.0 { 0.0 } else { fin(fin(j.compliance).max(0.0) / dt2) };
+    let denom = fin(w_sum + alpha);
     if denom <= 0.0 { return; }
 
     // XPBD: the multiplier accumulates over the step's iterations, so a compliant joint settles
     // at C = -alpha lambda (stretch = compliance x force) whatever the iteration count; without it
     // the stiffness depended on the iteration count and compliance was nearly ignored. The error
     // grows along n_cur; a correction along n changes it at the rate n . n_cur.
-    let lambda_old = q6(j.lambda_acc);
-    let lambda = q6(-(c_val + q6(alpha * lambda_old)) / (denom * n.dot(n_cur)));
+    let lambda_old = fin(j.lambda_acc);
+    let lambda = fin(-(c_val + fin(alpha * lambda_old)) / (denom * n.dot(n_cur)));
     if lambda.abs() <= 1.0e-9 { return; }
-    j.lambda_acc = q6(lambda_old + lambda);
+    j.lambda_acc = fin(lambda_old + lambda);
 
-    bodies.apply_position_delta(ia, q6v(-n * q6(lambda * wa)));
-    bodies.apply_position_delta(ib, q6v( n * q6(lambda * wb)));
+    bodies.apply_position_delta(ia, fin_v(-n * fin(lambda * wa)));
+    bodies.apply_position_delta(ib, fin_v( n * fin(lambda * wb)));
 
     let _ = dt;
 }
@@ -348,8 +348,8 @@ fn solve_d6(
     start: Option<(Isometry, Isometry)>,
 ) {
     let units = [Vec3::X, Vec3::Y, Vec3::Z];
-    let wa = q6(bodies.inv_mass_of(j.a.0));
-    let wb = q6(bodies.inv_mass_of(j.b.0));
+    let wa = fin(bodies.inv_mass_of(j.a.0));
+    let wb = fin(bodies.inv_mass_of(j.b.0));
 
     // Correction directions: the current iterate's (PBD), or the start of the step's (SHAKE).
     // The SHAKE fallback test (a body that turned too far this step uses PBD directions) runs
@@ -358,8 +358,8 @@ fn solve_d6(
     let start = start.filter(|(sa, sb)| turned(sa.rot, pa0.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb0.rot) < SHAKE_MAX_TURN);
     let shake: Option<([Vec3; 3], Vec3, Vec3, Mat3, Mat3)> = start.map(|(sa, sb)| {
         let ra0 = sa.rot * j.fa.rot;
-        ([normalize_q6(ra0 * Vec3::X), normalize_q6(ra0 * Vec3::Y), normalize_q6(ra0 * Vec3::Z)],
-         q6v(sa.rot * j.fa.pos), q6v(sb.rot * j.fb.pos),
+        ([normalize_fin(ra0 * Vec3::X), normalize_fin(ra0 * Vec3::Y), normalize_fin(ra0 * Vec3::Z)],
+         fin_v(sa.rot * j.fa.pos), fin_v(sb.rot * j.fb.pos),
          inv_inertia_at(bodies, j.a.0, sa.rot), inv_inertia_at(bodies, j.b.0, sb.rot))
     });
 
@@ -373,29 +373,29 @@ fn solve_d6(
         if !j.t[i].enabled { continue; }
 
         let (pa, pb) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
-        let u = normalize_q6((pa.rot * j.fa.rot) * units[i]);
+        let u = normalize_fin((pa.rot * j.fa.rot) * units[i]);
         if u == Vec3::ZERO { continue; }
-        let xa = q6v(pa.pos + pa.rot * j.fa.pos);
-        let xb = q6v(pb.pos + pb.rot * j.fb.pos);
-        let d = q6v(xb - xa);
+        let xa = fin_v(pa.pos + pa.rot * j.fa.pos);
+        let xb = fin_v(pb.pos + pb.rot * j.fb.pos);
+        let d = fin_v(xb - xa);
         let (un, lever_a, lever_b, iaw, ibw) = match &shake {
             Some((ax0, la, lb, ia, ib)) => (ax0[i], *la, *lb, *ia, *ib),
             None => (u, xa - pa.pos, xb - pb.pos, bodies.inv_inertia_world(j.a.0), bodies.inv_inertia_world(j.b.0)),
         };
 
         let row = &mut j.t[i];
-        let coord = q6(d.dot(u));
+        let coord = fin(d.dot(u));
         let mut target_pos = 0.0f32;
-        let mut c_err: Option<f32> = Some(q6(coord - 0.0));
+        let mut c_err: Option<f32> = Some(fin(coord - 0.0));
 
         if let Some(lim) = row.limit {
-            let lo = q6(lim.min);
-            let hi = q6(lim.max);
+            let lo = fin(lim.min);
+            let hi = fin(lim.max);
             if coord < lo {
-                c_err = Some(q6(coord - lo));
+                c_err = Some(fin(coord - lo));
                 target_pos = lo;
             } else if coord > hi {
-                c_err = Some(q6(coord - hi));
+                c_err = Some(fin(coord - hi));
                 target_pos = hi;
             } else {
                 c_err = None;
@@ -405,11 +405,11 @@ fn solve_d6(
 
         if let Some(drive) = row.drive {
             if !drive.vel_mode {
-                target_pos = q6(drive.target);
+                target_pos = fin(drive.target);
                 if let Some(lim) = row.limit {
-                    target_pos = target_pos.clamp(q6(lim.min), q6(lim.max));
+                    target_pos = target_pos.clamp(fin(lim.min), fin(lim.max));
                 }
-                c_err = Some(q6(coord - target_pos));
+                c_err = Some(fin(coord - target_pos));
             } else if row.limit.is_none() {
                 // Velocity drives act at velocity level (motor rows in the World's velocity
                 // solve); at position level the axis is free apart from its limits. Leaving it
@@ -422,27 +422,27 @@ fn solve_d6(
 
         let bias_vel = 0.0f32;
 
-        let ra_u = q6v(lever_a.cross(un));
-        let rb_u = q6v(lever_b.cross(un));
+        let ra_u = fin_v(lever_a.cross(un));
+        let rb_u = fin_v(lever_b.cross(un));
 
-        let w_rot_a = q6(ra_u.dot(iaw * ra_u));
-        let w_rot_b = q6(rb_u.dot(ibw * rb_u));
-        let w = q6(wa + wb + w_rot_a + w_rot_b);
+        let w_rot_a = fin(ra_u.dot(iaw * ra_u));
+        let w_rot_b = fin(rb_u.dot(ibw * rb_u));
+        let w = fin(wa + wb + w_rot_a + w_rot_b);
 
         let alpha = alpha_dt2(row.compliance, dt2);
-        let denom = q6(w + alpha);
+        let denom = fin(w + alpha);
         if denom <= 0.0 { continue; }
 
-        c = q6(c + q6(bias_vel * dt));
-        let lambda_old = q6(row.lambda_acc);
-        let dl = q6(-(c + q6(alpha * lambda_old)) / denom);
-        row.lambda_acc = q6(lambda_old + dl);
+        c = fin(c + fin(bias_vel * dt));
+        let lambda_old = fin(row.lambda_acc);
+        let dl = fin(-(c + fin(alpha * lambda_old)) / denom);
+        row.lambda_acc = fin(lambda_old + dl);
 
-        bodies.apply_position_delta(j.a.0, q6v(-un * q6(dl * wa)));
-        bodies.apply_position_delta(j.b.0, q6v( un * q6(dl * wb)));
+        bodies.apply_position_delta(j.a.0, fin_v(-un * fin(dl * wa)));
+        bodies.apply_position_delta(j.b.0, fin_v( un * fin(dl * wb)));
 
-        bodies.apply_orientation_delta(j.a.0, q6v(-(iaw * ra_u) * dl));
-        bodies.apply_orientation_delta(j.b.0, q6v( (ibw * rb_u) * dl));
+        bodies.apply_orientation_delta(j.a.0, fin_v(-(iaw * ra_u) * dl));
+        bodies.apply_orientation_delta(j.b.0, fin_v( (ibw * rb_u) * dl));
 
         let _ = target_pos;
     }
@@ -462,16 +462,16 @@ fn solve_d6(
         let (pa, pb) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
         let ra: Quat = pa.rot * j.fa.rot;
         let rb: Quat = pb.rot * j.fb.rot;
-        let u = normalize_q6(ra * units[i]);
+        let u = normalize_fin(ra * units[i]);
         if u == Vec3::ZERO { continue; }
         let mut q_err = ra.conjugate() * rb;
         if q_err.w < 0.0 { q_err = -q_err; }
         let v = Vec3::new(q_err.x, q_err.y, q_err.z);
         let angle = match hinge {
-            Some(f) if f == i => q6(2.0 * v[f].atan2(q_err.w)),
-            Some(f) => q6(q6v(normalize_q6(ra * units[f]).cross(normalize_q6(rb * units[f]))).dot(u)),
+            Some(f) if f == i => fin(2.0 * v[f].atan2(q_err.w)),
+            Some(f) => fin(fin_v(normalize_fin(ra * units[f]).cross(normalize_fin(rb * units[f]))).dot(u)),
             // The error vector 2 q_err.xyz, from anchor A's frame into world space
-            None => q6(q6v(ra * q6v(2.0 * v)).dot(u)),
+            None => fin(fin_v(ra * fin_v(2.0 * v)).dot(u)),
         };
         let (un, iaw, ibw) = match &shake {
             Some((ax0, _, _, ia, ib)) => (ax0[i], *ia, *ib),
@@ -480,16 +480,16 @@ fn solve_d6(
 
         let row = &mut j.r[i];
         let mut target_ang = 0.0f32;
-        let mut c_err: Option<f32> = Some(q6(angle - 0.0));
+        let mut c_err: Option<f32> = Some(fin(angle - 0.0));
 
         if let Some(lim) = row.limit {
-            let lo = q6(lim.min);
-            let hi = q6(lim.max);
+            let lo = fin(lim.min);
+            let hi = fin(lim.max);
             if angle < lo {
-                c_err = Some(q6(angle - lo));
+                c_err = Some(fin(angle - lo));
                 target_ang = lo;
             } else if angle > hi {
-                c_err = Some(q6(angle - hi));
+                c_err = Some(fin(angle - hi));
                 target_ang = hi;
             } else {
                 c_err = None;
@@ -499,11 +499,11 @@ fn solve_d6(
 
         if let Some(drive) = row.drive {
             if !drive.vel_mode {
-                target_ang = q6(drive.target);
+                target_ang = fin(drive.target);
                 if let Some(lim) = row.limit {
-                    target_ang = target_ang.clamp(q6(lim.min), q6(lim.max));
+                    target_ang = target_ang.clamp(fin(lim.min), fin(lim.max));
                 }
-                c_err = Some(q6(angle - target_ang));
+                c_err = Some(fin(angle - target_ang));
             } else if row.limit.is_none() {
                 // Velocity drives: velocity level only (see the translational rows above)
                 c_err = None;
@@ -514,18 +514,18 @@ fn solve_d6(
 
         let bias_vel = 0.0f32;
 
-        let w = q6(un.dot(iaw * un) + un.dot(ibw * un));
+        let w = fin(un.dot(iaw * un) + un.dot(ibw * un));
         let alpha = alpha_dt2(row.compliance, dt2);
-        let denom = q6(w + alpha);
+        let denom = fin(w + alpha);
         if denom <= 0.0 { continue; }
 
-        c = q6(c + q6(bias_vel * dt));
-        let lambda_old = q6(row.lambda_acc);
-        let dl = q6(-(c + q6(alpha * lambda_old)) / denom);
-        row.lambda_acc = q6(lambda_old + dl);
+        c = fin(c + fin(bias_vel * dt));
+        let lambda_old = fin(row.lambda_acc);
+        let dl = fin(-(c + fin(alpha * lambda_old)) / denom);
+        row.lambda_acc = fin(lambda_old + dl);
 
-        bodies.apply_orientation_delta(j.a.0, q6v(-(iaw * un) * dl));
-        bodies.apply_orientation_delta(j.b.0, q6v( (ibw * un) * dl));
+        bodies.apply_orientation_delta(j.a.0, fin_v(-(iaw * un) * dl));
+        bodies.apply_orientation_delta(j.b.0, fin_v( (ibw * un) * dl));
 
         let _ = target_ang;
     }
@@ -539,23 +539,29 @@ fn leave_hinge(j: &mut Generic6Dof, axis: usize) {
 }
 
 /// The hinge axis of a D6 joint, if it has one: `hinge_axis` when set (`add_hinge` sets it).
-/// Otherwise it is derived from the rows. A rotational row is rigid when it is enabled with no
-/// limit, drive or compliance (compliance that rounds to zero on the solver's grid counts as
-/// none); the one axis that is not rigid is the hinge, a sprung hinge included, so its spring
-/// acts on the angle in radians. Failing that, compliant rows count as locked, so a hinge whose
-/// two alignment rows are soft is still a hinge about its free axis. A sprung hinge whose
-/// alignment rows are also compliant can't be told from a soft weld by its rows: set
-/// `hinge_axis`. `None` for ball, universal and fully locked joints.
+/// Otherwise it is derived from the rows (PRECISION_SPEC P1):
+/// - the one rotational axis that is free (disabled), limited or driven; enabled rows with none
+///   of those count as locked, compliant or not, so a hinge whose alignment rows are soft is
+///   still a hinge about its free axis;
+/// - failing that, the one enabled row whose compliance is positive and at least 100x each other
+///   enabled rotational row's: a sprung hinge (0.15 against alignment rows at 0, 1e-9 or 1e-3),
+///   whose spring then acts on the angle in radians. A universal joint with a spring on its
+///   twist counts too (its other rows are disabled, so only the twist's measure changes);
+/// - otherwise none: ball, universal and welded joints, and soft bushings.
+///
+/// A bushing whose compliance ratio sits near 100x switches between measures as the ratio
+/// crosses it; the measures differ only at large angles. Set `hinge_axis` to pin it.
 pub fn d6_hinge_axis(j: &Generic6Dof) -> Option<usize> {
     if let Some(f) = j.hinge_axis { return (f < 3).then_some(f); }
-    let single = |locked: &dyn Fn(&D6Axis) -> bool| {
-        let mut free = None;
-        let mut n = 0;
-        for i in 0..3 { if !locked(&j.r[i]) { free = Some(i); n += 1; } }
-        if n == 1 { free } else { None }
-    };
-    single(&|r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none() && q6(r.compliance) <= 0.0)
-        .or_else(|| single(&|r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none()))
+    let mut free = None;
+    let mut n = 0;
+    for i in 0..3 {
+        let r = &j.r[i];
+        if !(r.enabled && r.limit.is_none() && r.drive.is_none()) { free = Some(i); n += 1; }
+    }
+    if n == 1 { return free; }
+    let c = |i: usize| if j.r[i].enabled { fin(j.r[i].compliance).max(0.0) } else { 0.0 };
+    (0..3).find(|&i| j.r[i].enabled && c(i) > 0.0 && (0..3).all(|k| k == i || c(i) >= 100.0 * c(k)))
 }
 
 /// The angle a D6 joint's rotational row `i` measures, from the joint frames' world rotations

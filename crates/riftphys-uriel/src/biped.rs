@@ -386,6 +386,59 @@ mod tests {
         let zero = StandPd { kp: [0.0; 3], kd: [0.0; 3], k_com: 0.0, k_com_v: 0.0, k_torso: 0.0, k_torso_v: 0.0, ..Default::default() };
         println!("no control: {:?}", (0..5).map(|s| stand_time(&zero, &cfg, 100 + s, 10.0)).collect::<Vec<_>>());
     }
+
+    /// `stand_time` with each push applied one tick after it is drawn (`delay`) and scaled by
+    /// `scale`; the RNG draws are the same as `BipedEnv::step`'s.
+    fn stand_time_varied(ctl: &StandPd, cfg: &BipedConfig, seed: u64, seconds: f32, delay: bool, scale: f32) -> f32 {
+        let mut env = BipedEnv::new(cfg, seconds, 0, seed);
+        let mut pending: Option<Vec3> = None;
+        while !env.done() {
+            let push = if env.rng.unit() < env.cfg.push_rate {
+                let dir = Vec3::new(env.rng.range(-0.3, 0.3), 0.0, env.rng.range(-1.0, 1.0)).normalize_or_zero();
+                Some(dir * env.cfg.push_impulse * scale)
+            } else { None };
+            let now = if delay { std::mem::replace(&mut pending, push) } else { push };
+            if let Some(j) = now { env.world.apply_impulse(env.biped.torso, j); }
+            env.biped.tick(&mut env.world, |w, b| ctl.command(w, b));
+            env.tick += 1;
+            if env.biped.is_fallen(&env.world) { env.fallen = true; }
+        }
+        env.seconds()
+    }
+
+    /// PRECISION_SPEC P1: is the 20 N s push result a precision effect or a chaotic threshold?
+    /// The same 20 seeds with the push as drawn, one tick late, and scaled 0.99 and 1.01.
+    #[test]
+    #[ignore]
+    fn push_sensitivity_20() {
+        let cfg = BipedConfig { push_impulse: 20.0, ..Default::default() };
+        for (name, delay, scale) in [("as drawn", false, 1.0f32), ("one tick late", true, 1.0), ("x0.99", false, 0.99), ("x1.01", false, 1.01)] {
+            let ok = (0..20).filter(|s| stand_time_varied(&StandPd::default(), &cfg, 1000 + s, 10.0, delay, scale) >= 10.0).count();
+            println!("20 N s push {:>13}: {}/20 stood 10 s", name, ok);
+        }
+    }
+
+    /// PRECISION_SPEC P1 at rest: the biped standing still (no push, no lean) under StandPd for
+    /// 60 s after settling 2 s. Reports whether it fell and the pelvis's largest drift.
+    #[test]
+    #[ignore]
+    fn standing_still_drift() {
+        let cfg = BipedConfig { push_rate: 0.0, start_lean: 0.0, ..Default::default() };
+        let ctl = StandPd::default();
+        let mut rng = Rng::new(7);
+        let mut world = World::with_capacity(32, 32);
+        let mut b = Biped::build(&mut world, &cfg, &mut rng);
+        for _ in 0..2 * CONTROL_HZ { b.tick(&mut world, |w, b| ctl.command(w, b)); }
+        let p0 = world.get_body_pose(b.pelvis).pos;
+        let (mut worst, mut min_y) = (0.0f32, f32::MAX);
+        for _ in 0..60 * CONTROL_HZ {
+            b.tick(&mut world, |w, b| ctl.command(w, b));
+            let p = world.get_body_pose(b.pelvis).pos;
+            worst = worst.max((p - p0).length());
+            min_y = min_y.min(p.y);
+        }
+        println!("biped standing still 60 s: pelvis drift {:.3e} m, pelvis y {:.4} -> min {:.4}", worst, p0.y, min_y);
+    }
 }
 
 

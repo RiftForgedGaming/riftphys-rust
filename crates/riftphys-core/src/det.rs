@@ -12,6 +12,18 @@ pub fn q6(x: Scalar) -> Scalar {
     (x / Q6).round() * Q6
 }
 
+/// Sort key for a float: its value in whole 1e-6 units, so values that differ only by ulp noise
+/// tie, and the caller's next key (or a stable sort's original order) decides. Without it, a sort
+/// over values that are equal on paper (the corners of a box lying flat) is decided by rounding
+/// noise, which is deterministic but chaotic (PRECISION_SPEC P1). -inf sorts first; +inf and NaN
+/// last.
+#[inline]
+pub fn sort_key6(x: Scalar) -> i64 {
+    if x.is_nan() { return i64::MAX; }
+    let k = (x as f64 * 1.0e6).round();
+    if k >= i64::MAX as f64 { i64::MAX } else if k <= i64::MIN as f64 { i64::MIN } else { k as i64 }
+}
+
 #[inline]
 pub fn q6_vec3(v: Vec3) -> Vec3 {
     Vec3::new(q6(v.x), q6(v.y), q6(v.z))

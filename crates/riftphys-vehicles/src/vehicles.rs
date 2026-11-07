@@ -19,7 +19,20 @@ fn q6(x: f32) -> f32 {
     }
 }
 
+/// Per-step quantities (ground samples, forces, velocities, dt) are not rounded (PRECISION_SPEC
+/// P1); non-finite values become 0. Inputs and parameters still go through `q6`.
 #[inline]
+fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
+#[inline]
+fn fin_v(v: Vec3) -> Vec3 {
+    Vec3::new(fin(v.x), fin(v.y), fin(v.z))
+}
+
+#[inline]
+#[allow(dead_code)]
 fn q6v(v: Vec3) -> Vec3 {
     Vec3::new(q6(v.x), q6(v.y), q6(v.z))
 }
@@ -46,7 +59,7 @@ impl GroundSampler for HeightField {
         if n.length_squared() < 1.0e-12 {
             n = Vec3::Y;
         }
-        (q6(y), q6v(n))
+        (fin(y), fin_v(n))
     }
 }
 
@@ -83,7 +96,7 @@ impl<'a> GroundSampler for HeightFieldSampler<'a> {
         if n.length_squared() < 1.0e-12 {
             n = Vec3::Y;
         }
-        (q6(y), q6v(n))
+        (fin(y), fin_v(n))
     }
 }
 
@@ -161,7 +174,7 @@ impl VehicleInstance {
         V: FnMut(BodyId) -> Velocity,
         S: FnMut(BodyId, Velocity),
     {
-        let dt = q6(dt as f32) as Scalar;
+        let dt = fin(dt as f32) as Scalar;
         if dt <= 0.0 {
             return;
         }
@@ -211,13 +224,13 @@ impl VehicleInstance {
             let f_wheel = n_w * f_susp + fwd_w * f_long + lat_w * f_lat;
 
             // Quantize contribution before summing.
-            force_sum_w += GVec3::new(q6(f_wheel.x), q6(f_wheel.y), q6(f_wheel.z));
+            force_sum_w += GVec3::new(fin(f_wheel.x), fin(f_wheel.y), fin(f_wheel.z));
 
             // If not a drive wheel, kill longitudinal drive force (still allows suspension + lateral).
             if !is_drive {
                 // remove the drive portion we just added
                 let f_drive = fwd_w * f_long;
-                force_sum_w -= GVec3::new(q6(f_drive.x), q6(f_drive.y), q6(f_drive.z));
+                force_sum_w -= GVec3::new(fin(f_drive.x), fin(f_drive.y), fin(f_drive.z));
             }
         }
 
@@ -229,7 +242,7 @@ impl VehicleInstance {
         let a = force_sum_w / mass;
 
         // Integrate linear velocity (MVP). Quantize output.
-        v.lin = q6v(v.lin + v3a(a) * dt);
+        v.lin = fin_v(v.lin + v3a(a) * dt);
         set_vel(self.p.body, v);
     }
 
@@ -265,8 +278,8 @@ impl VehicleInstance {
         let cast_len = q6(wp.rest_len.max(0.0) + wp.radius.max(0.0));
 
         // Sample ground beneath wheel (vertical height query).
-        let wx = q6(p0_w.x);
-        let wz = q6(p0_w.z);
+        let wx = fin(p0_w.x);
+        let wz = fin(p0_w.z);
         let (ground_y, mut n_g) = ground.sample(wx, wz);
         n_g = n_g.normalize_or_zero();
         if n_g.length_squared() < 1.0e-12 {
@@ -275,7 +288,7 @@ impl VehicleInstance {
 
         // Bottom point at full extension (along suspension axis).
         let p_bottom = p0_w + dir_w * cast_len;
-        let y_bottom = q6(p_bottom.y);
+        let y_bottom = fin(p_bottom.y);
 
         // No contact if bottom is above ground.
         if y_bottom > ground_y {
@@ -283,14 +296,14 @@ impl VehicleInstance {
         }
 
         // Compression amount (scalar). Quantize.
-        let x = q6((ground_y - y_bottom).clamp(0.0, cast_len));
+        let x = fin((ground_y - y_bottom).clamp(0.0, cast_len));
 
         // Relative velocity along suspension axis (MVP: chassis linear only).
-        let v_rel = q6(vel_world.lin.dot(v3a(dir_w)));
+        let v_rel = fin(vel_world.lin.dot(v3a(dir_w)));
 
-        let f_spring = q6(wp.k_spring.max(0.0) * x);
-        let f_damp = q6(wp.k_damp.max(0.0) * v_rel);
-        let f_susp = q6(f_spring - f_damp); // along +dir_w
+        let f_spring = fin(wp.k_spring.max(0.0) * x);
+        let f_damp = fin(wp.k_damp.max(0.0) * v_rel);
+        let f_susp = fin(f_spring - f_damp); // along +dir_w
 
         // Tire frame (world): chassis axes with steering around up axis.
         let up_w = pose_world.transform_vector3(GVec3::Y).normalize_or_zero();
@@ -308,18 +321,18 @@ impl VehicleInstance {
 
         // Project chassis linear velocity into tire axes.
         let v = vel_world.lin;
-        let _v_long = q6(v.dot(fwd_w));
-        let v_lat = q6(v.dot(lat_w));
+        let _v_long = fin(v.dot(fwd_w));
+        let v_lat = fin(v.dot(lat_w));
 
         // Simple friction caps (normal load proxy = m*g).
-        let fmax_long = q6(wp.mu_long.max(0.0) * mass * g_mag);
-        let fmax_lat = q6(wp.mu_lat.max(0.0) * mass * g_mag);
+        let fmax_long = fin(wp.mu_long.max(0.0) * mass * g_mag);
+        let fmax_lat = fin(wp.mu_lat.max(0.0) * mass * g_mag);
 
         // Longitudinal: throttle * cap (drive map applied by caller).
-        let f_long = q6((throttle * fmax_long).clamp(-fmax_long, fmax_long));
+        let f_long = fin((throttle * fmax_long).clamp(-fmax_long, fmax_long));
 
         // Lateral: super-MVP cornering spring; oppose lateral velocity.
-        let f_lat = q6((-v_lat * mass).clamp(-fmax_lat, fmax_lat));
+        let f_lat = fin((-v_lat * mass).clamp(-fmax_lat, fmax_lat));
 
         (true, n_g, f_susp, f_long, f_lat)
     }

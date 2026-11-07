@@ -5,20 +5,22 @@ use glam::Vec3 as GVec3;
 
 const EPS_ANG2: f32 = 1.0e-24;
 
-/* ─────────────────────────  Quantization + sanitation  ───────────────────────── */
+/* ─────────────────────────  Sanitation  ───────────────────────── */
+// Body state is not rounded (PRECISION_SPEC P1): a 1e-6 grid lost every motion under half a grid
+// step per tick. Non-finite values still become 0 (or the identity rotation).
 
-#[inline] fn q6(x: f32) -> f32 { if !x.is_finite() { return 0.0; } (x * 1.0e6_f32).round() * 1.0e-6_f32 }
-#[inline] fn q6v(v: Vec3) -> Vec3 { Vec3::new(q6(v.x), q6(v.y), q6(v.z)) }
+#[inline] fn fin(x: f32) -> f32 { if x.is_finite() { x } else { 0.0 } }
+#[inline] fn fin_v(v: Vec3) -> Vec3 { Vec3::new(fin(v.x), fin(v.y), fin(v.z)) }
 #[inline] fn quat_canon(mut q: Quat) -> Quat { if q.w < 0.0 { q = -q; } q }
-#[inline] fn q6q(q: Quat) -> Quat {
-    let mut qq = Quat::from_xyzw(q6(q.x), q6(q.y), q6(q.z), q6(q.w));
+#[inline] fn fin_q(q: Quat) -> Quat {
+    if !q.is_finite() { return Quat::IDENTITY; }
+    let qq = q.normalize();
     if !qq.is_finite() { return Quat::IDENTITY; }
-    qq = qq.normalize();
     quat_canon(qq)
 }
-#[inline] fn safe_pos(v: Vec3) -> Vec3 { if v.is_finite() { q6v(v) } else { Vec3::ZERO } }
-#[inline] fn safe_vec(v: Vec3) -> Vec3 { if v.is_finite() { q6v(v) } else { Vec3::ZERO } }
-#[inline] fn safe_quat(q: Quat) -> Quat { if !q.is_finite() { Quat::IDENTITY } else { q6q(q) } }
+#[inline] fn safe_pos(v: Vec3) -> Vec3 { if v.is_finite() { v } else { Vec3::ZERO } }
+#[inline] fn safe_vec(v: Vec3) -> Vec3 { if v.is_finite() { v } else { Vec3::ZERO } }
+#[inline] fn safe_quat(q: Quat) -> Quat { fin_q(q) }
 
 /* ─────────────────────────  Bodies  ───────────────────────── */
 
@@ -70,7 +72,7 @@ impl Bodies {
         let i = self.idx(id);
         if self.inv_mass[i] <= 0.0 || !dtheta_world.is_finite() { return; }
 
-        let d = q6v(dtheta_world);
+        let d = fin_v(dtheta_world);
         let ang2 = d.length_squared();
         if ang2 <= EPS_ANG2 { return; }
 
@@ -83,7 +85,7 @@ impl Bodies {
             1.0,
         ).normalize();
 
-        self.rot[i] = q6q((dq * self.rot[i]).normalize());
+        self.rot[i] = fin_q((dq * self.rot[i]).normalize());
     }
 
     #[inline]
@@ -95,7 +97,7 @@ impl Bodies {
 
     pub fn add(&mut self, desc: BodyDesc) -> u32 {
         let is_dyn = desc.dynamic && desc.inv_mass.is_finite() && desc.inv_mass > 0.0;
-        let inv_m = if is_dyn { q6(desc.inv_mass) } else { 0.0 };
+        let inv_m = if is_dyn { fin(desc.inv_mass) } else { 0.0 };
 
         self.pos.push(safe_pos(desc.pose.pos));
         self.rot.push(safe_quat(desc.pose.rot));
@@ -127,7 +129,7 @@ impl Bodies {
 
     #[inline] pub fn set_pose(&mut self, id: u32, iso: Isometry) {
         let i = self.idx(id);
-        if iso.pos.is_finite() { self.pos[i] = q6v(iso.pos); }
+        if iso.pos.is_finite() { self.pos[i] = fin_v(iso.pos); }
         if iso.rot.is_finite() { self.rot[i] = safe_quat(iso.rot); }
     }
 
@@ -138,8 +140,8 @@ impl Bodies {
 
     #[inline] pub fn set_vel(&mut self, id: u32, v: Velocity) {
         let i = self.idx(id);
-        if v.lin.is_finite() { self.linvel[i] = q6v(v.lin); }
-        if v.ang.is_finite() { self.angvel[i] = q6v(v.ang); }
+        if v.lin.is_finite() { self.linvel[i] = fin_v(v.lin); }
+        if v.ang.is_finite() { self.angvel[i] = fin_v(v.ang); }
     }
 
     #[inline] pub fn inv_mass_of(&self, id: u32) -> Scalar { self.inv_mass[self.idx(id)] }
@@ -162,15 +164,15 @@ impl Bodies {
     // -------- Integration (Semi-Implicit) --------
 
     pub fn integrate_all(&mut self, gravity: Vec3, dt: Scalar) {
-        let dt_q = q6(dt);
+        let dt_q = fin(dt);
         if dt_q <= 0.0 { return; }
         let g = if gravity.is_finite() { gravity } else { Vec3::ZERO };
 
         for i in 0..self.len() {
             if !self.dynamic[i] || self.inv_mass[i] <= 0.0 { continue; }
 
-            self.linvel[i] = q6v(self.linvel[i] + g * dt_q);
-            self.pos[i] = q6v(self.pos[i] + self.linvel[i] * dt_q);
+            self.linvel[i] = fin_v(self.linvel[i] + g * dt_q);
+            self.pos[i] = fin_v(self.pos[i] + self.linvel[i] * dt_q);
             let w = self.angvel[i];
             self.rot[i] = Self::integrate_rot(self.rot[i], w, dt_q);
         }
@@ -183,7 +185,7 @@ impl Bodies {
         let qdot = Quat::from_xyzw(w_world.x, w_world.y, w_world.z, 0.0) * q;
         let s = 0.5 * dt;
         let qn = Quat::from_xyzw(q.x + qdot.x*s, q.y + qdot.y*s, q.z + qdot.z*s, q.w + qdot.w*s);
-        q6q(qn.normalize())
+        fin_q(qn.normalize())
     }
 
     // -------- Impulses / Corrections --------
@@ -191,20 +193,20 @@ impl Bodies {
     #[inline] pub fn apply_impulse(&mut self, id: u32, j: Vec3) {
         let i = self.idx(id);
         let im = self.inv_mass[i];
-        if im > 0.0 && j.is_finite() { self.linvel[i] = q6v(self.linvel[i] + j * im); }
+        if im > 0.0 && j.is_finite() { self.linvel[i] = fin_v(self.linvel[i] + j * im); }
     }
 
     #[inline] pub fn apply_angular_impulse(&mut self, id: u32, tau: Vec3) {
         let i = self.idx(id);
         if self.inv_mass[i] > 0.0 && tau.is_finite() {
             let dw = self.inv_inertia_world(id) * tau;
-            self.angvel[i] = q6v(self.angvel[i] + dw);
+            self.angvel[i] = fin_v(self.angvel[i] + dw);
         }
     }
 
     #[inline] pub fn apply_position_delta(&mut self, id: u32, dp: Vec3) {
         let i = self.idx(id);
-        if self.inv_mass[i] > 0.0 && dp.is_finite() { self.pos[i] = q6v(self.pos[i] + dp); }
+        if self.inv_mass[i] > 0.0 && dp.is_finite() { self.pos[i] = fin_v(self.pos[i] + dp); }
     }
 
     // Deactivation

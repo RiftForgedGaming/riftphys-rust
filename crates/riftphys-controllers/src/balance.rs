@@ -37,9 +37,12 @@ impl BalanceCtrl {
         if len > self.params.max_accel && len > 0.0 {
             a *= self.params.max_accel / len;
         }
+        // quantize 0 (or less, or non-finite) means off; dividing by it made NaN
         let q = self.params.quantize;
-        a.x = (a.x / q).round() * q;
-        a.y = (a.y / q).round() * q;
+        if q > 0.0 && q.is_finite() {
+            a.x = (a.x / q).round() * q;
+            a.y = (a.y / q).round() * q;
+        }
         a
     }
 }

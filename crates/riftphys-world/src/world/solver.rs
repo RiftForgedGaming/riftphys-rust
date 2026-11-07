@@ -83,7 +83,7 @@ struct FrictionPatch {
 fn patch_radius(pts: &[(f32, f32)]) -> f32 {
     if pts.len() < 2 { return 0.0; }
     let mut p: Vec<(f32, f32)> = pts.to_vec();
-    p.sort_by(|a, b| a.1.atan2(a.0).partial_cmp(&b.1.atan2(b.0)).unwrap_or(std::cmp::Ordering::Equal));
+    p.sort_by_key(|a| riftphys_core::det::sort_key6(a.1.atan2(a.0)));
     let (mut area, mut moment) = (0.0f32, 0.0f32);
     const N: usize = 6;
     for i in 0..p.len() {
@@ -400,6 +400,10 @@ impl World {
             joint_body_level[id_a as usize] = target + 1;
             joint_body_level[id_b as usize] = target + 1;
         }
+        self.last_max_batch = (
+            contact_batches.iter().map(Vec::len).max().unwrap_or(0),
+            joint_batches.iter().map(Vec::len).max().unwrap_or(0),
+        );
 
         // 3. The Global Parallel Solve
         let mut acc_jn = vec![0.0f32; constraints.len()];
@@ -544,7 +548,7 @@ impl World {
             if cs.b_is_terrain { f32::NEG_INFINITY } else { ha.min(self.bodies.pose(cs.bi).pos.dot(up)) }
         };
         let mut order: Vec<usize> = (0..constraints.len()).filter(|&i| !constraints[i].soft && (constraints[i].inv_a > 0.0 || constraints[i].inv_b > 0.0)).collect();
-        order.sort_by(|&x, &y| height(&constraints[x]).partial_cmp(&height(&constraints[y])).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y)));
+        order.sort_by_key(|&x| (riftphys_core::det::sort_key6(height(&constraints[x])), x));
         for &c_idx in &order {
             let mut cs = constraints[c_idx];
             if cs.inv_a > 0.0 && cs.inv_b > 0.0 {

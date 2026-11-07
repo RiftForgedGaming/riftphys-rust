@@ -66,12 +66,10 @@ fn torsional_spring_holds_its_static_sag() {
 /// the spring must act on the angle itself.
 #[test]
 fn torsional_spring_large_sag_is_in_radians() {
-    // Measured (kept awake): 0.0004% at 60 Hz, 0.87% at 240 Hz. On 2 sin(theta / 2) it was 3.3%
-    // and 4.1%. The 240 Hz offset is not the spring law: it doesn't change with the iteration
-    // count, the mode or an unrounded multiplier, and the rod freezes once its motion per step
-    // falls below the 1e-6 pose grid (JOINT_CONDITIONING_SPEC C6), so 240 Hz gets a looser gate
-    // until C6.
-    for (hz, gate) in [(60.0f32, 0.0025f32), (240.0, 0.015)] {
+    // On 2 sin(theta / 2) it was 3.3% at 60 Hz and 4.1% at 240 Hz. With the 1e-6 pose grid the
+    // 240 Hz rod froze 0.87% off once its motion per step fell below a grid step; without it
+    // (PRECISION_SPEC P1) it holds within 0.5%.
+    for (hz, gate) in [(60.0f32, 0.0025f32), (240.0, 0.005)] {
         let worst = torsion_spring(0.15, hz, 10.0);
         assert!(worst < gate, "{} Hz: sag departed {:.2}% from static", hz, worst * 100.0);
     }
@@ -155,11 +153,11 @@ fn sprung_hinge_past_90(align_c: f32, hinge_axis: Option<usize>, hz: f32) -> (f3
 
 #[test]
 fn sprung_hinge_stays_aligned_past_90_degrees() {
-    // (alignment-row compliance, hinge_axis): rigid rows, a compliance that rounds to zero on the
-    // solver's grid (both recognised from the rows), and soft rows (needs hinge_axis set)
-    for (align_c, axis) in [(0.0f32, None), (1.0e-9, None), (1.0e-3, Some(2usize))] {
+    // Alignment rows rigid, stiff (1e-9) and soft (1e-3), all with hinge_axis unset: the hinge is
+    // recognised from the rows, its spring's compliance being at least 100x theirs.
+    for align_c in [0.0f32, 1.0e-9, 1.0e-3] {
         for hz in [60.0f32, 240.0] {
-            let (tilt, gap) = sprung_hinge_past_90(align_c, axis, hz);
+            let (tilt, gap) = sprung_hinge_past_90(align_c, None, hz);
             assert!(tilt < 1.0 && gap < 0.001, "alignment c {:e}, {} Hz: hinge axis tilted {:.2} deg, joint apart {:.4} m", align_c, hz, tilt, gap);
         }
     }

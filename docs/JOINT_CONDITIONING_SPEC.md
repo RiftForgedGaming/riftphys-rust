@@ -359,6 +359,9 @@ Acceptance:
 
 ### C6. Precision of λ and compliance (R2)
 
+**Superseded by docs/PRECISION_SPEC.md (2026-11-07).** The grid on body state turned out to be the
+larger floor; that spec covers this item and more.
+
 Option A: keep λ and alpha off the 1e-6 grid.
 - They are internal to the step. Determinism needs identical operations, not a grid: f32 is
   bit-reproducible on one target as long as there's no fast-math or FMA contraction.

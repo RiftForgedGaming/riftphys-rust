@@ -197,6 +197,9 @@ pub struct World {
     pub players: Vec<PlayerController>,
 
     pub last_frame_contacts: Vec<Contact>,
+    /// Largest batch (contact level, joint level) the last solve ran; batches of `PAR_MIN` (64)
+    /// or more run in parallel. Lets tests prove they reach the parallel solver paths.
+    pub(super) last_max_batch: (usize, usize),
 
     pub(super) warm_cache: BTreeMap<(u32, u32), WarmImp>,
     pub(super) last_normal_impulse: Vec<f32>,
@@ -292,6 +295,7 @@ impl World {
             balances: Vec::new(),
             players: Vec::new(),
             last_frame_contacts: Vec::with_capacity(colliders * 4),
+            last_max_batch: (0, 0),
             warm_cache: BTreeMap::new(),
             last_normal_impulse: vec![0.0; bodies],
             prov_impulses_sum: 0.0,
@@ -623,6 +627,9 @@ impl World {
     /// How the position-level joint solve in `step` chooses its correction directions.
     pub fn set_joint_projection(&mut self, p: JointProjection) { self.joint_projection = p; }
     pub fn joint_projection(&self) -> JointProjection { self.joint_projection }
+
+    /// Largest (contact, joint) batch of the last step's solve: 64 or more ran in parallel.
+    pub fn last_max_batch(&self) -> (usize, usize) { self.last_max_batch }
 
     /// The joint solve inside `step`: SHAKE directions from the start-of-step poses `start`
     /// (indexed by body), or PBD.

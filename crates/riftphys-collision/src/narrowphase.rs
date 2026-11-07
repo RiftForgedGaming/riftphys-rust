@@ -1,5 +1,6 @@
 // File: crates/riftphys-collision/src/narrowphase.rs
 
+use riftphys_core::det::sort_key6;
 use riftphys_core::types::{Isometry, Vec3};
 use riftphys_geom::{Shape, Triangle};
 
@@ -28,28 +29,25 @@ impl ContactManifold {
     }
 }
 
+// Contact geometry is not rounded (PRECISION_SPEC P1); these guard against non-finite values,
+// which become 0 (or the fallback normal).
 #[inline]
-fn q6(x: f32) -> f32 {
-    if x.is_finite() {
-        (x * 1.0e6_f32).round() * 1.0e-6_f32
-    } else {
-        0.0
-    }
+fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 #[inline]
-fn q6_vec3(v: Vec3) -> Vec3 {
-    Vec3::new(q6(v.x), q6(v.y), q6(v.z))
+fn fin_v(v: Vec3) -> Vec3 {
+    Vec3::new(fin(v.x), fin(v.y), fin(v.z))
 }
 
 #[inline]
-fn q6_norm_vec3(v: Vec3, fallback: Vec3) -> Vec3 {
-    let qv = q6_vec3(v);
-    let len2 = qv.length_squared();
+fn norm_or(v: Vec3, fallback: Vec3) -> Vec3 {
+    let v = fin_v(v);
+    let len2 = v.length_squared();
 
     if len2 > 1.0e-12 {
-        let inv = 1.0 / len2.sqrt();
-        q6_vec3(qv * inv)
+        v * (1.0 / len2.sqrt())
     } else {
         fallback
     }
@@ -85,7 +83,7 @@ pub fn collide_shapes(
         return None;
     }
 
-    let contact_dist = q6(contact_dist.max(0.0));
+    let contact_dist = fin(contact_dist.max(0.0));
 
     match (shape_a, shape_b) {
         (Sphere { r: ra }, Sphere { r: rb }) => {
@@ -206,7 +204,7 @@ fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dis
     }
     let (overlap, axis, _) = best?;
     let n = if t.dot(axis) < 0.0 { -axis } else { axis };
-    let normal = q6_norm_vec3(n, Vec3::Y);
+    let normal = norm_or(n, Vec3::Y);
 
     let corners = |x: &Isometry, e: Vec3| -> [Vec3; 8] {
         let mut out = [Vec3::ZERO; 8];
@@ -245,14 +243,51 @@ fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dis
         // Edge-edge: one point between the two supports
         let sa = xa.pos + normal * ra_n;
         let sb = xb.pos - normal * rb_n;
-        manifold.push(ContactPoint { position: q6_vec3((sa + sb) * 0.5), normal, penetration: q6(overlap + contact_dist) });
+        manifold.push(ContactPoint { position: fin_v((sa + sb) * 0.5), normal, penetration: fin(overlap + contact_dist) });
         return Some(manifold);
     }
-    cands.sort_by(|p, q| q.0.partial_cmp(&p.0).unwrap_or(std::cmp::Ordering::Equal).then(p.1.x.partial_cmp(&q.1.x).unwrap_or(std::cmp::Ordering::Equal)));
-    for (depth, pos) in cands.into_iter().take(4) {
-        manifold.push(ContactPoint { position: q6_vec3(pos), normal, penetration: q6(depth + contact_dist) });
+    for k in reduce_to_4(&cands, normal) {
+        let (depth, pos) = cands[k];
+        manifold.push(ContactPoint { position: fin_v(pos), normal, penetration: fin(depth + contact_dist) });
     }
     Some(manifold)
+}
+
+/// Up to 4 of the candidate (depth, point) pairs that span the contact patch: the deepest, the
+/// one farthest from it, the one farthest from the line through those two, and the one farthest
+/// on the other side of that line. Keeping the 4 deepest instead put every point of a box lying
+/// flat on one edge (its 8 corner candidates tie on depth), which tipped stacks over.
+/// Comparisons use 1e-6 keys (`sort_key6`) with the lowest index winning ties, so ulp noise
+/// doesn't change the choice from step to step. Distances and areas are compared in m^2, so a
+/// patch under about 1 mm across ties at key 0 and keeps only 1 or 2 points.
+/// It selects from the candidates as given: corners inside the other box grown by the contact
+/// distance, with no face clipping (see PRECISION_SPEC 3.5, stack ticket).
+fn reduce_to_4(cands: &[(f32, Vec3)], n: Vec3) -> Vec<usize> {
+    if cands.len() <= 4 { return (0..cands.len()).collect(); }
+    let argmax = |f: &dyn Fn(usize) -> f32| -> (usize, f32) {
+        let mut best = (0usize, f32::NEG_INFINITY, i64::MIN);
+        for i in 0..cands.len() {
+            let v = f(i);
+            let k = sort_key6(v);
+            if k > best.2 { best = (i, v, k); }
+        }
+        (best.0, best.1)
+    };
+    let (i0, _) = argmax(&|i| cands[i].0);
+    let p0 = cands[i0].1;
+    let mut out = vec![i0];
+    let (i1, d1) = argmax(&|i| (cands[i].1 - p0).length_squared());
+    if !(d1 > 1.0e-12) { return out; }
+    out.push(i1);
+    let e = cands[i1].1 - p0;
+    let side = |i: usize| (cands[i].1 - p0).cross(e).dot(n);
+    let (i2, a2) = argmax(&|i| side(i).abs());
+    if !(a2 > 1.0e-12) { return out; }
+    out.push(i2);
+    let s2 = side(i2).signum();
+    let (i3, a3) = argmax(&|i| -side(i) * s2);
+    if a3 > 1.0e-12 { out.push(i3); }
+    out
 }
 
 /* ───────────────────────── Sphere / Capsule Logic ───────────────────────── */
@@ -319,14 +354,14 @@ fn collide_box_triangle(
     if !hit { return None; }
 
     let mut manifold = ContactManifold {
-        normal: q6_norm_vec3(-normal, -normal), // Normal points A -> B (Box -> Terrain)
+        normal: norm_or(-normal, -normal), // Normal points A -> B (Box -> Terrain)
         ..Default::default()
     };
 
     manifold.push(ContactPoint {
-        position: q6_vec3(deepest_pt),
+        position: fin_v(deepest_pt),
         normal: manifold.normal,
-        penetration: q6(max_pen),
+        penetration: fin(max_pen),
     });
 
     Some(manifold)
@@ -341,9 +376,9 @@ fn collide_sphere_sphere(
     let delta = center_b - center_a;
     let dist2 = delta.length_squared();
 
-    let ra = q6(ra.max(0.0));
-    let rb = q6(rb.max(0.0));
-    let allowed = q6(ra + rb + contact_dist);
+    let ra = fin(ra.max(0.0));
+    let rb = fin(rb.max(0.0));
+    let allowed = fin(ra + rb + contact_dist);
 
     if !dist2.is_finite() || dist2 > allowed * allowed {
         return None;
@@ -351,12 +386,12 @@ fn collide_sphere_sphere(
 
     let dist = dist2.sqrt();
     let raw_n = if dist > 1.0e-6 { delta / dist } else { Vec3::new(1.0, 0.0, 0.0) };
-    let normal = q6_norm_vec3(raw_n, Vec3::new(1.0, 0.0, 0.0));
+    let normal = norm_or(raw_n, Vec3::new(1.0, 0.0, 0.0));
 
-    let penetration = q6((allowed - dist).max(0.0));
+    let penetration = fin((allowed - dist).max(0.0));
     let pa = center_a + normal * ra;
     let pb = center_b - normal * rb;
-    let position = q6_vec3((pa + pb) * 0.5);
+    let position = fin_v((pa + pb) * 0.5);
 
     let mut manifold = ContactManifold { normal, ..Default::default() };
     manifold.push(ContactPoint { position, normal, penetration });
@@ -466,7 +501,7 @@ fn collide_box_sphere(
     sphere_r: f32,
     contact_dist: f32,
 ) -> Option<ContactManifold> {
-    let p_local = q6_vec3(box_xf.rot.conjugate() * (sphere_center - box_xf.pos));
+    let p_local = fin_v(box_xf.rot.conjugate() * (sphere_center - box_xf.pos));
     let mut closest_local = p_local.clamp(-box_extents, box_extents);
     let mut inside = false;
 
@@ -484,26 +519,26 @@ fn collide_box_sphere(
         }
     }
 
-    let closest_world = q6_vec3(box_xf.pos + box_xf.rot * closest_local);
+    let closest_world = fin_v(box_xf.pos + box_xf.rot * closest_local);
     let delta = sphere_center - closest_world;
     let dist2 = delta.length_squared();
     let dist = dist2.sqrt();
 
-    let r = q6(sphere_r.max(0.0));
-    let allowed = q6(r + contact_dist);
+    let r = fin(sphere_r.max(0.0));
+    let allowed = fin(r + contact_dist);
 
     if dist > allowed {
         return None;
     }
 
     let raw_n = if dist > 1.0e-6 { delta / dist } else { box_xf.rot * Vec3::Y };
-    let normal = q6_norm_vec3(raw_n, box_xf.rot * Vec3::Y);
-    let penetration = q6(allowed - dist);
+    let normal = norm_or(raw_n, box_xf.rot * Vec3::Y);
+    let penetration = fin(allowed - dist);
 
     let position = if inside {
-        q6_vec3(closest_world)
+        fin_v(closest_world)
     } else {
-        q6_vec3((closest_world + (sphere_center - normal * r)) * 0.5)
+        fin_v((closest_world + (sphere_center - normal * r)) * 0.5)
     };
 
     let mut manifold = ContactManifold { normal, ..Default::default() };
@@ -521,8 +556,8 @@ fn collide_box_capsule(
 ) -> Option<ContactManifold> {
     let (a_w, b_w) = capsule_segment_world(cap_xf, cap_hh);
     let inv_rot = box_xf.rot.conjugate();
-    let a_l = q6_vec3(inv_rot * (a_w - box_xf.pos));
-    let b_l = q6_vec3(inv_rot * (b_w - box_xf.pos));
+    let a_l = fin_v(inv_rot * (a_w - box_xf.pos));
+    let b_l = fin_v(inv_rot * (b_w - box_xf.pos));
 
     let (mid_l, _) = closest_point_segment(Vec3::ZERO, a_l, b_l);
 
@@ -603,8 +638,8 @@ fn collide_sphere_triangle(
     let delta = sphere_center - closest;
     let dist2 = delta.length_squared();
 
-    let r = q6(sphere_r.max(0.0));
-    let allowed = q6(r + contact_dist);
+    let r = fin(sphere_r.max(0.0));
+    let allowed = fin(r + contact_dist);
 
     if dist2 > allowed * allowed {
         return None;
@@ -615,10 +650,10 @@ fn collide_sphere_triangle(
     // Triangle normal (fallback if center is exactly on the triangle)
     let tri_n = (b - a).cross(c - a).normalize_or_zero();
     let raw_n = if dist > 1.0e-6 { delta / dist } else { tri_n };
-    let normal = q6_norm_vec3(raw_n, tri_n);
+    let normal = norm_or(raw_n, tri_n);
 
-    let penetration = q6(allowed - dist);
-    let position = q6_vec3(closest);
+    let penetration = fin(allowed - dist);
+    let position = fin_v(closest);
 
     let mut manifold = ContactManifold { normal, ..Default::default() };
     manifold.push(ContactPoint { position, normal, penetration });

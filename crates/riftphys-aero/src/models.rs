@@ -3,23 +3,23 @@ use riftphys_core::models::{AeroModel, AeroQuery};
 
 use crate::ISA;
 
+// Not rounded (PRECISION_SPEC P1); non-finite values become 0.
 #[inline]
-fn q6(x: f32) -> f32 {
-    if !x.is_finite() { return 0.0; }
-    (x * 1.0e6_f32).round() * 1.0e-6_f32
+fn fin(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
 }
 
 #[inline]
-fn q6v(v: Vec3) -> Vec3 {
-    Vec3::new(q6(v.x), q6(v.y), q6(v.z))
+fn fin_v(v: Vec3) -> Vec3 {
+    Vec3::new(fin(v.x), fin(v.y), fin(v.z))
 }
 
 #[inline]
-fn normalize_q6(v: Vec3) -> Vec3 {
-    let v = q6v(v);
+fn normalize_fin(v: Vec3) -> Vec3 {
+    let v = fin_v(v);
     let len2 = v.length_squared();
     if len2 > 1.0e-12 {
-        q6v(v * (1.0 / len2.sqrt()))
+        v * (1.0 / len2.sqrt())
     } else {
         Vec3::ZERO
     }
@@ -34,10 +34,10 @@ pub struct FlatPlateDrag {
 
 impl AeroModel for FlatPlateDrag {
     fn accel_contrib(&self, _ctx: &StepCtx, q: AeroQuery) -> [f32; 3] {
-        let mass = q6(q.mass);
+        let mass = fin(q.mass);
         if !(mass > 0.0) { return [0.0; 3]; }
 
-        let rho = q6(self.isa.density(q.altitude));
+        let rho = fin(self.isa.density(q.altitude));
         if rho <= 0.0 { return [0.0; 3]; }
 
         let v = Vec3::from_array(q.vel_world);
@@ -47,15 +47,15 @@ impl AeroModel for FlatPlateDrag {
         let speed = v2.sqrt();
         if speed <= 1.0e-6 { return [0.0; 3]; }
 
-        let vhat = normalize_q6(v / speed);
+        let vhat = normalize_fin(v / speed);
         if vhat == Vec3::ZERO { return [0.0; 3]; }
 
-        let cd = q6(self.cd).max(0.0);
-        let area = q6(self.area_m2).max(0.0);
+        let cd = fin(self.cd).max(0.0);
+        let area = fin(self.area_m2).max(0.0);
         if area <= 0.0 { return [0.0; 3]; }
 
-        let f_mag = q6(0.5 * rho * q6(speed * speed) * cd * area);
-        let a = q6v((-vhat) * q6(f_mag / mass));
+        let f_mag = fin(0.5 * rho * fin(speed * speed) * cd * area);
+        let a = fin_v((-vhat) * fin(f_mag / mass));
         [a.x, a.y, a.z]
     }
 }
@@ -73,10 +73,10 @@ pub struct SimpleWing {
 
 impl AeroModel for SimpleWing {
     fn accel_contrib(&self, _ctx: &StepCtx, q: AeroQuery) -> [f32; 3] {
-        let mass = q6(q.mass);
+        let mass = fin(q.mass);
         if !(mass > 0.0) { return [0.0; 3]; }
 
-        let rho = q6(self.isa.density(q.altitude));
+        let rho = fin(self.isa.density(q.altitude));
         if rho <= 0.0 { return [0.0; 3]; }
 
         let v = Vec3::from_array(q.vel_world);
@@ -86,44 +86,44 @@ impl AeroModel for SimpleWing {
         let speed = v2.sqrt();
         if speed <= 1.0e-6 { return [0.0; 3]; }
 
-        let vhat = normalize_q6(v / speed);
+        let vhat = normalize_fin(v / speed);
         if vhat == Vec3::ZERO { return [0.0; 3]; }
 
-        let stall = q6(self.stall_rad).abs().max(1.0e-6);
-        let alpha = q6(q.alpha_rad).clamp(-stall, stall);
+        let stall = fin(self.stall_rad).abs().max(1.0e-6);
+        let alpha = fin(q.alpha_rad).clamp(-stall, stall);
 
-        let cl_per = q6(self.cl_per_rad);
-        let cl = q6(cl_per * alpha);
+        let cl_per = fin(self.cl_per_rad);
+        let cl = fin(cl_per * alpha);
 
-        let cd0 = q6(self.cd0).max(0.0);
-        let k   = q6(self.k_induced).max(0.0);
-        let cd  = q6(cd0 + q6(k * cl * cl));
+        let cd0 = fin(self.cd0).max(0.0);
+        let k   = fin(self.k_induced).max(0.0);
+        let cd  = fin(cd0 + fin(k * cl * cl));
 
-        let area = q6(self.area_m2).max(0.0);
+        let area = fin(self.area_m2).max(0.0);
         if area <= 0.0 { return [0.0; 3]; }
 
         let ori: Quat = q.orientation;
 
         // Replaced mul_vec3a with standard multiplication
-        let lift_world_nominal = q6v(ori * self.lift_dir_body);
+        let lift_world_nominal = fin_v(ori * self.lift_dir_body);
 
-        let proj = q6(lift_world_nominal.dot(vhat));
-        let mut lift_dir = q6v(lift_world_nominal - vhat * proj);
+        let proj = fin(lift_world_nominal.dot(vhat));
+        let mut lift_dir = fin_v(lift_world_nominal - vhat * proj);
 
         let lift_len2 = lift_dir.length_squared();
         if !lift_len2.is_finite() || lift_len2 <= 1.0e-20 { return [0.0; 3]; }
 
-        lift_dir = normalize_q6(lift_dir);
+        lift_dir = normalize_fin(lift_dir);
         if lift_dir == Vec3::ZERO { return [0.0; 3]; }
 
-        let qdyn = q6(0.5 * rho * q6(speed * speed));
-        let l = q6(qdyn * cl * area);
-        let d = q6(qdyn * cd * area);
+        let qdyn = fin(0.5 * rho * fin(speed * speed));
+        let l = fin(qdyn * cl * area);
+        let d = fin(qdyn * cd * area);
 
-        let a_lift = q6v(lift_dir * q6(l / mass));
-        let a_drag = q6v((-vhat)   * q6(d / mass));
+        let a_lift = fin_v(lift_dir * fin(l / mass));
+        let a_drag = fin_v((-vhat)   * fin(d / mass));
 
-        let a = q6v(a_lift + a_drag);
+        let a = fin_v(a_lift + a_drag);
         [a.x, a.y, a.z]
     }
 }

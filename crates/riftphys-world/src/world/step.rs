@@ -174,7 +174,7 @@ impl World {
                 let v0 = self.last_lin_vel.get(i as usize).copied().unwrap_or(vel.lin);
                 pose.pos += (v0 - vel.lin) * (0.5 * dt);
             }
-            if vel.ang.length_squared() > 1e-9 {
+            if vel.ang.length_squared() > 0.0 {
                 // Torque-free rotation: world angular momentum L = I_world w is constant through
                 // the rotation, so w changes as the body turns (gyroscopic effect, intermediate-
                 // axis flips). Keeping w fixed instead loses L and energy.
@@ -374,7 +374,7 @@ impl World {
                 Some(b) => self.bodies.pose(pc.a).pos.dot(up).min(self.bodies.pose(b).pos.dot(up)),
                 None => f32::NEG_INFINITY,
             };
-            order.sort_by(|&x, &y| height(&pcs[x]).partial_cmp(&height(&pcs[y])).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y)));
+            order.sort_by_key(|&x| (riftphys_core::det::sort_key6(height(&pcs[x])), x));
         }
         for &k in &order {
             let pc = &pcs[k];
@@ -428,7 +428,8 @@ impl World {
 
         let mut culled = Vec::new();
         for (_, mut v) in buckets {
-            v.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap());
+            // Deepest first; ties within 1e-6 keep narrowphase order (stable sort).
+            v.sort_by_key(|c| std::cmp::Reverse(riftphys_core::det::sort_key6(c.depth)));
             v.truncate(4);
             culled.extend(v);
         }

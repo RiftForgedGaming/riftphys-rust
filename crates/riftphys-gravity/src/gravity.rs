@@ -48,6 +48,14 @@ fn q6(x: f32) -> f32 {
     }
 }
 
+/// The field's acceleration is not rounded (PRECISION_SPEC P1); non-finite components become 0.
+/// Its parameters still are (`q6`), as inputs, matching `spec_id`.
+#[inline]
+fn fin_v(a: Vec3) -> Vec3 {
+    let f = |x: f32| if x.is_finite() { x } else { 0.0 };
+    Vec3::new(f(a.x), f(a.y), f(a.z))
+}
+
 #[inline]
 fn q6_i64(x: f32) -> i64 {
     if x.is_finite() {
@@ -96,7 +104,7 @@ pub fn eval(spec: &GravitySpec, p: Vec3) -> Vec3 {
             let inv_r3 = 1.0 / (r2 * r2.sqrt());
             let a = -r * (mu * inv_r3);
 
-            Vec3::new(q6(a.x), q6(a.y), q6(a.z))
+            fin_v(a)
         }
 
         GravitySpec::LayeredPlanet { surface_g, radius, center, min_r } => {
@@ -120,7 +128,7 @@ pub fn eval(spec: &GravitySpec, p: Vec3) -> Vec3 {
             let g_mag = surface_g * (radius * radius) / (dist * dist);
             let a = -dir * g_mag;
 
-            Vec3::new(q6(a.x), q6(a.y), q6(a.z))
+            fin_v(a)
         }
 
         GravitySpec::MultiBody { bodies, min_r } => {
@@ -145,7 +153,7 @@ pub fn eval(spec: &GravitySpec, p: Vec3) -> Vec3 {
                 a += -r * (mu * inv_r3);
             }
 
-            Vec3::new(q6(a.x), q6(a.y), q6(a.z))
+            fin_v(a)
         }
     }
 }
