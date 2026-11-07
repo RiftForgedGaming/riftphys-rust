@@ -440,6 +440,7 @@ pub fn load_into_world(world: &mut World, rig: &PhysicsRig) -> Result<RigMap> {
                     fb,
                     t: [Default::default(), Default::default(), Default::default()],
                     r: [Default::default(), Default::default(), Default::default()],
+                    hinge_axis: None,
                 };
 
                 for i in 0..3 {

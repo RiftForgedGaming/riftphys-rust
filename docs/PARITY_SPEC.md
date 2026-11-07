@@ -201,6 +201,11 @@ which the paper itself names as the limit for Drake and MuJoCo.
 
 ### 3.5 W5: lever-arm conditioning (P5, only if shown)
 
+**Update 2026-11-07:** see JOINT_CONDITIONING_SPEC.
+- Most of this was a stale-measurement bug, fixed as its item C1.
+- Sprung hinges are fixed as C2.
+- The block solve below is now that spec's item C5, still only if needed.
+
 - **The problem:** small bodies on long lever arms converge badly in Gauss-Seidel
   (JOINT_ENERGY_SPEC 5.4).
 - **The fix:** solve each D6 joint's rows as a block, 3×3 linear and 3×3 angular coupled

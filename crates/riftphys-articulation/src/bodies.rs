@@ -84,6 +84,12 @@ pub struct Generic6Dof {
     pub fb: Isometry,
     pub t: [D6Axis; 3],
     pub r: [D6Axis; 3],
+    /// The hinge's rotational axis (0, 1, 2 = x, y, z of frame A), if this joint is a hinge:
+    /// set by `add_hinge`. Its row measures the twist angle in radians (for limits, drives and
+    /// springs), and the other two rows only keep it aligned, whatever their compliance. `None`
+    /// derives it from the rows (`d6_hinge_axis`). `set_d6_limit_r` / `set_d6_drive_r` on another
+    /// rotational axis clear it; edit `r` directly and you must keep it consistent yourself.
+    pub hinge_axis: Option<usize>,
 }
 
 /* ─────────────────────────  Joint union + container ─────────────────────────── */
@@ -153,21 +159,21 @@ impl Joints {
     }
 
     pub fn add_ball(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry) -> JointId {
-        let mut j = Generic6Dof { a, b, fa, fb, t: Default::default(), r: Default::default() };
+        let mut j = Generic6Dof { a, b, fa, fb, t: Default::default(), r: Default::default(), hinge_axis: None };
         for ax in 0..3 { j.t[ax].enabled = true; }
         for ax in 0..3 { j.r[ax].enabled = false; }
         self.add_d6(j)
     }
 
     pub fn add_hinge(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry, hinge_axis: usize) -> JointId {
-        let mut j = Generic6Dof { a, b, fa, fb, t: Default::default(), r: Default::default() };
+        let mut j = Generic6Dof { a, b, fa, fb, t: Default::default(), r: Default::default(), hinge_axis: Some(hinge_axis) };
         for ax in 0..3 { j.t[ax].enabled = true; }
         for ax in 0..3 { j.r[ax].enabled = ax != hinge_axis; }
         self.add_d6(j)
     }
 
     pub fn add_universal(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry, ax0: usize, ax1: usize) -> JointId {
-        let mut j = Generic6Dof { a, b, fa, fb, t: Default::default(), r: Default::default() };
+        let mut j = Generic6Dof { a, b, fa, fb, t: Default::default(), r: Default::default(), hinge_axis: None };
         for ax in 0..3 { j.t[ax].enabled = true; }
         for ax in 0..3 { j.r[ax].enabled = !(ax == ax0 || ax == ax1); }
         self.add_d6(j)
@@ -183,7 +189,7 @@ impl Joints {
     pub fn set_d6_drive_r(&mut self, id: JointId, axis: usize, d: Option<Drive>) {
         if let Some(JointKind::D6(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
             j.r[axis].drive = d;
-            if j.r[axis].drive.is_some() { j.r[axis].enabled = true; }
+            if j.r[axis].drive.is_some() { j.r[axis].enabled = true; leave_hinge(j, axis); }
         }
     }
 
@@ -197,7 +203,7 @@ impl Joints {
     pub fn set_d6_limit_r(&mut self, id: JointId, axis: usize, lim: Option<Limit>) {
         if let Some(JointKind::D6(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
             j.r[axis].limit = lim;
-            if j.r[axis].limit.is_some() { j.r[axis].enabled = true; }
+            if j.r[axis].limit.is_some() { j.r[axis].enabled = true; leave_hinge(j, axis); }
         }
     }
 
@@ -341,46 +347,43 @@ fn solve_d6(
     alpha_dt2: fn(Scalar, Scalar) -> Scalar,
     start: Option<(Isometry, Isometry)>,
 ) {
-    let pa = bodies.pose(j.a.0);
-    let pb = bodies.pose(j.b.0);
-
-    let ra: Quat = pa.rot * j.fa.rot;
-    let rb: Quat = pb.rot * j.fb.rot;
-
-    let xa = q6v(pa.pos + pa.rot * j.fa.pos);
-    let xb = q6v(pb.pos + pb.rot * j.fb.pos);
-
-    let ax = normalize_q6(ra * Vec3::X);
-    let ay = normalize_q6(ra * Vec3::Y);
-    let az = normalize_q6(ra * Vec3::Z);
-    let axes = [ax, ay, az];
-
+    let units = [Vec3::X, Vec3::Y, Vec3::Z];
     let wa = q6(bodies.inv_mass_of(j.a.0));
     let wb = q6(bodies.inv_mass_of(j.b.0));
 
     // Correction directions: the current iterate's (PBD), or the start of the step's (SHAKE).
-    // Errors are always measured at the current iterate.
-    let start = start.filter(|(sa, sb)| turned(sa.rot, pa.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb.rot) < SHAKE_MAX_TURN);
-    let (dir_axes, lever_a, lever_b, iaw, ibw): ([Vec3; 3], Vec3, Vec3, Mat3, Mat3) = match start {
-        Some((sa, sb)) => {
-            let ra0 = sa.rot * j.fa.rot;
-            ([normalize_q6(ra0 * Vec3::X), normalize_q6(ra0 * Vec3::Y), normalize_q6(ra0 * Vec3::Z)],
-             q6v(sa.rot * j.fa.pos), q6v(sb.rot * j.fb.pos),
-             inv_inertia_at(bodies, j.a.0, sa.rot), inv_inertia_at(bodies, j.b.0, sb.rot))
-        }
-        None => (axes, xa - pa.pos, xb - pb.pos, bodies.inv_inertia_world(j.a.0), bodies.inv_inertia_world(j.b.0)),
-    };
+    // The SHAKE fallback test (a body that turned too far this step uses PBD directions) runs
+    // once per call, on the poses the call starts from: simpler, and deterministic.
+    let (pa0, pb0) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
+    let start = start.filter(|(sa, sb)| turned(sa.rot, pa0.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb0.rot) < SHAKE_MAX_TURN);
+    let shake: Option<([Vec3; 3], Vec3, Vec3, Mat3, Mat3)> = start.map(|(sa, sb)| {
+        let ra0 = sa.rot * j.fa.rot;
+        ([normalize_q6(ra0 * Vec3::X), normalize_q6(ra0 * Vec3::Y), normalize_q6(ra0 * Vec3::Z)],
+         q6v(sa.rot * j.fa.pos), q6v(sb.rot * j.fb.pos),
+         inv_inertia_at(bodies, j.a.0, sa.rot), inv_inertia_at(bodies, j.b.0, sb.rot))
+    });
 
-    let d = q6v(xb - xa);
-
+    // Every row is measured afresh from the bodies' current poses (axes, anchor gap, angles,
+    // and in PBD mode its correction directions, lever arms and inertias), so it sees what the
+    // rows before it moved. Measured once per call instead, the rows of a joint with a lever arm
+    // overcorrected together: a Jacobi sweep with an eigenvalue at -1, which cycled between two
+    // wrong states with the joint pulled apart (a hinge drive to 57.3 deg alternated between
+    // 24 and 98 deg, the anchor 0.34 / 0.48 m off; JOINT_CONDITIONING_SPEC 2.1).
     for i in 0..3 {
-        let row = &mut j.t[i];
-        if !row.enabled { continue; }
+        if !j.t[i].enabled { continue; }
 
-        let u = axes[i];
+        let (pa, pb) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
+        let u = normalize_q6((pa.rot * j.fa.rot) * units[i]);
         if u == Vec3::ZERO { continue; }
-        let un = dir_axes[i];
+        let xa = q6v(pa.pos + pa.rot * j.fa.pos);
+        let xb = q6v(pb.pos + pb.rot * j.fb.pos);
+        let d = q6v(xb - xa);
+        let (un, lever_a, lever_b, iaw, ibw) = match &shake {
+            Some((ax0, la, lb, ia, ib)) => (ax0[i], *la, *lb, *ia, *ib),
+            None => (u, xa - pa.pos, xb - pb.pos, bodies.inv_inertia_world(j.a.0), bodies.inv_inertia_world(j.b.0)),
+        };
 
+        let row = &mut j.t[i];
         let coord = q6(d.dot(u));
         let mut target_pos = 0.0f32;
         let mut c_err: Option<f32> = Some(q6(coord - 0.0));
@@ -444,45 +447,38 @@ fn solve_d6(
         let _ = target_pos;
     }
 
-    let mut q_err = ra.conjugate() * rb;
-    if q_err.w < 0.0 { q_err = -q_err; }
-
-    // 'e_local' is generated in the local coordinate space of Anchor A
-    let e_local = q6v(2.0 * Vec3::new(q_err.x, q_err.y, q_err.z));
-
-    // Rotate the local error vector into world space to match 'axes'
-    let e_world = q6v(ra * e_local);
-
-    // With one rotational axis not rigidly locked (a hinge, limited or not), the other two rows
-    // only keep that axis aligned. Measure the misalignment as a_f x b_f, which does not depend
-    // on the twist about it. The quaternion error above mixes the twist into its other
-    // components (by half the twist angle), so past ~90 degrees of twist a locked row pushed
-    // the wrong way and a hinge diverged.
-    let rigid = |r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none();
+    // With a hinge (one rotational axis not rigidly locked: free, limited, driven or sprung),
+    // the other two rows only keep that axis aligned. They measure the misalignment as
+    // a_f x b_f, which does not depend on the twist about it; the quaternion error mixes the
+    // twist into its other components (by half the twist angle), so past ~90 degrees of twist
+    // a locked row pushed the wrong way and a hinge diverged. The hinge's own row measures its
+    // angle in radians (limits, drives and springs are given in radians; the small-angle
+    // measure 2 sin(angle / 2) put a 2.2 limit out of reach and -1.5 at -97 deg).
     let hinge = d6_hinge_axis(j);
-    let e_lock = match hinge {
-        Some(f) => {
-            let unit = [Vec3::X, Vec3::Y, Vec3::Z][f];
-            q6v(normalize_q6(ra * unit).cross(normalize_q6(rb * unit)))
-        }
-        None => e_world,
-    };
-    // A hinge's own angle, in radians (limits and position drives are given in radians; the
-    // small-angle measure 2 sin(angle / 2) put a 2.2 limit out of reach and -1.5 at -97 deg)
-    let hinge_angle = hinge.map(|f| { let v = Vec3::new(q_err.x, q_err.y, q_err.z); q6(2.0 * v[f].atan2(q_err.w)) });
 
     for i in 0..3 {
-        let row = &mut j.r[i];
-        if !row.enabled { continue; }
+        if !j.r[i].enabled { continue; }
 
-        let u = axes[i];
+        let (pa, pb) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
+        let ra: Quat = pa.rot * j.fa.rot;
+        let rb: Quat = pb.rot * j.fb.rot;
+        let u = normalize_q6(ra * units[i]);
         if u == Vec3::ZERO { continue; }
-        let un = dir_axes[i];
+        let mut q_err = ra.conjugate() * rb;
+        if q_err.w < 0.0 { q_err = -q_err; }
+        let v = Vec3::new(q_err.x, q_err.y, q_err.z);
+        let angle = match hinge {
+            Some(f) if f == i => q6(2.0 * v[f].atan2(q_err.w)),
+            Some(f) => q6(q6v(normalize_q6(ra * units[f]).cross(normalize_q6(rb * units[f]))).dot(u)),
+            // The error vector 2 q_err.xyz, from anchor A's frame into world space
+            None => q6(q6v(ra * q6v(2.0 * v)).dot(u)),
+        };
+        let (un, iaw, ibw) = match &shake {
+            Some((ax0, _, _, ia, ib)) => (ax0[i], *ia, *ib),
+            None => (u, bodies.inv_inertia_world(j.a.0), bodies.inv_inertia_world(j.b.0)),
+        };
 
-        // Both vectors are now correctly operating in world space
-        let angle = if rigid(row) { q6(e_lock.dot(u)) }
-                    else if hinge == Some(i) { hinge_angle.unwrap_or(0.0) }
-                    else { q6(e_world.dot(u)) };
+        let row = &mut j.r[i];
         let mut target_ang = 0.0f32;
         let mut c_err: Option<f32> = Some(q6(angle - 0.0));
 
@@ -535,14 +531,31 @@ fn solve_d6(
     }
 }
 
-/// The hinge axis of a D6 joint: the one rotational axis that is not rigidly locked (free,
-/// limited or driven), if exactly one is. `None` for ball, universal and fully locked joints.
+/// A limit or drive on a rotational row other than a stored hinge axis makes the joint
+/// something else (that row would otherwise be measured as the hinge's alignment, not its own
+/// angle): forget the stored axis and derive it from the rows again.
+fn leave_hinge(j: &mut Generic6Dof, axis: usize) {
+    if j.hinge_axis.map_or(false, |f| f != axis) { j.hinge_axis = None; }
+}
+
+/// The hinge axis of a D6 joint, if it has one: `hinge_axis` when set (`add_hinge` sets it).
+/// Otherwise it is derived from the rows. A rotational row is rigid when it is enabled with no
+/// limit, drive or compliance (compliance that rounds to zero on the solver's grid counts as
+/// none); the one axis that is not rigid is the hinge, a sprung hinge included, so its spring
+/// acts on the angle in radians. Failing that, compliant rows count as locked, so a hinge whose
+/// two alignment rows are soft is still a hinge about its free axis. A sprung hinge whose
+/// alignment rows are also compliant can't be told from a soft weld by its rows: set
+/// `hinge_axis`. `None` for ball, universal and fully locked joints.
 pub fn d6_hinge_axis(j: &Generic6Dof) -> Option<usize> {
-    let rigid = |r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none();
-    let mut free = None;
-    let mut n = 0;
-    for i in 0..3 { if !rigid(&j.r[i]) { free = Some(i); n += 1; } }
-    if n == 1 { free } else { None }
+    if let Some(f) = j.hinge_axis { return (f < 3).then_some(f); }
+    let single = |locked: &dyn Fn(&D6Axis) -> bool| {
+        let mut free = None;
+        let mut n = 0;
+        for i in 0..3 { if !locked(&j.r[i]) { free = Some(i); n += 1; } }
+        if n == 1 { free } else { None }
+    };
+    single(&|r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none() && q6(r.compliance) <= 0.0)
+        .or_else(|| single(&|r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none()))
 }
 
 /// The angle a D6 joint's rotational row `i` measures, from the joint frames' world rotations

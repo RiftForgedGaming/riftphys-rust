@@ -326,6 +326,10 @@ These are 1 m × 0.05 m rods (2.5 kg) hinged at their ends, as in robot and ragd
 
 ### 5.4 New findings, not fixed here
 
+- **Mostly fixed by JOINT_CONDITIONING_SPEC C1 (2026-11-07):**
+  - The energy gains and joint separations below were a stale-measurement bug: the rows of a
+    joint were solved against an error measured once per joint, not a conditioning problem.
+  - What remains is slow convergence for very small bobs (JOINT_CONDITIONING_SPEC C5).
 - **Small bodies on long lever arms converge badly in Gauss-Seidel, in both modes.** The
   examples are a 0.1 m bob on a 1–2 m arm, or the 2 m cube on a 5 m arm hitting a stop.
   - **Why:** the bob's own rotational inertia is hundreds of times smaller than its inertia about
