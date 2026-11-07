@@ -341,13 +341,12 @@ These are 1 m × 0.05 m rods (2.5 kg) hinged at their ends, as in robot and ragd
     - solve each joint's rows as one block, using the 6×6 (or 3×3 plus 3×3) effective mass, so
       a limit feels the inertia about the pivot;
     - or more velocity iterations for such joints.
-- **The hinge limit measure is not an angle.** Limits are compared with 2·sin(φ/2), not φ. The
-  velocity-level speculative bound therefore allows 1 / cos(φ/2) times the remaining approach
-  (2.3× at 128°). A limit set in radians also lands at the wrong angle (−1.8 is about −128°, not
-  −103°). This is a units fix, separate from energy.
-- **`D6Axis::lambda_acc` is never reset between steps.** For compliant rows (compliance > 0) the
-  XPBD multiplier keeps growing across steps. Rigid rows (compliance 0) are unaffected, because
-  alpha is 0.
+- **The hinge limit measure was not an angle (fixed, PARITY_SPEC W1).** Limits were compared with
+  2·sin(φ/2), not φ, so the velocity-level speculative bound allowed 1 / cos(φ/2) times the
+  remaining approach (2.3× at 128°), and a limit landed at the wrong angle (−1.8 sat at about
+  −128°, not −103°).
+- **`D6Axis::lambda_acc` was never reset between steps (fixed, PARITY_SPEC W2).** Compliant rows
+  grew stiffer every step. Rigid rows were unaffected, because alpha is 0.
 - **Precision floor (section 2.4) applies to both modes.** Far from the origin at high step rates,
   energy is erratic either way. At 240 Hz, 200 m up: PBD 113%, SHAKE 115%; at 1000 m: PBD 84%,
   SHAKE 111%. At 62.5 Hz, 1000 m up, SHAKE reads 105%; PBD's 10% loss hides the same error.

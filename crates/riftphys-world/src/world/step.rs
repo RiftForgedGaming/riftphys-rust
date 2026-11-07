@@ -217,9 +217,14 @@ impl World {
         let start_poses: Vec<Isometry> = if has_joints && self.joint_projection == JointProjection::Shake {
             (0..count).map(|i| if self.bodies.is_dynamic(i) && self.sleep.is_awake(i as usize) { original_poses[i as usize] } else { self.bodies.pose(i) }).collect()
         } else { Vec::new() };
+        if has_joints { self.joints.begin_step(); }
+        // Static and sleeping bodies: joints between two of them are not solved this step
+        let frozen: Vec<bool> = if has_joints {
+            (0..count).map(|i| !self.bodies.is_dynamic(i) || !self.sleep.is_awake(i as usize)).collect()
+        } else { Vec::new() };
         if has_joints || !pos_contacts.is_empty() {
             for _ in 0..self.solver_iters.1 {
-                if has_joints { self.solve_joints_in_step(dt, &start_poses); }
+                if has_joints { self.solve_joints_in_step(dt, &start_poses, &frozen); }
                 self.project_contacts(&pos_contacts, &mut split, false);
             }
             // Shock propagation, as in the velocity solve: bottom-up, lower body immovable

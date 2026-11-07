@@ -193,7 +193,8 @@ fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulati
                 None if row.drive.is_some() => {}
                 None => out.push(base),
                 Some(lim) => {
-                    let x = if angular { e_world.dot(u) } else { d.dot(u) };
+                    // Same measure as the position solve (radians on a hinge's own axis)
+                    let x = if angular { riftphys_articulation::bodies::d6_row_angle(j, rot_a, rot_b, i) } else { d.dot(u) };
                     // Approach the stop by at most what is left this step; never push out here
                     // (the position solve removes any violation)
                     out.push(JointRow { target: ((lim.min - x) / dt).min(0.0), lam_min: 0.0, ..base });
@@ -426,6 +427,9 @@ impl World {
                 run_batch(batch, |&j_idx| {
                     let bodies = unsafe { bodies_ptr.get_mut() };
                     if let riftphys_articulation::bodies::JointKind::Distance(j) = &joints_ref.kinds()[j_idx] {
+                        // Compliant (spring) joints act at position level only, like compliant D6
+                        // rows: a rigid velocity row here held them at their rest length.
+                        if j.compliance > 0.0 { return; }
                         let pa = bodies.pose(j.a.0).pos;
                         let pb = bodies.pose(j.b.0).pos;
                         let dir = pb - pa;

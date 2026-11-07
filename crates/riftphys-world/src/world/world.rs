@@ -626,17 +626,16 @@ impl World {
 
     /// The joint solve inside `step`: SHAKE directions from the start-of-step poses `start`
     /// (indexed by body), or PBD.
-    pub(super) fn solve_joints_in_step(&mut self, dt: f32, start: &[Isometry]) {
-        match self.joint_projection {
-            JointProjection::Shake => self.joints.solve_shake(&mut self.bodies, dt, 1, start),
-            JointProjection::Pbd => self.joints.solve(&mut self.bodies, dt, 1),
-        }
+    pub(super) fn solve_joints_in_step(&mut self, dt: f32, start: &[Isometry], frozen: &[bool]) {
+        let start = (self.joint_projection == JointProjection::Shake).then_some(start);
+        self.joints.solve_step(&mut self.bodies, dt, 1, start, frozen);
     }
 
     /// Position-level joint solve from the current poses (PBD directions; used outside `step`,
     /// e.g. to settle a pose).
     pub fn solve_joints(&mut self, dt: f32, iterations: u32) {
-        // 1. Standard XPBD Solve
+        // 1. Standard XPBD Solve (each call is one step: multipliers start from zero)
+        self.joints.begin_step();
         self.joints.solve(&mut self.bodies, dt, iterations);
 
         // The center-to-center "HARD PROJECTION" block has been completely removed.

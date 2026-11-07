@@ -190,8 +190,8 @@ fn hinge_limit_still_absorbs_energy() {
         let p = pin(&mut w, Vec3::new(0.0, 10.0, 0.0));
         let a = rod(&mut w, iso(Vec3::new(0.5, 10.0, 0.0)), Velocity::default());
         let j = w.add_hinge_joint(p, a.id, iso(Vec3::ZERO), iso(Vec3::new(-0.5, 0.0, 0.0)), 2);
-        // Released at 0; the free swing would reach -180 degrees. The stop sits past the bottom
-        // (hinge measure 2 sin(angle / 2) = -1.8, about -128 degrees).
+        // Released at 0; the free swing would reach -180 degrees. The stop sits past the bottom,
+        // at -1.8 rad (-103 degrees).
         w.set_d6_limit_r(j, 2, Some(D6Limit { min: -1.8, max: 0.1 }));
         let dt = 1.0 / hz;
         w.step(dt);

@@ -34,6 +34,8 @@ pub struct DistanceJoint {
     pub b: BodyId,
     pub rest: Scalar,
     pub compliance: Scalar,
+    /// XPBD multiplier accumulated over the current step's iterations (zeroed by `begin_step`)
+    pub lambda_acc: Scalar,
 }
 
 /* ─────────────────────────  D6 types ──────────── */
@@ -126,8 +128,23 @@ impl Joints {
             b,
             rest: q6(rest),
             compliance: q6(compliance).max(0.0),
+            lambda_acc: 0.0,
         }));
         JointId((self.kinds.len() as u32) - 1)
+    }
+
+    /// Starts a step's position solve: zeroes every XPBD multiplier. The multiplier belongs to
+    /// one step; carried over, a compliant row grew stiffer every step (a torsional spring sagged
+    /// 21x too little at 60 Hz).
+    pub fn begin_step(&mut self) {
+        for k in &mut self.kinds {
+            match k {
+                JointKind::Distance(j) => j.lambda_acc = 0.0,
+                JointKind::D6(j) => {
+                    for r in j.t.iter_mut().chain(j.r.iter_mut()) { r.lambda_acc = 0.0; }
+                }
+            }
+        }
     }
 
     pub fn add_d6(&mut self, j: Generic6Dof) -> JointId {
@@ -187,7 +204,7 @@ impl Joints {
     /// Position-level joint solve (PBD/XPBD): corrections along the constraint directions at the
     /// current iterate.
     pub fn solve(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32) {
-        self.solve_impl(bodies, dt, iterations, None);
+        self.solve_step(bodies, dt, iterations, None, &[]);
     }
 
     /// Position-level joint solve with SHAKE projection: the error is measured at the current
@@ -198,15 +215,22 @@ impl Joints {
     /// bleeding it at first order in dt (a hinged pendulum kept 90% of its swing energy per
     /// period at 62.5 Hz with `solve`). `start` is indexed by body id.
     pub fn solve_shake(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, start: &[Isometry]) {
-        self.solve_impl(bodies, dt, iterations, Some(start));
+        self.solve_step(bodies, dt, iterations, Some(start), &[]);
     }
 
-    fn solve_impl(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, start: Option<&[Isometry]>) {
+    /// The position solve inside a world step: SHAKE directions from `start` if given (else
+    /// PBD), and joints skipped when both bodies are `frozen` (static or asleep, indexed by body
+    /// id; missing entries count as not frozen). A sleeping body gets no gravity, so a compliant
+    /// row solved on it relaxed to zero sag while it slept.
+    pub fn solve_step(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, start: Option<&[Isometry]>, frozen: &[bool]) {
         if self.kinds.is_empty() { return; }
+        let is_frozen = |id: u32| frozen.get(id as usize).copied().unwrap_or(false);
 
         let dt = q6(dt);
         if !(dt > 0.0) { return; }
-        let dt2 = q6((dt * dt).max(1.0e-12));
+        // Not quantized: on the 1e-6 grid dt^2 itself was off by 2% at 240 Hz and 8% at 960 Hz
+        // (1.736e-5 -> 1.7e-5, 1.085e-6 -> 1e-6), and every compliance with it.
+        let dt2 = (dt * dt).max(1.0e-12);
 
         #[inline]
         fn alpha_dt2(c: Scalar, dt2: Scalar) -> Scalar {
@@ -216,6 +240,8 @@ impl Joints {
 
         for _ in 0..iterations.max(1) {
             for k in &mut self.kinds {
+                let (a, b) = match k { JointKind::Distance(j) => (j.a.0, j.b.0), JointKind::D6(j) => (j.a.0, j.b.0) };
+                if is_frozen(a) && is_frozen(b) { continue; }
                 match k {
                     JointKind::Distance(j) => {
                         let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
@@ -258,7 +284,7 @@ fn inv_inertia_at(bodies: &Bodies, id: u32, rot: Quat) -> Mat3 {
     r * bodies.inv_inertia_local_of(id) * r.transpose()
 }
 
-fn solve_distance_row(bodies: &mut Bodies, j: &DistanceJoint, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>) {
+fn solve_distance_row(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>) {
     let ia = j.a.0;
     let ib = j.b.0;
 
@@ -287,14 +313,19 @@ fn solve_distance_row(bodies: &mut Bodies, j: &DistanceJoint, dt: Scalar, dt2: S
     }
 
     let c_val = q6(len - q6(j.rest));
-    if c_val.abs() <= 1.0e-6 { return; }
 
     let alpha = if j.compliance <= 0.0 { 0.0 } else { q6(q6(j.compliance).max(0.0) / dt2) };
     let denom = q6(w_sum + alpha);
     if denom <= 0.0 { return; }
 
-    // The error grows along n_cur; a correction along n changes it at the rate n . n_cur
-    let lambda = q6(-c_val / (denom * n.dot(n_cur)));
+    // XPBD: the multiplier accumulates over the step's iterations, so a compliant joint settles
+    // at C = -alpha lambda (stretch = compliance x force) whatever the iteration count; without it
+    // the stiffness depended on the iteration count and compliance was nearly ignored. The error
+    // grows along n_cur; a correction along n changes it at the rate n . n_cur.
+    let lambda_old = q6(j.lambda_acc);
+    let lambda = q6(-(c_val + q6(alpha * lambda_old)) / (denom * n.dot(n_cur)));
+    if lambda.abs() <= 1.0e-9 { return; }
+    j.lambda_acc = q6(lambda_old + lambda);
 
     bodies.apply_position_delta(ia, q6v(-n * q6(lambda * wa)));
     bodies.apply_position_delta(ib, q6v( n * q6(lambda * wb)));
@@ -428,16 +459,17 @@ fn solve_d6(
     // components (by half the twist angle), so past ~90 degrees of twist a locked row pushed
     // the wrong way and a hinge diverged.
     let rigid = |r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none();
-    let mut free = None;
-    let mut n_free = 0;
-    for i in 0..3 { if !rigid(&j.r[i]) { free = Some(i); n_free += 1; } }
-    let e_lock = match (n_free, free) {
-        (1, Some(f)) => {
+    let hinge = d6_hinge_axis(j);
+    let e_lock = match hinge {
+        Some(f) => {
             let unit = [Vec3::X, Vec3::Y, Vec3::Z][f];
             q6v(normalize_q6(ra * unit).cross(normalize_q6(rb * unit)))
         }
-        _ => e_world,
+        None => e_world,
     };
+    // A hinge's own angle, in radians (limits and position drives are given in radians; the
+    // small-angle measure 2 sin(angle / 2) put a 2.2 limit out of reach and -1.5 at -97 deg)
+    let hinge_angle = hinge.map(|f| { let v = Vec3::new(q_err.x, q_err.y, q_err.z); q6(2.0 * v[f].atan2(q_err.w)) });
 
     for i in 0..3 {
         let row = &mut j.r[i];
@@ -448,7 +480,9 @@ fn solve_d6(
         let un = dir_axes[i];
 
         // Both vectors are now correctly operating in world space
-        let angle = q6(if rigid(row) { e_lock.dot(u) } else { e_world.dot(u) });
+        let angle = if rigid(row) { q6(e_lock.dot(u)) }
+                    else if hinge == Some(i) { hinge_angle.unwrap_or(0.0) }
+                    else { q6(e_world.dot(u)) };
         let mut target_ang = 0.0f32;
         let mut c_err: Option<f32> = Some(q6(angle - 0.0));
 
@@ -498,6 +532,32 @@ fn solve_d6(
         bodies.apply_orientation_delta(j.b.0, q6v( (ibw * un) * dl));
 
         let _ = target_ang;
+    }
+}
+
+/// The hinge axis of a D6 joint: the one rotational axis that is not rigidly locked (free,
+/// limited or driven), if exactly one is. `None` for ball, universal and fully locked joints.
+pub fn d6_hinge_axis(j: &Generic6Dof) -> Option<usize> {
+    let rigid = |r: &D6Axis| r.enabled && r.limit.is_none() && r.drive.is_none();
+    let mut free = None;
+    let mut n = 0;
+    for i in 0..3 { if !rigid(&j.r[i]) { free = Some(i); n += 1; } }
+    if n == 1 { free } else { None }
+}
+
+/// The angle a D6 joint's rotational row `i` measures, from the joint frames' world rotations
+/// `rot_a` (body A's rotation x frame A) and `rot_b`. On a hinge's own axis it is the twist
+/// angle in radians, wrapped to (-pi, pi], so limits and position drives mean what they say.
+/// Elsewhere it is the small-angle measure 2 sin(angle / 2) along the axis (ball and universal
+/// joints have no single twist; their limits stay approximate past small angles).
+pub fn d6_row_angle(j: &Generic6Dof, rot_a: Quat, rot_b: Quat, i: usize) -> f32 {
+    let mut q = rot_a.conjugate() * rot_b;
+    if q.w < 0.0 { q = -q; }
+    let v = Vec3::new(q.x, q.y, q.z);
+    if d6_hinge_axis(j) == Some(i) {
+        2.0 * v[i].atan2(q.w)
+    } else {
+        (rot_a * (v * 2.0)).dot(rot_a * [Vec3::X, Vec3::Y, Vec3::Z][i])
     }
 }
 
