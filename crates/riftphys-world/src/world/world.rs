@@ -185,6 +185,7 @@ pub struct CarriedState {
     last_lin_vel: Vec<Vec3>,
     awake: Vec<u8>,
     sleep_ticks: Vec<u16>,
+    rotor: BTreeMap<(u32, u8), f32>,
 }
 
 /* ---------------- World ---------------- */
@@ -238,6 +239,13 @@ pub struct World {
 
     /// Contact warm start (AT_REST_SPEC R1): last step's contacts per key, in contact order
     pub(super) warm: BTreeMap<WarmKey, Vec<WarmContact>>,
+    /// Armature rotors' velocities, per (joint, rotational axis), carried between steps
+    /// (PARITY_SPEC W4b). Physical state, not a cache: `clear_warm` leaves it.
+    pub(super) rotor: BTreeMap<(u32, u8), f32>,
+    /// Joints whose rotors `set_body_pose` restarted since the last step: a `set_body_vel` on
+    /// their bodies before the next step restarts them again, so pose-then-velocity resets
+    /// don't leave the rotor at the old speed. Cleared each step; not carried state.
+    pub(super) rotor_pending: std::collections::BTreeSet<u32>,
     pub(super) warm_patches: BTreeMap<WarmKey, WarmPatch>,
     /// D6 joint rows' impulses per joint index, for warm starting
     pub(super) warm_joints: BTreeMap<u32, Vec<WarmRow>>,
@@ -338,6 +346,8 @@ impl World {
             last_frame_contacts: Vec::with_capacity(colliders * 4),
             last_max_batch: (0, 0),
             warm: BTreeMap::new(),
+            rotor: BTreeMap::new(),
+            rotor_pending: std::collections::BTreeSet::new(),
             warm_patches: BTreeMap::new(),
             warm_joints: BTreeMap::new(),
             last_warm_matched: 0,
@@ -391,6 +401,12 @@ impl World {
         for c in &mut self.colliders {
             if c.body == id { c.aabb = aabb_of(&c.shape, &pose); }
         }
+        // Armature rotors on this body's joints restart from the links (PARITY_SPEC W4b)
+        let with_rotor: Vec<u32> = self.joints.kinds().iter().enumerate().filter_map(|(k, j)| match j {
+            JointKind::D6(d) if (d.a == id || d.b == id) && d.r.iter().any(|a| a.armature > 0.0) => Some(k as u32),
+            _ => None,
+        }).collect();
+        for k in with_rotor { self.rotor_init(k); self.rotor_pending.insert(k); }
     }
 
     pub fn yaw_body(&mut self, id: BodyId, dy: f32) {
@@ -526,6 +542,16 @@ impl World {
     pub fn set_body_vel(&mut self, id: BodyId, vel: Velocity) {
         self.bodies.set_vel(id.0, vel);
         if let Some(v) = self.last_lin_vel.get_mut(id.0 as usize) { *v = vel.lin; }
+        // A reset (pose, then velocity) restarts the rotors the pose restarted; other velocity
+        // writes keep them (PARITY_SPEC W4b)
+        if !self.rotor_pending.is_empty() {
+            let kinds = self.joints.kinds();
+            let again: Vec<u32> = self.rotor_pending.iter().copied().filter(|&k| match kinds.get(k as usize) {
+                Some(JointKind::D6(d)) => d.a == id || d.b == id,
+                _ => false,
+            }).collect();
+            for k in again { self.rotor_init(k); }
+        }
     }
 
     pub fn apply_impulse(&mut self, id: BodyId, impulse: Vec3) {
@@ -559,7 +585,12 @@ impl World {
 
     pub fn add_ball_joint(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry) -> JointId { self.joints.add_ball(a, b, fa, fb) }
     pub fn add_hinge_joint(&mut self, a: BodyId, b: BodyId, fa: Isometry, fb: Isometry, hinge_axis: usize) -> JointId { self.joints.add_hinge(a, b, fa, fb, hinge_axis) }
-    pub fn add_d6_joint(&mut self, j: D6Joint) -> JointId { self.joints.add_d6(j) }
+    pub fn add_d6_joint(&mut self, j: D6Joint) -> JointId {
+        let id = self.joints.add_d6(j);
+        // Armature set on the joint as built: start its rotors now, as set_d6_armature does
+        if j.r.iter().any(|a| a.armature > 0.0) { self.rotor_init(id.0); }
+        id
+    }
 
     pub fn integrate_forces(&mut self, dt: f32) {
         let count = self.bodies.len() as u32;
@@ -657,6 +688,39 @@ impl World {
             Some(JointKind::Distance(d)) => d.a.0 != b && d.b.0 != b,
             None => false,
         });
+        // A teleported or removed body's joints restart their rotors from the links (set_body_vel
+        // keeps them: hosts that write velocities every step would otherwise lose armature)
+        self.rotor.retain(|&(j, _), _| match kinds.get(j as usize) {
+            Some(JointKind::D6(d)) => d.a.0 != b && d.b.0 != b,
+            _ => false,
+        });
+    }
+
+    /// Sets a joint's armature rotors to its links' relative velocity now. Done when armature
+    /// is set, on `reset_d6_rotor` and on `set_body_pose`: started at the next step instead, the
+    /// rotor would take the links' speed after that step's host torques, and the first torque
+    /// would bypass the armature.
+    fn rotor_init(&mut self, j_idx: u32) {
+        self.rotor.retain(|&(j, _), _| j != j_idx);
+        let Some(JointKind::D6(d)) = self.joints.kinds().get(j_idx as usize).copied() else { return };
+        let (pa, va, vb) = (self.bodies.pose(d.a.0), self.bodies.vel(d.a.0), self.bodies.vel(d.b.0));
+        let rot_a = pa.rot * d.fa.rot;
+        for i in 0..3 {
+            if d.r[i].armature > 0.0 {
+                let u = rot_a * [Vec3::X, Vec3::Y, Vec3::Z][i];
+                self.rotor.insert((j_idx, i as u8), (vb.ang - va.ang).dot(u));
+            }
+        }
+    }
+
+    /// Restarts a joint's armature rotors from its links' relative velocity.
+    pub fn reset_d6_rotor(&mut self, id: JointId) { self.rotor_init(id.0); }
+
+    /// Armature (kg m^2) about rotational axis `axis` of a D6 joint (PARITY_SPEC W4b). Its rotor
+    /// starts at the links' current relative velocity.
+    pub fn set_d6_armature(&mut self, id: JointId, axis: usize, armature: f32) {
+        self.joints.set_d6_armature(id, axis, armature);
+        self.rotor_init(id.0);
     }
 
     /// Number of contacts in the warm-start cache (diagnostics and tests).
@@ -664,6 +728,37 @@ impl World {
 
     /// Contacts the last step's solve started warm (diagnostics and tests).
     pub fn warm_matched(&self) -> usize { self.last_warm_matched }
+
+    /// Hashes the carried state (AT_REST_SPEC D2): the warm-start entries, last velocities and
+    /// sleep state, in map order, each collection prefixed with its length. Part of `step_hash`.
+    pub(super) fn hash_carried(&self, h: &mut riftphys_core::StepHasher) {
+        use riftphys_core::hash::canon_f32_bits;
+        use riftphys_core::hash_vec3;
+        use std::sync::atomic::Ordering::Relaxed;
+        let key = |h: &mut riftphys_core::StepHasher, k: &WarmKey| { h.update_u32(k.0); h.update_u32(k.1); h.update_u32(k.2); h.update_u32(k.3); };
+        h.update_u64(self.warm.len() as u64);
+        for (k, v) in &self.warm {
+            key(h, k);
+            h.update_u32(v.len() as u32);
+            for c in v { hash_vec3(h, &c.la); h.update_f32_bits(canon_f32_bits(c.jn)); hash_vec3(h, &c.jt); }
+        }
+        h.update_u64(self.warm_patches.len() as u64);
+        for (k, p) in &self.warm_patches { key(h, k); hash_vec3(h, &p.jt); h.update_f32_bits(canon_f32_bits(p.tw)); }
+        h.update_u64(self.warm_joints.len() as u64);
+        for (j, rows) in &self.warm_joints {
+            h.update_u32(*j);
+            h.update_u32(rows.len() as u32);
+            for r in rows { h.update_u8(r.tag); h.update_f32_bits(canon_f32_bits(r.lam)); }
+        }
+        h.update_u64(self.rotor.len() as u64);
+        for (&(j, ax), w) in &self.rotor { h.update_u32(j); h.update_u8(ax); h.update_f32_bits(canon_f32_bits(*w)); }
+        h.update_u64(self.last_lin_vel.len() as u64);
+        for v in &self.last_lin_vel { hash_vec3(h, v); }
+        h.update_u64(self.sleep.awake.len() as u64);
+        for a in self.sleep.awake.iter() { h.update_u8(a.load(Relaxed)); }
+        h.update_u64(self.sleep.sleep_ticks.len() as u64);
+        for t in self.sleep.sleep_ticks.iter() { h.update_bytes(&t.load(Relaxed).to_le_bytes()); }
+    }
 
     /// The state a step carries besides body poses and velocities (see `CarriedState`).
     pub fn carried_state(&self) -> CarriedState {
@@ -675,6 +770,7 @@ impl World {
             last_lin_vel: self.last_lin_vel.clone(),
             awake: self.sleep.awake.iter().map(|a| a.load(Relaxed)).collect(),
             sleep_ticks: self.sleep.sleep_ticks.iter().map(|t| t.load(Relaxed)).collect(),
+            rotor: self.rotor.clone(),
         }
     }
 
@@ -685,6 +781,11 @@ impl World {
         self.warm = s.warm.clone();
         self.warm_patches = s.warm_patches.clone();
         self.warm_joints = s.warm_joints.clone();
+        self.rotor = s.rotor.clone();
+        // The restored rotors are authoritative: the restore's own set_body_pose calls marked
+        // them pending, and a set_body_vel before the next step would re-init them, which the
+        // original run (nothing pending) didn't do
+        self.rotor_pending.clear();
         for (i, v) in s.last_lin_vel.iter().enumerate() {
             if let Some(x) = self.last_lin_vel.get_mut(i) { *x = *v; }
         }
@@ -705,6 +806,10 @@ impl World {
             Some(JointKind::Distance(d)) => alive(d.a.0) && alive(d.b.0),
             None => false,
         });
+        self.rotor.retain(|&(j, _), _| match kinds.get(j as usize) {
+            Some(JointKind::D6(d)) => alive(d.a.0) && alive(d.b.0),
+            _ => false,
+        });
     }
     pub fn wake_all_bodies(&mut self) {
         for i in 0..self.bodies.len() { if self.bodies.is_dynamic(i as u32) { self.sleep.wake(i); } }
@@ -713,6 +818,9 @@ impl World {
     pub fn set_d6_drive_r(&mut self, id: JointId, axis: usize, drive: Option<D6Drive>) { self.joints.set_d6_drive_r(id, axis, drive); }
     pub fn set_d6_drive_t(&mut self, id: JointId, axis: usize, drive: Option<D6Drive>) { self.joints.set_d6_drive_t(id, axis, drive); }
     pub fn set_d6_limit_r(&mut self, id: JointId, axis: usize, limit: Option<D6Limit>) { self.joints.set_d6_limit_r(id, axis, limit); }
+    /// Viscous damping (N m s/rad or N s/m) and Coulomb friction (N m or N) on one axis of a D6
+    /// joint, rotational if `angular` (PARITY_SPEC W3a).
+    pub fn set_d6_damping(&mut self, id: JointId, angular: bool, axis: usize, damping: f32, friction: f32) { self.joints.set_d6_damping(id, angular, axis, damping, friction); }
 
     // --- XPBD CONSTRAINT SOLVER ---
     /// Use measured contact properties for a material pair (either order) instead of the table.

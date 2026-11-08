@@ -1,8 +1,10 @@
 # At rest: stacks that creep, feet that slide
 
-Status: proposed 2026-11-07, reviewed the same day (4 medium, 6 low findings, folded in). Built
-2026-11-07, uncommitted: R1 for contacts **and joint rows**, and D2's snapshot carry. R2 was built,
-measured and set aside: see section 2.4, which changes the diagnosis in 2.2. This covers the two
+Status: proposed 2026-11-07, reviewed the same day (4 medium, 6 low findings, folded in). R1 for
+contacts **and joint rows**, D2's snapshot carry and the `StandPd` retune are committed (d69f4e7).
+R2 was built, measured and set aside: see section 2.4, which changes the diagnosis in 2.2. Built
+overnight 2026-11-07 and committed 2026-11-08: R3 (box-box and box-triangle face clipping, revised from a
+measurement and reviewed) and D2's hash. D2 and D4 are decided (section 5). This covers the two
 tickets PRECISION_SPEC 3.5 left: stack creep in the contact solver, and the standing biped's drift.
 Both fail at HEAD with the grid on too; neither comes from P1.
 
@@ -365,19 +367,88 @@ Acceptance:
   - keep the clipped points within the contact distance below the reference face.
 - **Then run `reduce_to_4`** on the clipped points.
 - **The edge-edge case keeps its single point.**
+- **A face of A against a face of B: B takes the reference only when clearly shallower,** by 2%
+  and 1 mm (as Box2D). Parallel faces tie exactly (a yawed box on another), and a choice that
+  flips on ulp noise keeps a different 4 of the clipped points each step, so the warm start
+  never matches (the RiftPhys Reviewer's finding).
 - **Terrain contacts get the same reduction.**
   - `step.rs:431` keeps the 4 deepest points per (collider, terrain) bucket, ties broken in
     narrowphase order. That is the bias `reduce_to_4` removed for box-box.
-  - A box lying flat across several heightfield triangles may get all its points on one side.
-    Not yet measured.
-  - Run `reduce_to_4` on that bucket.
+  - Run `reduce_to_4` on that bucket, for box colliders. The side test uses the deepest point's
+    normal, lowest index on ties (a bucket mixes triangles' normals at a crease).
+  - The measurement below showed the bucket reduction alone isn't enough for a box on a
+    heightfield: box-triangle needs clipping too.
+- **Measured at d69f4e7 (2026-11-07, `tests/r3_diag.rs`):**
+
+  | Case | 60 Hz | 240 Hz |
+  |---|---|---|
+  | 3-stack, middle box yawed 3° | holds (6e-8 m over 59 s) | holds (8e-9 m) |
+  | 3-stack, middle box yawed 45° | topples at 1.7 s | topples at 2.1 s |
+  | Ledge, centre of mass 5 cm or 1 cm inside the edge | tips off | tips off |
+  | Ledge, centre of mass 1 cm or 5 cm past the edge | tips off | tips off |
+  | Box flat on a heightfield (0.25 m cells), 3 placements | thrown off within 0.12 s | within 0.22 s |
+
+  - **The ledge:** a box hanging 15 cm past the edge gets only its two corners inside the slab.
+    The slab's edge crosses the box's face, but no corner of either box is inside the other there,
+    so the box pivots on its inner edge and falls whatever its centre of mass does. The grow
+    doesn't reach (5 cm against 15 cm). Face clipping fixes this.
+  - **The heightfield: `collide_box_triangle` returns one point per triangle.** It is the closest
+    point on the triangle to the deepest box corner. For a triangle that is not under that corner,
+    the closest point is on the triangle's edge, possibly outside the box's footprint. The step's
+    query widens by a cell each way, so a flat box gets one point from each of up to about 30
+    triangles, all tied in depth; the 4 deepest, in narrowphase order, sit on one side.
+    Reducing that bucket alone can't fix this: the points are in the wrong places. So R3 also
+    clips box-triangle (below).
+- **Box-triangle clipping (added from the measurement):**
+  - the reference face is the triangle, with its own normal (terrain is one-sided; the heightfield
+    and the seam workpiece wind their triangles with the normal out of the solid);
+  - the incident face is the box's face most anti-parallel to that normal;
+  - clip it against the triangle's three side planes (perpendicular to the triangle through
+    each edge);
+  - keep the clipped points within the contact distance of the triangle's plane, and run
+    `reduce_to_4` on them;
+  - the point sits halfway between the clipped point and the plane, as for box-box;
+  - penetration keeps today's convention (contact distance minus the signed distance).
+  - A box beside a triangle, not over or under it, gets no points from that triangle. On a
+    heightfield the neighbouring triangle supplies them. A box striking a lone triangle's edge
+    from the side is missed; none of today's triangle environments has one (heightfields, and the
+    seam workpiece, which no box touches).
+  - Spheres and capsules on triangles are unchanged, and so are their buckets (the 4 deepest)
+    for now. The torch's capsule on the seam workpiece is one; extend the reduction to them once
+    F1 shows it changes nothing.
 
 Acceptance:
 - a 3-stack with its middle box yawed 3° and 45° holds 60 s at 60 and 240 Hz (with R1);
-- a box resting with its centre of mass 1 cm inside a ledge's edge stays; one 1 cm past it tips
-  off;
-- a box resting flat on a heightfield, across several triangles, holds 60 s (with R1);
-- the cube tosses and the rest of fidelity stay within their gates.
+- a box resting with its centre of mass 1 cm inside a ledge's edge holds 60 s; one 1 cm past it
+  tips off within 2 s, at 60 and 240 Hz;
+- a box resting flat on a heightfield, across several triangles, holds 60 s (with R1), at 0° and
+  30° yaw;
+- the cube tosses and the rest of fidelity stay within their gates; F1 seams are compared before
+  and after.
+
+**Results (built overnight 2026-11-07, committed 2026-11-08):**
+
+| Case | d69f4e7 | R3 |
+|---|---|---|
+| 3-stack, middle box yawed 3°, 60 / 240 Hz | holds | holds (1e-7 / 3e-9 m over 59 s) |
+| 3-stack, middle box yawed 45°, 60 Hz | topples at 1.7 s | holds (6.5e-8 m), every contact warm every step |
+| 3-stack, middle box yawed 45°, 240 Hz | topples at 2.1 s | holds (7e-9 m) |
+| Ledge, centre of mass 1 or 5 cm inside | tips off | holds exactly |
+| Ledge, centre of mass 1 or 5 cm past | tips off | tips off within 2 s |
+| Box flat on a heightfield, 0° / 30° yaw, 3 placements | thrown within 0.2 s | 0 m movement, 4 contacts |
+
+- Before the sticky reference face, the 45° stack at 60 Hz crept 1.9 mm: the reference flipped
+  between the boxes on ulp noise and its contacts started cold (50 cold steps with the plain
+  comparison restored).
+- **Regression** (single core, against d69f4e7):
+  - workspace: 150 pass, 0 fail;
+  - fidelity: unchanged (one -0.0000 is now 0.0000; sliding stop 1.0128 → 1.0129);
+  - F1 seams: identical, line and ring, every joint type;
+  - cube tosses: measured 26.0% → 25.8% position, fitted held-out 21.0% / 17.6° → 21.0% / 17.5°;
+  - biped `push_recovery_sweep`: identical at 0, 6, 12 and 30 N s; 20 N s 19/20 → 18/20 (HEAD
+    before R1: 17/20). Held out (seeds 2000–2039): 35/40, the same as before R3
+    (`push_recovery_20_holds`, gate 32, now prints its count). `standing_holds_still` passes. The feet are boxes on a box, so their contacts are clipped now.
+- Golden step hashes change (box contacts, and D2's hash).
 
 ### R4. Tests
 
@@ -386,22 +457,25 @@ Acceptance:
 - Gate the standing biped on R1's numbers in a non-ignored test. Built:
   `biped::tests::standing_holds_still` (pelvis under 1 mm, feet under 0.1 mm, over 60 s after a
   10 s settle).
-- Add a yawed stack and a ledge test (R3).
+- Add a yawed stack and a ledge test (R3). Built: `yawed_stacks_stand` (also asserts every
+  contact starts warm on every resting step), `box_on_a_ledge_stays_or_tips_by_its_centre_of_mass`
+  and `box_rests_flat_on_a_heightfield` in `at_rest_test.rs`.
 
 ## 4. Order
 
-1. **R1, contacts and joint rows, with D2's snapshot carry:** built (section 2.4), uncommitted.
+1. **R1, contacts and joint rows, with D2's snapshot carry:** built (section 2.4).
    - It lands alone; R2 is set aside.
    - D1 is settled: `StandPd` is retuned in the same change (section 5, D1), so push recovery is
      back above HEAD. argref's `biped_stand` uses `StandPd::default()` as its teacher, so name the
      retune to URIEL Orchestration with the commit.
-   - D4 (the 10-box gate) can be settled with it.
-2. **R3:** about 1 day. It's independent of R1, but its stacking acceptance needs R1.
+   - Committed as d69f4e7. D4 is settled (section 5).
+2. **R3:** built overnight 2026-11-07, committed 2026-11-08 (results in R3 above).
 3. **R4** with each.
 
 Golden step hashes change with R1 and R3. Each commit is named to URIEL Orchestration for the
 argref bump, and every spec and commit goes to the RiftPhys Reviewer. Heavy runs finish before
-11 PM EST.
+11 PM EST; after that, single-core only while URIEL's runs are going. argref stays pinned at
+2b98bb3 until parity (URIEL Orchestration, 2026-11-07), then bumps past every commit at once.
 
 ## 5. Decisions for the Designer
 
@@ -481,7 +555,12 @@ argref bump, and every spec and commit goes to the RiftPhys Reviewer. Heavy runs
       `carried_state_restores_exactly` (riftphys-world) does the same, and checks that a restore
       with only the cache cleared differs.
     - With the carried cache not restored, all three fail, the sleeping cases included.
-  - **Not built: the hash.** `step_hash` still covers body state only, pending this decision.
+  - **Decided 2026-11-07 (Designer): the hash covers the carried state.** Built:
+    `World::hash_carried`, called at the end of `step_hash`, hashes the warm contact, patch and
+    joint-row entries (map order, each collection length-prefixed, floats canonicalized),
+    `last_lin_vel`, and the sleep flags and counters. `carried_state_restores_exactly` asserts a
+    full restore hashes equal to the snapshot before any step, and a cold one differently.
+    Golden hashes change with it.
 - **D3: the frictionless stack at 60 Hz.**
   - With warm starting it still slides at 9 s; a frictionless stack is only neutrally stable.
   - Accept it, or raise the default velocity iterations for scenes like it?
@@ -492,3 +571,5 @@ argref bump, and every spec and commit goes to the RiftPhys Reviewer. Heavy runs
     4.3e-5 to 2.6e-4 m, past its gate. The shock pass's jn is also the heavy-on-light hazard that
     put the store before it.
   - Accept 1 mm, or store after the shock pass?
+  - **Decided 2026-11-07 (Designer): accept 0.4 mm, gated at 1 mm.** 0.1 mm stays a target for
+    later.

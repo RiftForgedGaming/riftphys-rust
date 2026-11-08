@@ -212,11 +212,15 @@ fn carried_state_restores_exactly() {
             w.apply_impulse(top, Vec3::new(0.3, 0.0, 0.0));
             (0..90).map(|_| { w.step(1.0 / 60.0); w.step_hash() }).collect()
         };
+        let h0 = w.step_hash();
         let first = run(&mut w);
         restore(&mut w, &snap, true);
+        assert_eq!(w.step_hash(), h0, "the hash after a full restore differs (settled {} steps)", settle);
         assert_eq!(first, run(&mut w), "restore with carried state diverged (settled {} steps)", settle);
-        // The carried state matters: a cold restore is a different run
+        // The carried state matters: a cold restore is a different run, and the step hash covers
+        // the carried state (AT_REST_SPEC D2), so it differs before any step
         restore(&mut w, &snap, false);
+        assert_ne!(w.step_hash(), h0, "a cold restore hashes like the full one (settled {} steps)", settle);
         assert_ne!(first, run(&mut w), "a cold restore matched: the test proves nothing (settled {} steps)", settle);
         restore(&mut w, &snap, true);
     }
@@ -236,4 +240,75 @@ fn teleport_drops_only_that_bodys_warm_entries() {
     // Setting a velocity keeps them
     w.set_body_vel(a[0], Velocity::default());
     assert_eq!(w.warm_contacts(), before - 4);
+}
+
+// ---- AT_REST_SPEC R3: face clipping (box-box and box-triangle) ----
+
+fn tilt_deg(q: Quat) -> f32 { (q * Vec3::Y).dot(Vec3::Y).clamp(-1.0, 1.0).acos().to_degrees() }
+
+#[test]
+fn yawed_stacks_stand() {
+    // The middle box of 3 yawed: at 45 degrees no corner of either box is inside the other, so
+    // the corner test gave one centre point and the stack toppled in about 2 s
+    for (deg, hz, gate) in [(3.0f32, 60.0f32, 1e-4f32), (3.0, 240.0, 1e-4), (45.0, 60.0, 1e-4), (45.0, 240.0, 1e-4)] {
+        let mut w = world();
+        let ids: Vec<BodyId> = (0..3).map(|i| {
+            let b = boxed(&mut w, Vec3::new(0.0, 0.1 + 0.21 * i as f32, 0.0), Vec3::new(0.2, 0.1, 0.2), 5.0, MaterialId::Wood, false);
+            if i == 1 { w.set_body_pose(b, Isometry { pos: w.get_body_pose(b).pos, rot: Quat::from_rotation_y(deg.to_radians()) }); }
+            b
+        }).collect();
+        // Every contact starts warm while the stack rests: a reference face that flipped between
+        // the two boxes would keep a different 4 of the clipped points and start them cold
+        let settle = hz as usize;
+        let mut cold = 0usize;
+        let worst = worst_move(&mut w, &ids, hz, 1.0, 60.0, |w, k| {
+            if k > settle && w.warm_matched() != w.last_frame_contacts.len() { cold += 1; }
+        });
+        assert!(worst < gate, "stack yawed {} deg at {} Hz: a box moved {:.3e} m in 60 s (gate {:.0e})", deg, hz, worst, gate);
+        assert_eq!(cold, 0, "stack yawed {} deg at {} Hz: {} steps had contacts start cold", deg, hz, cold);
+        for &b in &ids { assert!(tilt_deg(w.get_body_pose(b).rot) < 1.0, "stack yawed {} deg at {} Hz tilted", deg, hz); }
+    }
+}
+
+#[test]
+fn box_on_a_ledge_stays_or_tips_by_its_centre_of_mass() {
+    // A slab with its top at y = 0 and its edge at x = 0; a 0.4 m box hangs over the edge with
+    // its centre of mass 1 cm inside (holds 60 s) or 1 cm past (tips off within 2 s)
+    for hz in [60.0f32, 240.0] {
+        for (off, stays) in [(-0.01f32, true), (0.01, false)] {
+            let mut w = World::with_capacity(8, 8);
+            w.set_gravity(Vec3::new(0.0, -G, 0.0));
+            let g = w.add_body(Isometry { pos: Vec3::new(-5.0, -0.5, 0.0), rot: Quat::IDENTITY }, Velocity::default(), MassProps::infinite(), false);
+            w.add_collider(g, Shape::Box { hx: 5.0, hy: 0.5, hz: 5.0 }, material(MaterialId::Concrete));
+            let b = boxed(&mut w, Vec3::new(off, 0.1, 0.0), Vec3::new(0.2, 0.1, 0.2), 5.0, MaterialId::Wood, false);
+            let secs = if stays { 60.0 } else { 2.0 };
+            for _ in 0..(secs * hz) as usize { w.step(1.0 / hz); }
+            let p = w.get_body_pose(b);
+            if stays {
+                assert!((p.pos - Vec3::new(off, 0.1, 0.0)).length() < 1e-3 && tilt_deg(p.rot) < 0.5, "box 1 cm inside the edge at {} Hz moved to {:?}, tilt {:.1}", hz, p.pos, tilt_deg(p.rot));
+            } else {
+                assert!(p.pos.y < -0.2 && tilt_deg(p.rot) > 30.0, "box 1 cm past the edge at {} Hz hasn't tipped off in 2 s: y {:.3}, tilt {:.1}", hz, p.pos.y, tilt_deg(p.rot));
+            }
+        }
+    }
+}
+
+#[test]
+fn box_rests_flat_on_a_heightfield() {
+    // 0.25 m cells under a 0.4 m box: its base spans several triangles. One point per triangle,
+    // on the triangle's edge, threw it off within 0.2 s
+    use glam::{UVec2, Vec2};
+    use riftphys_terrain::terrain::HeightField;
+    for hz in [60.0f32, 240.0] {
+        for (deg, c) in [(0.0f32, 2.0f32), (0.0, 2.1), (30.0, 2.05)] {
+            let mut w = World::with_capacity(8, 8);
+            w.set_gravity(Vec3::new(0.0, -G, 0.0));
+            w.add_environment(Box::new(HeightField::from_heights(UVec2::new(20, 20), Vec2::new(0.25, 0.25), Vec2::ZERO, vec![0.0; 400], MaterialId::Concrete)));
+            let b = boxed(&mut w, Vec3::new(c, 0.1, c), Vec3::new(0.2, 0.1, 0.2), 5.0, MaterialId::Wood, false);
+            w.set_body_pose(b, Isometry { pos: Vec3::new(c, 0.1, c), rot: Quat::from_rotation_y(deg.to_radians()) });
+            let worst = worst_move(&mut w, &[b], hz, 1.0, 60.0, |_, _| {});
+            assert!(worst < 1e-4, "box yawed {} deg at x {} on a heightfield at {} Hz moved {:.3e} m", deg, c, hz, worst);
+            assert!((w.get_body_pose(b).pos.y - 0.1).abs() < 1e-3);
+        }
+    }
 }

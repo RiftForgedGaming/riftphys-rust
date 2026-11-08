@@ -62,6 +62,16 @@ pub struct D6Axis {
     pub drive: Option<Drive>,
     pub limit: Option<Limit>,
     pub lambda_acc: Scalar,
+    /// Viscous damping on this axis, N m s/rad (rotational) or N s/m (linear): a velocity row
+    /// whose impulse is -damping x relative velocity x dt, solved implicitly (stable for any
+    /// value). Works on free axes too. 0 = none. (PARITY_SPEC W3a)
+    pub damping: Scalar,
+    /// Coulomb friction on this axis, N m or N: a velocity row holding the relative velocity at
+    /// 0 with at most friction x dt of impulse per step. 0 = none. (PARITY_SPEC W3a)
+    pub friction: Scalar,
+    /// Armature, kg m^2 (rotational axes): a rotor geared rigidly to this axis (rotor inertia x
+    /// gear ratio^2), feeling no gravity or contact. 0 = none. (PARITY_SPEC W4b)
+    pub armature: Scalar,
 }
 
 impl Default for D6Axis {
@@ -72,6 +82,9 @@ impl Default for D6Axis {
             drive: None,
             limit: None,
             lambda_acc: 0.0,
+            damping: 0.0,
+            friction: 0.0,
+            armature: 0.0,
         }
     }
 }
@@ -197,6 +210,24 @@ impl Joints {
         if let Some(JointKind::D6(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
             j.t[axis].limit = lim;
             if j.t[axis].limit.is_some() { j.t[axis].enabled = true; }
+        }
+    }
+
+    /// Viscous damping and Coulomb friction on one axis of a D6 joint (rotational if `angular`).
+    /// Negative or non-finite values become 0. Neither changes which axes are constrained.
+    pub fn set_d6_damping(&mut self, id: JointId, angular: bool, axis: usize, damping: Scalar, friction: Scalar) {
+        if let Some(JointKind::D6(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
+            let a = if angular { &mut j.r[axis] } else { &mut j.t[axis] };
+            a.damping = fin(damping).max(0.0);
+            a.friction = fin(friction).max(0.0);
+        }
+    }
+
+    /// Armature (kg m^2) about rotational axis `axis` of a D6 joint. Negative or non-finite
+    /// values become 0.
+    pub fn set_d6_armature(&mut self, id: JointId, axis: usize, armature: Scalar) {
+        if let Some(JointKind::D6(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
+            j.r[axis].armature = fin(armature).max(0.0);
         }
     }
 

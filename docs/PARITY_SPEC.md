@@ -1,7 +1,8 @@
 # Real-world parity: definition and remaining work
 
 Status: proposed 2026-11-06. The definition in section 2 needs the Designer's sign-off. W1 and
-W2 are built (section 3.7); W3 to W6 are not started.
+W2 are built (section 3.7). W3a and W4b are built and committed 2026-11-08 (section 3.8). W3 and W4 wait on
+their data downloads (D5); W5 and W6 only if triggered.
 
 **Why.** The Designer's rule, relayed by URIEL Orchestration on 2026-11-06: URIEL physics
 training resumes only once RiftPhys matches real-world reference values. argref then bumps its
@@ -191,6 +192,49 @@ than 2 SE. Also report the energy decay rate per run against the measured one.
 - **Torques:** applied from the measured motor torques through the gear ratios. There's no
   controller, so the replay is open loop over 50 ms.
 
+**W4b design: axis-only armature** (drafted 2026-11-07 overnight, for review before building).
+- **The model:** a rotor geared rigidly to the joint, inertia J_a (rotor inertia × gear
+  ratio²) about the joint axis u, feeling no gravity or contact. Its velocity is the joint's
+  relative angular velocity along u.
+- **As a velocity row:** a soft row on u with gamma = 1 / J_a and target ω_rotor, the rotor's
+  velocity carried from the last step. It solves ω_rel + λ / J_a = ω_rotor, the rotor's momentum
+  balance: the links take λ and the rotor −λ, so J_a (ω_end − ω_rotor) = −λ.
+  - Under a torque τ across the joint (or gravity on the links), ω_rel changes by τ dt / (I + J_a)
+    per step, the reduced-coordinate answer. Derivation: the links' impulse gives
+    ω0 + k τ dt; the row gives λ = −k τ dt / (k + 1/J_a); so ω_end = ω0 + τ dt / (1/k + J_a).
+  - It uses the same soft-row machinery as W3a's damper (`gamma`), so it adds no new solver code.
+- **ω_rotor is state.** It goes in `CarriedState` and the step hash (AT_REST_SPEC D2).
+  - **Why it must be carried** (the RiftPhys Reviewer): `apply_torque` writes I⁻¹τ straight into
+    the velocity between steps. Read from ω_rel at the start of a step, the rotor would never see
+    a host torque (the biped's PD, Cassie's measured motor torques), and J_a would do nothing.
+  - **What is stored:** the rotor's own balance after the solve, ω_rotor − λ / J_a, using the
+    row's accumulated λ. It equals ω_rel when nothing runs after the iterations. The shock and
+    restitution passes apply contact impulses with no joint rows; storing ω_rel would hand
+    their change to the rotor with no impulse, creating or destroying ½ J_a ω² at an impact,
+    which is W4's window. Stored this way, the rotor changes only by impulses it received, and
+    the next step's row reconciles the two inelastically.
+  - The first step after a joint gets armature starts from its current ω_rel.
+  - `set_body_pose` and `remove_body` drop the entries of joints on that body. `set_body_vel`
+    keeps them: hosts that write velocities every step would otherwise turn armature off
+    silently. A velocity reset then exchanges momentum with the geared rotor in one inelastic
+    step, which is physical. `reset_d6_rotor(joint)` is the explicit reset.
+- **The position solve doesn't see J_a.** SHAKE projects the locked rows only, and the free
+  axis has none, so nothing there needs it.
+- **API:** `set_d6_armature(joint, axis, j_a)`, on rotational axes.
+- **The arm keeps its isotropic armature.** Switching it to the axis row changes F1's dynamics
+  and the teacher, so it's decision D6, not part of W4b.
+- **Zero values:** the row exists only for J_a > 0 (gamma = 1 / J_a); the setter rejects
+  negative and non-finite values, as W3a's does.
+- **Torques in the W4 replay:** `World::apply_torque` takes an angular impulse (N m s), not a
+  torque; measured motor torques need × dt.
+- **Tests:**
+  - a hinge with armature under a constant torque accelerates at τ / (I + J_a) within 1%, at
+    60 and 240 Hz, and also when the host writes the links' velocities every step;
+  - a pendulum's small-swing period is 2π √((I_pivot + J_a) / (m g d)) within 1%;
+  - energy, counting ½ J_a ω², is kept over a 10 s swing as well as without armature;
+  - a rollback across a step with armature replays hash for hash;
+  - across an impact on a jointed limb, the rotor's momentum change equals the row impulses.
+
 **Pass (P4):** RiftPhys's loss with fitted contact parameters is ≤ 38.0 (Drake) on the same
 22 jumps and metric. If per-jump losses can be reproduced, use the comparison rule against
 MuJoCo's 30.0 instead.
@@ -291,6 +335,65 @@ Ball and universal joints keep the small-angle measure.
   - **Not re-tuned.**
   - **Not run:** the M3 DAgger suite, which is a training run, not a quick check.
 
+### 3.8 Results: W3a and W4b (built overnight 2026-11-07, committed 2026-11-08)
+
+Both were reviewed by the RiftPhys Reviewer before the build, and their findings are folded in.
+Builds and tests ran single-core while URIEL's holonomy run was going.
+
+**W3a, joint damping and Coulomb friction** (`D6Axis::{damping, friction}`,
+`World::set_d6_damping(joint, angular, axis, c, tau_f)`), velocity rows on any axis, free ones
+included:
+- **Damper:** a soft row, v + γλ = 0 with γ = 1 / (c dt), so the impulse is −c dt v_end:
+  implicit, stable for any c. Its per-step factor is 1 / (1 + c dt / I), a rate of
+  ln(1 + c dt / I) / dt, which tends to c / I. A fitted c absorbs the difference; report
+  c dt / I with any comparison to a paper's identified c.
+- **Friction:** target 0, impulse within ±τ_f dt.
+- A row exists only for a coefficient above 0; the setter turns negative and non-finite values
+  into 0.
+- **Rigid rows are bit-identical:** they take the old code path (γ = 0 branches it out). A hinge
+  chain with a limit and a motor gives the same pose and velocity bits before and after, at 60 and
+  240 Hz (`tests/joint_bits_probe.rs`).
+- **Tests** (`joint_damping_test.rs`, 5):
+  - decay rate within 0.5% of the discrete closed form and 2% of c / I, at c/I = 0.5 and 2 /s,
+    60 and 240 Hz;
+  - a friction-only hinge stops at I ω0² / (2 τ_f) within 2% and stays stopped;
+  - friction only with c = 0, and NaN or negative coefficients, stay finite and inert;
+  - c dt / I = 1e4 is monotone and stable;
+  - damping plus a limit still stops at the limit.
+
+**W4b, axis-only armature** (`D6Axis::armature`, `World::set_d6_armature(joint, axis, J_a)`,
+`World::reset_d6_rotor`), as designed in 3.4:
+- The rotor's speed is carried state (`CarriedState`, the step hash), stored as its own balance,
+  ω_rotor − λ / J_a.
+- **Found in the build:** a rotor started at the next step took the links' speed after that
+  step's host torque, so the first torque bypassed the armature (1.7% at 60 Hz over 1 s). Rotors
+  are now set from the links' current speed when the armature is set (`set_d6_armature`, or
+  `add_d6_joint` with armature already on the joint), on `reset_d6_rotor`, and on
+  `set_body_pose`. `remove_body` drops them.
+- **Velocity writes keep the rotor, except in a reset** (the Reviewer's finding): pose then
+  velocity is the natural reset order, so `set_body_pose` marks its joints' rotors pending, a
+  `set_body_vel` on the same body before the next step restarts them again, and each step clears
+  the marks. A host writing velocities every step keeps its armature; `apply_torque` never
+  restarts a rotor. `restore_carried_state` clears the marks too: the restore's own
+  `set_body_pose` calls set them, and a host velocity write before the next step would otherwise
+  overwrite the restored rotor and diverge from the original run (the Reviewer's recheck; the
+  rollback test now writes a changed velocity before each step, and fails without the clear).
+- **Tests** (`joint_armature_test.rs`, 6):
+  - a torque accelerates the hinge at τ / (I + J_a) within 1%, at 60 and 240 Hz, also when the
+    host writes the links' velocity every step;
+  - a pendulum's small-swing period is 2π √((I_pivot + J_a) / (m g d)) within 1%, with and
+    without armature, at 60 and 240 Hz;
+  - energy, rotor included, is kept over 10 s at 0.5 rad as well as without armature;
+  - a restore replays hash for hash, and the rotor is in the hash;
+  - a bar spinning at 3 rad/s, reset with `set_body_pose` then `set_body_vel(0)`, stays at rest;
+  - a joint built with armature (`add_d6_joint`) counts the first torque.
+- **Not built:** the impact check (rotor momentum against row impulses across an impact). It
+  needs W4's Cassie model, so it goes with W4.
+- The arm keeps its isotropic armature (decision D6).
+
+**What's left for parity** needs data: W3 (double pendulum) and W4 (Cassie) wait on the
+downloads (D5), and the definition waits on the Designer's sign-off (D1–D4).
+
 ## 4. Order and reporting
 
 **Order:**
@@ -319,3 +422,10 @@ Ball and universal joints keep the small-angle measure.
   closest contact model, and MuJoCo's soft constraints are tuned differently.
 - **D5:** downloads: the double pendulum (encoder data and CAD) and the Cassie dataset. Each needs
   the user's go-ahead with its size, given when asked.
+- **D6:** the F1 arm's armature. Today it is added isotropically to each child link's inertia
+  (`arm.rs:230`). Once W4b exists, should the arm use the axis-only row (the physical model)?
+  That changes the arm's dynamics and the teacher's behaviour, so argref would re-record. Or
+  keep the arm as is. Note: position drives and compliant rows act at position level, after the
+  rotor is stored, so they feel J_a only through the next step's catch-up: a step late, with
+  some energy loss. The arm uses torques today, but a position-driven arm would see this.
+  Cassie's actuated joints are torque-driven, so W4 isn't affected.

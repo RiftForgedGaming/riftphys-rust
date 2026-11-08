@@ -163,10 +163,13 @@ pub fn collide_shapes(
 /* ───────────────────────── Box / Box ───────────────────────── */
 
 /// Box vs box: separating-axis test over the 15 candidate axes (3 face normals of each box and
-/// the 9 edge-edge cross products), then contact points from the vertices of either box that
-/// penetrate the other along the chosen normal, deepest 4 kept. Face axes win ties (within 5%)
-/// over edge axes so resting contacts stay stable. Normal points A -> B; `penetration` includes
-/// `contact_dist`, as for the other pairs.
+/// the 9 edge-edge cross products). On a face axis, the other box's most anti-parallel face is
+/// clipped against the reference face's side planes (Sutherland-Hodgman) and the clipped points
+/// within the contact distance are kept, 4 of them spanning the patch (`reduce_to_4`). Face
+/// axes win ties (within 5%) over edge axes so resting contacts stay stable; an edge axis gives
+/// one point between the two supports. Normal points A -> B; `penetration` includes
+/// `contact_dist`, as for the other pairs. (AT_REST_SPEC R3: the corner-inside test this replaces
+/// missed patches where neither box has a corner inside the other, e.g. a box over a ledge.)
 fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dist: f32) -> Option<ContactManifold> {
     let a_axes = [xa.rot * Vec3::X, xa.rot * Vec3::Y, xa.rot * Vec3::Z];
     let b_axes = [xb.rot * Vec3::X, xb.rot * Vec3::Y, xb.rot * Vec3::Z];
@@ -177,73 +180,72 @@ fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dis
         e[0] * axes[0].dot(l).abs() + e[1] * axes[1].dot(l).abs() + e[2] * axes[2].dot(l).abs()
     };
 
-    // (overlap, axis, is_face)
-    let mut best: Option<(f32, Vec3, bool)> = None;
-    let mut consider = |l: Vec3, is_face: bool| -> bool {
+    // (overlap, axis, which: 0..3 A's faces, 3..6 B's faces, 6 an edge pair)
+    let mut best: Option<(f32, Vec3, usize)> = None;
+    let mut consider = |l: Vec3, which: usize| -> bool {
         let len2 = l.length_squared();
         if len2 < 1.0e-10 { return true; } // parallel edges: no information
         let l = l / len2.sqrt();
         let overlap = radius(&a_axes, &ea_a, l) + radius(&b_axes, &eb_a, l) - t.dot(l).abs();
         if overlap < -contact_dist { return false; } // separated
+        let is_face = which < 6;
         let better = match best {
             None => true,
-            Some((o, _, face)) => {
-                if is_face == face { overlap < o } else if is_face { overlap < o * 1.05 + 1.0e-4 } else { overlap < o * 0.95 - 1.0e-4 }
+            Some((o, _, w)) => {
+                let face = w < 6;
+                if is_face && face && (which >= 3) != (w >= 3) {
+                    // A's face against B's: B takes the reference only when clearly shallower
+                    // (as Box2D, 2% and 1 mm). Parallel faces tie exactly (a yawed box on
+                    // another), and a choice flipping on ulp noise keeps a different 4 of the
+                    // clipped points each step, so the warm start never matches.
+                    overlap < o - (0.02 * o.abs() + 1.0e-3)
+                } else if is_face == face { overlap < o } else if is_face { overlap < o * 1.05 + 1.0e-4 } else { overlap < o * 0.95 - 1.0e-4 }
             }
         };
-        if better { best = Some((overlap, l, is_face)); }
+        if better { best = Some((overlap, l, which)); }
         true
     };
-    for ax in a_axes.iter().chain(b_axes.iter()) {
-        if !consider(*ax, true) { return None; }
+    for (k, ax) in a_axes.iter().chain(b_axes.iter()).enumerate() {
+        if !consider(*ax, k) { return None; }
     }
     for aa in a_axes.iter() {
         for bb in b_axes.iter() {
-            if !consider(aa.cross(*bb), false) { return None; }
+            if !consider(aa.cross(*bb), 6) { return None; }
         }
     }
-    let (overlap, axis, _) = best?;
+    let (overlap, axis, which) = best?;
     let n = if t.dot(axis) < 0.0 { -axis } else { axis };
     let normal = norm_or(n, Vec3::Y);
 
-    let corners = |x: &Isometry, e: Vec3| -> [Vec3; 8] {
-        let mut out = [Vec3::ZERO; 8];
-        for (i, c) in out.iter_mut().enumerate() {
-            let s = Vec3::new(if i & 1 == 0 { -1.0 } else { 1.0 }, if i & 2 == 0 { -1.0 } else { 1.0 }, if i & 4 == 0 { -1.0 } else { 1.0 });
-            *c = x.pos + x.rot * (s * e);
-        }
-        out
-    };
-    // Is `p` inside box (x, e) grown by `grow` on every axis?
-    let inside = |p: Vec3, x: &Isometry, e: Vec3, grow: f32| -> bool {
-        let l = x.rot.conjugate() * (p - x.pos);
-        l.x.abs() <= e.x + grow && l.y.abs() <= e.y + grow && l.z.abs() <= e.z + grow
-    };
-
-    let ra_n = radius(&a_axes, &ea_a, normal);
-    let rb_n = radius(&b_axes, &eb_a, normal);
-    let mut cands: Vec<(f32, Vec3)> = Vec::with_capacity(16);
-    // B's vertices pushed into A: depth below A's support plane along +n
-    for v in corners(xb, eb) {
-        let depth = ra_n - (v - xa.pos).dot(normal);
-        if depth > -contact_dist && inside(v, xa, ea, contact_dist + 1.0e-4) {
-            cands.push((depth, v + normal * (0.5 * depth)));
-        }
-    }
-    // A's vertices pushed into B: depth past B's support plane along -n
-    for w in corners(xa, ea) {
-        let depth = (w - xb.pos).dot(normal) + rb_n;
-        if depth > -contact_dist && inside(w, xb, eb, contact_dist + 1.0e-4) {
-            cands.push((depth, w - normal * (0.5 * depth)));
-        }
-    }
-
     let mut manifold = ContactManifold { normal, ..Default::default() };
-    if cands.is_empty() {
-        // Edge-edge: one point between the two supports
-        let sa = xa.pos + normal * ra_n;
-        let sb = xb.pos - normal * rb_n;
+    let edge_point = |manifold: &mut ContactManifold| {
+        let sa = xa.pos + normal * radius(&a_axes, &ea_a, normal);
+        let sb = xb.pos - normal * radius(&b_axes, &eb_a, normal);
         manifold.push(ContactPoint { position: fin_v((sa + sb) * 0.5), normal, penetration: fin(overlap + contact_dist) });
+    };
+    if which == 6 {
+        edge_point(&mut manifold);
+        return Some(manifold);
+    }
+
+    // Reference box and its outward face normal toward the other box; the incident box
+    let (rx, re, raxes, ix, ie, iaxes, k, nr) = if which < 3 {
+        (xa, ea_a, a_axes, xb, eb_a, b_axes, which, normal)
+    } else {
+        (xb, eb_a, b_axes, xa, ea_a, a_axes, which - 3, -normal)
+    };
+    let mut cands: Vec<(f32, Vec3)> = Vec::with_capacity(8);
+    if let Some(poly) = clip_incident_face(&rx.pos, &re, &raxes, k, nr, &ix.pos, &ie, &iaxes) {
+        let plane = rx.pos.dot(nr) + re[k];
+        for p in poly {
+            let depth = plane - p.dot(nr);
+            if depth > -contact_dist {
+                cands.push((depth, p + nr * (0.5 * depth)));
+            }
+        }
+    }
+    if cands.is_empty() {
+        edge_point(&mut manifold);
         return Some(manifold);
     }
     for k in reduce_to_4(&cands, normal) {
@@ -253,6 +255,51 @@ fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dis
     Some(manifold)
 }
 
+/// The incident box's face most anti-parallel to `nr` (the reference face's outward normal),
+/// clipped against the reference face's four side planes. `k` is the reference face's axis.
+#[allow(clippy::too_many_arguments)]
+fn clip_incident_face(rc: &Vec3, re: &[f32; 3], raxes: &[Vec3; 3], k: usize, nr: Vec3,
+                      ic: &Vec3, ie: &[f32; 3], iaxes: &[Vec3; 3]) -> Option<Vec<Vec3>> {
+    // Incident face: the axis most aligned with nr, on the side facing against it; lowest index
+    // wins ties
+    let mut f = 0usize;
+    let mut fd = f32::NEG_INFINITY;
+    for i in 0..3 {
+        let d = iaxes[i].dot(nr).abs();
+        if d > fd { fd = d; f = i; }
+    }
+    let s = if iaxes[f].dot(nr) > 0.0 { -1.0 } else { 1.0 };
+    let (u, v) = ((f + 1) % 3, (f + 2) % 3);
+    let c = *ic + iaxes[f] * (s * ie[f]);
+    let (du, dv) = (iaxes[u] * ie[u], iaxes[v] * ie[v]);
+    let mut poly = vec![c + du + dv, c - du + dv, c - du - dv, c + du - dv];
+    // Side planes of the reference face: |(p - rc) . axis_j| <= e_j for the two axes j != k
+    for j in [(k + 1) % 3, (k + 2) % 3] {
+        let a = raxes[j];
+        let mid = rc.dot(a);
+        poly = clip_poly(&poly, a, mid + re[j]);
+        if poly.is_empty() { return None; }
+        poly = clip_poly(&poly, -a, -(mid - re[j]));
+        if poly.is_empty() { return None; }
+    }
+    Some(poly)
+}
+
+/// Sutherland-Hodgman: keeps the part of `poly` with p . n <= d.
+fn clip_poly(poly: &[Vec3], n: Vec3, d: f32) -> Vec<Vec3> {
+    let mut out = Vec::with_capacity(poly.len() + 2);
+    for i in 0..poly.len() {
+        let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+        let (dp, dq) = (p.dot(n) - d, q.dot(n) - d);
+        if dp <= 0.0 { out.push(p); }
+        if (dp <= 0.0) != (dq <= 0.0) {
+            let t = dp / (dp - dq);
+            out.push(p + (q - p) * t);
+        }
+    }
+    out
+}
+
 /// Up to 4 of the candidate (depth, point) pairs that span the contact patch: the deepest, the
 /// one farthest from it, the one farthest from the line through those two, and the one farthest
 /// on the other side of that line. Keeping the 4 deepest instead put every point of a box lying
@@ -260,9 +307,9 @@ fn collide_box_box(xa: &Isometry, ea: Vec3, xb: &Isometry, eb: Vec3, contact_dis
 /// Comparisons use 1e-6 keys (`sort_key6`) with the lowest index winning ties, so ulp noise
 /// doesn't change the choice from step to step. Distances and areas are compared in m^2, so a
 /// patch under about 1 mm across ties at key 0 and keeps only 1 or 2 points.
-/// It selects from the candidates as given: corners inside the other box grown by the contact
-/// distance, with no face clipping (see PRECISION_SPEC 3.5, stack ticket).
-fn reduce_to_4(cands: &[(f32, Vec3)], n: Vec3) -> Vec<usize> {
+/// Box-box and box-triangle pass it their clipped face points; the world runs it on each
+/// collider's terrain contacts too (AT_REST_SPEC R3).
+pub fn reduce_to_4(cands: &[(f32, Vec3)], n: Vec3) -> Vec<usize> {
     if cands.len() <= 4 { return (0..cands.len()).collect(); }
     let argmax = |f: &dyn Fn(usize) -> f32| -> (usize, f32) {
         let mut best = (0usize, f32::NEG_INFINITY, i64::MIN);
@@ -290,7 +337,15 @@ fn reduce_to_4(cands: &[(f32, Vec3)], n: Vec3) -> Vec<usize> {
     out
 }
 
-/* ───────────────────────── Sphere / Capsule Logic ───────────────────────── */
+/* ───────────────────────── Box / Triangle ───────────────────────── */
+
+/// Box vs one-sided triangle (terrain): the triangle is the reference face, with its own normal.
+/// The box's face most anti-parallel to it is clipped against the triangle's three side planes,
+/// and the clipped points within `contact_dist` of the triangle's plane are kept, up to 4
+/// spanning the patch. A box beside the triangle, not over or under it, gets nothing from it; on
+/// a heightfield the neighbouring triangle supplies those points. Normal points box -> terrain.
+/// (AT_REST_SPEC R3: the closest point on the triangle to the deepest corner, one per triangle,
+/// put points outside the box's footprint and threw a box resting on a heightfield.)
 fn collide_box_triangle(
     box_xf: &Isometry,
     box_extents: Vec3,
@@ -298,74 +353,62 @@ fn collide_box_triangle(
     tri_xf: &Isometry,
     contact_dist: f32,
 ) -> Option<ContactManifold> {
-    // 1. Transform triangle to world space
     let ta = tri_xf.pos + tri_xf.rot * tri.a;
     let tb = tri_xf.pos + tri_xf.rot * tri.b;
     let tc = tri_xf.pos + tri_xf.rot * tri.c;
-    let normal = (tb - ta).cross(tc - ta).normalize_or_zero();
+    let raw = (tb - ta).cross(tc - ta);
+    if !(raw.length_squared() > 1.0e-12) || !finite_vec3(raw) { return None; }
+    let n = raw.normalize();
 
-    // 2. Sample the 8 corners of the box
-    let mut deepest_pt = Vec3::ZERO;
-    let mut max_pen = -f32::MAX;
-    let mut hit = false;
+    let axes = [box_xf.rot * Vec3::X, box_xf.rot * Vec3::Y, box_xf.rot * Vec3::Z];
+    let e = box_extents.to_array();
+    // The box's lowest point along n must be within contact_dist of the plane
+    let r = e[0] * axes[0].dot(n).abs() + e[1] * axes[1].dot(n).abs() + e[2] * axes[2].dot(n).abs();
+    let centre = (box_xf.pos - ta).dot(n);
+    if centre - r > contact_dist { return None; }
 
-    // Local corners of the box
-    for x in [-1.0, 1.0] {
-        for y in [-1.0, 1.0] {
-            for z in [-1.0, 1.0] {
-                let corner_l = Vec3::new(x, y, z) * box_extents;
-                let corner_w = box_xf.pos + box_xf.rot * corner_l;
+    // Incident face: most anti-parallel to n, lowest index on ties
+    let mut f = 0usize;
+    let mut fd = f32::NEG_INFINITY;
+    for i in 0..3 {
+        let d = axes[i].dot(n).abs();
+        if d > fd { fd = d; f = i; }
+    }
+    let sgn = if axes[f].dot(n) > 0.0 { -1.0 } else { 1.0 };
+    let (u, v) = ((f + 1) % 3, (f + 2) % 3);
+    let c = box_xf.pos + axes[f] * (sgn * e[f]);
+    let (du, dv) = (axes[u] * e[u], axes[v] * e[v]);
+    let mut poly = vec![c + du + dv, c - du + dv, c - du - dv, c + du - dv];
 
-                // Find closest point on triangle for this corner
-                let cp = closest_point_triangle(corner_w, ta, tb, tc);
-                let delta = corner_w - cp;
-                let dist = delta.dot(normal); // Distance along triangle normal
-
-                // If the corner is "behind" the triangle normal within contact distance
-                if dist <= contact_dist {
-                    let pen = contact_dist - dist;
-                    if pen > max_pen {
-                        max_pen = pen;
-                        deepest_pt = cp;
-                        hit = true;
-                    }
-                }
-            }
-        }
+    // Side planes: through each edge, perpendicular to the triangle, normal pointing out
+    for (p, q) in [(ta, tb), (tb, tc), (tc, ta)] {
+        let out = (q - p).cross(n);
+        if !(out.length_squared() > 1.0e-12) { return None; }
+        let out = out.normalize();
+        poly = clip_poly(&poly, out, p.dot(out));
+        if poly.is_empty() { return None; }
     }
 
-    // 3. Sample Triangle vertices against Box (Reverse check)
-    for tri_v in [ta, tb, tc] {
-        let p_local = box_xf.rot.conjugate() * (tri_v - box_xf.pos);
-        let closest_l = p_local.clamp(-box_extents, box_extents);
-        let closest_w = box_xf.pos + box_xf.rot * closest_l;
-        let dist = (tri_v - closest_w).length();
-
+    let mut cands: Vec<(f32, Vec3)> = Vec::with_capacity(8);
+    for x in poly {
+        let dist = (x - ta).dot(n);
         if dist <= contact_dist {
-            let pen = contact_dist - dist;
-            if pen > max_pen {
-                max_pen = pen;
-                deepest_pt = closest_w;
-                hit = true;
-            }
+            // Halfway between the box's point and the plane, as for box-box
+            cands.push((-dist, x - n * (0.5 * dist)));
         }
     }
+    if cands.is_empty() { return None; }
 
-    if !hit { return None; }
-
-    let mut manifold = ContactManifold {
-        normal: norm_or(-normal, -normal), // Normal points A -> B (Box -> Terrain)
-        ..Default::default()
-    };
-
-    manifold.push(ContactPoint {
-        position: fin_v(deepest_pt),
-        normal: manifold.normal,
-        penetration: fin(max_pen),
-    });
-
+    let normal = -n; // box -> terrain
+    let mut manifold = ContactManifold { normal, ..Default::default() };
+    for k in reduce_to_4(&cands, normal) {
+        let (depth, pos) = cands[k];
+        manifold.push(ContactPoint { position: fin_v(pos), normal, penetration: fin(contact_dist + depth) });
+    }
     Some(manifold)
 }
+
+/* ───────────────────────── Sphere / Capsule Logic ───────────────────────── */
 fn collide_sphere_sphere(
     center_a: Vec3,
     ra: f32,

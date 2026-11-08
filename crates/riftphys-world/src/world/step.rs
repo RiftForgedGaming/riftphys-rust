@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use super::world::{Collider, Contact, JointProjection, World, CCD_MAX_MARGIN, TERRAIN_CI};
 use riftphys_core::{StepStage, StepStats, Scalar, Quat, Isometry, Vec3, BodyId};
 use riftphys_geom::{aabb_of, Shape, Aabb};
-use riftphys_collision::narrowphase::collide_shapes;
+use riftphys_collision::narrowphase::{collide_shapes, reduce_to_4};
 use riftphys_gravity::eval as grav_eval;
 use riftphys_viz::viz::LedgerEvent;
 
@@ -32,6 +32,7 @@ struct PosContact {
 impl World {
     pub fn step(&mut self, dt: Scalar) -> StepStats {
         self.schedule.clear();
+        self.rotor_pending.clear();
         self.tick = self.tick.wrapping_add(1);
         self.ledger.clear();
         self.reset_provenance();
@@ -428,10 +429,27 @@ impl World {
 
         let mut culled = Vec::new();
         for (_, mut v) in buckets {
-            // Deepest first; ties within 1e-6 keep narrowphase order (stable sort).
-            v.sort_by_key(|c| std::cmp::Reverse(riftphys_core::det::sort_key6(c.depth)));
-            v.truncate(4);
-            culled.extend(v);
+            // One manifold per collider pair has at most 4 points; a collider on terrain gets a
+            // manifold per triangle.
+            if v.len() <= 4 { culled.extend(v); continue; }
+            if matches!(self.colliders[v[0].a_collider].shape, Shape::Box { .. }) {
+                // A box keeps 4 that span its patch, as box-box does (AT_REST_SPEC R3): the 4
+                // deepest put every point of a flat box on one side (narrowphase order broke
+                // the depth ties). The side test uses the deepest point's normal (lowest index
+                // on ties, as `reduce_to_4` picks its first point).
+                let cands: Vec<(f32, Vec3)> = v.iter().map(|c| (c.depth, c.point)).collect();
+                let mut deep = 0usize;
+                for i in 1..v.len() {
+                    if riftphys_core::det::sort_key6(v[i].depth) > riftphys_core::det::sort_key6(v[deep].depth) { deep = i; }
+                }
+                for k in reduce_to_4(&cands, v[deep].normal) { culled.push(v[k]); }
+            } else {
+                // Spheres and capsules: deepest first; ties within 1e-6 keep narrowphase order
+                // (stable sort). R3 leaves these until F1's seams show the reduction is safe.
+                v.sort_by_key(|c| std::cmp::Reverse(riftphys_core::det::sort_key6(c.depth)));
+                v.truncate(4);
+                culled.extend(v);
+            }
         }
 
         for c in &mut culled {

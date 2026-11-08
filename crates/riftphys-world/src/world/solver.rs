@@ -122,7 +122,8 @@ fn patch_radius(pts: &[(f32, f32)]) -> f32 {
 /// along `u` (lever arms `ra`, `rb`); angular rows the relative angular velocity along `u`.
 /// The row keeps the relative velocity inside [vmin, vmax] with its accumulated impulse in
 /// [lam_min, lam_max]: equality rows (locked axes) are [0, 0] / unbounded, a lower limit is
-/// [speculative bound, inf) / [0, inf), an upper limit the mirror image.
+/// [speculative bound, inf) / [0, inf), an upper limit the mirror image. A soft row (`gamma` > 0,
+/// a damper) solves v + gamma lam = target instead of v = target; rigid rows have gamma 0.
 #[derive(Clone, Copy)]
 struct JointRow {
     a: u32, b: u32,
@@ -130,11 +131,15 @@ struct JointRow {
     u: Vec3, ra: Vec3, rb: Vec3,
     /// Inverse masses and world inverse inertias (zero for static bodies)
     wa: f32, wb: f32, ia: Mat3, ib: Mat3,
+    /// 1 / (k + gamma), k the row's inverse effective mass
     m_eff: f32,
     target: f32,
     lam_min: f32, lam_max: f32,
-    /// Which row of its joint this is: angular (bit 4), axis (bits 2-3), kind (bits 0-1:
-    /// equality, motor, lower limit, upper limit). Warm starting matches rows by it.
+    /// Softness: 1 / (damping dt) for a damper row, 0 for rigid rows
+    gamma: f32,
+    /// Which row of its joint this is: angular (bit 5), axis (bits 3-4), kind (bits 0-2:
+    /// equality, motor, lower limit, upper limit, damping, friction). Warm starting matches rows
+    /// by it.
     tag: u8,
 }
 
@@ -159,7 +164,7 @@ fn joint_row_apply(bodies: &mut riftphys_dynamics::dynamics::Bodies, r: &JointRo
 
 /// Velocity rows of a D6 joint: locked axes as equalities, limits as speculative inequalities.
 /// Drives and soft (compliant) rows stay at position level.
-fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulation::bodies::D6Joint, dt: f32, out: &mut Vec<JointRow>) {
+fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulation::bodies::D6Joint, dt: f32, j_idx: u32, rotor: &BTreeMap<(u32, u8), f32>, out: &mut Vec<JointRow>) {
     let (a, b) = (j.a.0, j.b.0);
     let (pa, pb) = (bodies.pose(a), bodies.pose(b));
     let rot_a = pa.rot * j.fa.rot;
@@ -179,19 +184,50 @@ fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulati
     for angular in [false, true] {
         for i in 0..3 {
             let row = if angular { &j.r[i] } else { &j.t[i] };
-            if !row.enabled || row.compliance > 0.0 { continue; }
-            // Position drives stay at position level; velocity drives become motor rows below
-            if row.drive.map_or(false, |d| !d.vel_mode) { continue; }
             let u = axes[i];
-            let k = if angular {
+            let k = |u: Vec3| if angular {
                 u.dot(ia.mul_vec3(u)) + u.dot(ib.mul_vec3(u))
             } else {
                 let (ca, cb) = (ra.cross(u), rb.cross(u));
                 wa + wb + ca.dot(ia.mul_vec3(ca)) + cb.dot(ib.mul_vec3(cb))
             };
+            let tag = ((angular as u8) << 5) | ((i as u8) << 3);
+            // Joint damping and Coulomb friction (PARITY_SPEC W3a), on any axis, free ones too.
+            // The damper is implicit: v + gamma lam = 0 with gamma = 1 / (c dt) gives the impulse
+            // -c dt v_end, stable for any c (a rigid lock as c grows).
+            if row.damping > 0.0 || row.friction > 0.0 {
+                let kk = k(u);
+                if kk > 1e-9 {
+                    let base = JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / kk, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, gamma: 0.0, tag };
+                    if row.damping > 0.0 {
+                        let gamma = 1.0 / (row.damping * dt);
+                        out.push(JointRow { gamma, m_eff: 1.0 / (kk + gamma), tag: tag | 4, ..base });
+                    }
+                    if row.friction > 0.0 {
+                        let cap = row.friction * dt;
+                        out.push(JointRow { lam_min: -cap, lam_max: cap, tag: tag | 5, ..base });
+                    }
+                }
+            }
+            // Armature (PARITY_SPEC W4b): the geared rotor's momentum balance, a soft row
+            // w_rel + lam / J_a = w_rotor (the links take lam, the rotor -lam). Under a torque
+            // across the joint w_rel then changes by tau dt / (I + J_a), the reduced-coordinate
+            // answer. w_rotor is carried state; the first step starts it from the links.
+            if angular && row.armature > 0.0 {
+                let kk = k(u);
+                if kk > 1e-9 {
+                    let gamma = 1.0 / row.armature;
+                    let w_rel = (bodies.vel(b).ang - bodies.vel(a).ang).dot(u);
+                    let target = rotor.get(&(j_idx, i as u8)).copied().unwrap_or(w_rel);
+                    out.push(JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / (kk + gamma), target, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, gamma, tag: tag | 6 });
+                }
+            }
+            if !row.enabled || row.compliance > 0.0 { continue; }
+            // Position drives stay at position level; velocity drives become motor rows below
+            if row.drive.map_or(false, |d| !d.vel_mode) { continue; }
+            let k = k(u);
             if k <= 1e-9 { continue; }
-            let tag = ((angular as u8) << 4) | ((i as u8) << 2);
-            let base = JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / k, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, tag };
+            let base = JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / k, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, gamma: 0.0, tag };
             if let Some(drive) = row.drive {
                 // Motor: drive the relative velocity to the target with at most max_impulse per
                 // step (a constraint motor; adding kd x error straight to the velocity diverged
@@ -400,7 +436,7 @@ impl World {
         for &j_idx in &active_joints {
             if let riftphys_articulation::bodies::JointKind::D6(j) = &self.joints.kinds()[j_idx] {
                 let start = joint_rows.len();
-                d6_rows(&self.bodies, j, dt, &mut joint_rows);
+                d6_rows(&self.bodies, j, dt, j_idx as u32, &self.rotor, &mut joint_rows);
                 row_range[j_idx] = (start, joint_rows.len());
             }
         }
@@ -567,7 +603,9 @@ impl World {
                             let r = &joint_rows_ref[k];
                             let v = joint_row_vel(bodies, r);
                             let old = acc[k];
-                            let new = (old + (r.target - v) * r.m_eff).clamp(r.lam_min, r.lam_max);
+                            // Rigid rows run exactly as before; soft rows (dampers) add gamma lam
+                            let new = if r.gamma == 0.0 { old + (r.target - v) * r.m_eff } else { old + (r.target - v - r.gamma * old) * r.m_eff };
+                            let new = new.clamp(r.lam_min, r.lam_max);
                             acc[k] = new;
                             if new != old { joint_row_apply(bodies, r, new - old); }
                         }
@@ -679,6 +717,17 @@ impl World {
             if e == s { continue; }
             let rows = (s..e).map(|k| WarmRow { tag: joint_rows[k].tag, lam: row_acc[k] }).collect();
             self.warm_joints.insert(j_idx as u32, rows);
+            // Armature rotors keep their own balance, w_rotor - lam / J_a: equal to the links'
+            // w_rel when the iterations converged, and untouched by the shock and restitution
+            // passes below, which apply contact impulses with no joint rows (storing w_rel would
+            // hand their change to the rotor with no impulse, making or losing energy at an
+            // impact)
+            for k in s..e {
+                let r = &joint_rows[k];
+                if r.tag & 7 == 6 {
+                    self.rotor.insert((j_idx as u32, (r.tag >> 3) & 3), r.target - row_acc[k] * r.gamma);
+                }
+            }
         }
 
         // 3a. Shock propagation (Guendelman et al. 2003): one more normal pass, bottom-up along

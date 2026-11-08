@@ -429,6 +429,7 @@ mod tests {
     fn push_recovery_20_holds() {
         let cfg = BipedConfig { push_impulse: 20.0, ..Default::default() };
         let ok = (2000..2040).filter(|&s| stand_time(&StandPd::default(), &cfg, s, 10.0) >= 10.0).count();
+        println!("push_recovery_20_holds: {}/40 held-out seeds stood 10 s", ok);
         assert!(ok >= 32, "20 N s pushes, held-out seeds: {}/40 stood 10 s (gate 32; measured 35)", ok);
     }
 

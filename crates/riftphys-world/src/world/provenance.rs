@@ -17,6 +17,10 @@ impl World {
             hash_vec3(&mut h, &vel.lin);
             hash_vec3(&mut h, &vel.ang);
         }
+        // The state the solver carries between steps besides poses and velocities (AT_REST_SPEC
+        // D2): warm-start entries, last velocities, sleep. (Not the tick, players, balances,
+        // guards or accel_comps.)
+        self.hash_carried(&mut h);
         h.finalize()
     }
 
