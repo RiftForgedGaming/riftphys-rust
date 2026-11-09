@@ -78,6 +78,50 @@ pub struct Collider {
     pub material: riftphys_materials::materials::Material,
 }
 
+/// One step's bounce passes (PARITY_SPEC W6), for tests and traces.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct BounceStats {
+    /// Contacts bounced at their time of impact, support rows beside them, pseudo rows
+    pub toi_rows: usize,
+    pub support_rows: usize,
+    pub pseudo_rows: usize,
+    /// Direct solves the velocity pass used (the most any component took) and the pseudo pass's
+    /// (1); 0 above the direct limit
+    pub solves: usize,
+    pub pseudo_solves: usize,
+    /// Gauss-Seidel sweeps (each at most 256), only above the direct limit or if the velocity
+    /// pass's direct solve didn't converge; else 0
+    pub sweeps: usize,
+    pub pseudo_sweeps: usize,
+    /// Connected components the velocity pass solved separately
+    pub components: usize,
+    /// Components that fell back to sweeping, in either pass (above the direct limit, or not
+    /// converged): 0 in every suite
+    pub fallbacks: usize,
+    /// The velocity pass's largest component: its rows, and the entries of K and of L below the
+    /// diagonal (the sparse factor's fill)
+    pub largest: usize,
+    pub k_nnz: usize,
+    pub l_nnz: usize,
+    /// Wall time of both bounce passes on a bounce step, in microseconds (a diagnostic: it never
+    /// feeds the simulation)
+    pub pass_us: u64,
+    /// With the dense reference on (tests only): the first Newton system of each velocity solve
+    /// (well conditioned), sparse against dense, the worst difference relative to the largest
+    pub dense_check: f64,
+    /// The worst normwise backward error of any bounce-pass solve this step (infinity norms):
+    /// a backward-stable factor gives about 1e-15, however ill-conditioned the system
+    pub backward_error: f64,
+    /// The largest velocity error left on a pushing row, against the unregularised K (m/s): the
+    /// compliance's cost, about 1e-9 of the velocity change
+    pub true_residual: f64,
+    /// The pseudo solve's largest residual (m/s)
+    pub residual: f32,
+    /// The fastest mid-step approach of any rigid contact (m/s, positive approaching); bounces
+    /// need more than 1
+    pub max_approach: f32,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Contact {
     pub a_collider: usize,
@@ -213,6 +257,23 @@ pub struct World {
     /// Velocities at the start of the current step, before forces (restitution uses the
     /// approach speed, not one that already includes this step's gravity)
     pub(super) pre_step_vel: Vec<Velocity>,
+    /// Per-step outputs of the contact solve (PARITY_SPEC W6), never carried or hashed:
+    /// bodies whose contacts carried load this step, the split-impulse pseudo-velocity
+    /// (linear, angular) that places a bounced free body where its time of impact puts it,
+    /// and the pseudo solve's last residual (m/s).
+    pub(super) contact_loaded: Vec<bool>,
+    pub(super) bounce_pseudo: Vec<(Vec3, Vec3)>,
+    pub(super) last_bounce_residual: f32,
+    pub(super) last_bounce_stats: BounceStats,
+    /// The W6 bounce passes' direct-solve limit, in rows per component (`DIRECT_MAX`)
+    pub(super) bounce_direct_max: usize,
+    /// Tests only: also solve the first Newton system of each velocity solve densely, and report
+    /// the difference from the sparse solve (`BounceStats::dense_check`)
+    pub(super) bounce_dense_reference: bool,
+    /// The last step's velocity-pass impulse changes, per row, components in order (tests only)
+    pub(super) last_bounce_x: Vec<f64>,
+    /// Which bodies moved ballistically last step (W6 H2), for tracing
+    pub(super) last_ballistic: Vec<bool>,
     /// Measured contact properties per material pair, replacing the built-in table (set from
     /// fitting real data; see riftphys-reality). Keys are (min, max) by MaterialId order.
     /// Linear velocity at the end of each body's last step (or as last set): the start of the
@@ -332,6 +393,14 @@ impl World {
             solver_iters: (20, 20),
             joint_projection: JointProjection::default(),
             pre_step_vel: Vec::new(),
+            contact_loaded: Vec::new(),
+            bounce_pseudo: Vec::new(),
+            last_bounce_residual: 0.0,
+            last_bounce_stats: BounceStats::default(),
+            bounce_direct_max: super::solver::DIRECT_MAX,
+            bounce_dense_reference: false,
+            last_bounce_x: Vec::new(),
+            last_ballistic: Vec::new(),
             pair_overrides: Vec::new(),
             last_lin_vel: Vec::new(),
             tick: 0,
@@ -849,6 +918,35 @@ impl World {
 
     /// Largest (contact, joint) batch of the last step's solve: 64 or more ran in parallel.
     pub fn last_max_batch(&self) -> (usize, usize) { self.last_max_batch }
+
+    /// Largest normal-velocity residual (m/s) the last step's bounce pseudo solve left
+    /// (PARITY_SPEC W6); 0 when nothing bounced.
+    pub fn last_bounce_residual(&self) -> f32 { self.last_bounce_residual }
+
+    /// The last step's bounce passes (PARITY_SPEC W6): rows, sweeps used, residual, and the
+    /// fastest mid-step approach of any rigid contact.
+    pub fn last_bounce_stats(&self) -> BounceStats { self.last_bounce_stats }
+
+    /// Tests only: the bounce passes' direct-solve limit in rows per component, so the sweeping
+    /// fallback can be exercised. Not part of the simulation's configuration.
+    #[doc(hidden)]
+    pub fn set_bounce_direct_max(&mut self, rows: usize) { self.bounce_direct_max = rows; }
+
+    /// Tests only: also solve the first Newton system of each velocity solve densely (the
+    /// reference for the sparse factor); `BounceStats::dense_check` reports the difference. Like
+    /// `set_bounce_direct_max`, not saved in `CarriedState` or hashed; a new World starts off.
+    #[doc(hidden)]
+    pub fn set_bounce_dense_reference(&mut self, on: bool) { self.bounce_dense_reference = on; }
+
+    /// Tests only: the last step's velocity-pass impulse changes per row (components in order)
+    #[doc(hidden)]
+    pub fn last_bounce_impulses(&self) -> &[f64] { &self.last_bounce_x }
+
+    /// Whether `body` moved ballistically last step (free flight, W6 H2).
+    pub fn last_ballistic(&self, body: BodyId) -> bool { self.last_ballistic.get(body.0 as usize).copied().unwrap_or(false) }
+
+    /// Whether any of `body`'s contacts carried load last step.
+    pub fn last_contact_loaded(&self, body: BodyId) -> bool { self.contact_loaded.get(body.0 as usize).copied().unwrap_or(false) }
 
     /// The joint solve inside `step`: SHAKE directions from the start-of-step poses `start`
     /// (indexed by body), or PBD.

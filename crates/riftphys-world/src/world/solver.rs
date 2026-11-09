@@ -70,6 +70,145 @@ struct ContactConstraint {
     soft_jn: f32,
     /// Friction is solved by this point's patch (see `FrictionPatch`), not here
     patch: bool,
+    /// Bounce at the time of impact (PARITY_SPEC W6), for a rigid bouncing contact between
+    /// bodies in no joint: the gap at the step's start, e, and each side's velocity at the
+    /// contact along the normal at the step's start (`last_lin_vel`'s convention) and after
+    /// this step's forces
+    toi: bool,
+    /// Mid-step normal approach speed (negative approaching), for the step's stats
+    approach: f32,
+    toi_s0: f32, toi_e: f32,
+    toi_va: (f32, f32), toi_vb: (f32, f32),
+}
+
+/// PARITY_SPEC W6's bounce and pseudo passes are solved directly (`bounce_lcp::bounce_qp`,
+/// `bounce_lcp::pseudo_solve`) for components of up to `DIRECT_MAX` rows. Gauss-Seidel took 2,300
+/// sweeps on a 10-box stack: support runs down a pile as a chain, and a tall stack's rocking modes
+/// are weak. 250 rows is the 5 ms point on a quiet machine, single core (`w6_cost_probe`: 220 rows
+/// 4.0-4.2 ms, 279 rows 5.5-5.9 ms; the 20-box pile 3.3-3.9 ms).
+pub(super) const DIRECT_MAX: usize = 250;
+/// Above `DIRECT_MAX` rows: Gauss-Seidel sweeps, alternating direction, until no row changes its
+/// velocity by more than `BOUNCE_TOL` x (1 + |target|), at most `BOUNCE_SWEEPS`
+const BOUNCE_SWEEPS: usize = 256;
+const BOUNCE_TOL: f32 = 1e-6;
+/// The velocity pass's direct solves at most (`bounce_qp`); past them it sweeps
+const BOUNCE_SOLVES: usize = 64;
+
+
+
+/// Bounce-pass components that fell back to sweeping in this process (above the direct limit,
+/// or not converged). A diagnostic, not simulation state: outside the hash and rollback.
+static BOUNCE_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bounce-pass fallbacks to sweeping in this process so far (PARITY_SPEC W6); the regression
+/// suites print it and expect 0
+pub fn bounce_fallbacks_total() -> u64 { BOUNCE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// The largest bounce-pass component (rows) in this process so far: a diagnostic, outside the
+/// hash and rollback. A regression's results hold under any direct limit at or above it.
+static BOUNCE_LARGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The largest bounce-pass component seen in this process (rows)
+pub fn bounce_largest_component() -> u64 { BOUNCE_LARGEST.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// One side of a contact row: the body, its Jacobian (linear, angular) and M^-1 J^T, in f64.
+/// `u32::MAX` for a side that can't move.
+type RowSide = (u32, glam::DVec3, glam::DVec3, glam::DVec3, glam::DVec3);
+
+fn row_sides(cs: &ContactConstraint) -> [RowSide; 2] {
+    let n = cs.normal.as_dvec3();
+    let side = |body: u32, sign: f64, r: Vec3, inv: f32, ii: Mat3| -> RowSide {
+        if inv <= 0.0 && ii == Mat3::ZERO { return (u32::MAX, glam::DVec3::ZERO, glam::DVec3::ZERO, glam::DVec3::ZERO, glam::DVec3::ZERO); }
+        let jl = n * sign;
+        let ja = r.as_dvec3().cross(n) * sign;
+        // The world inverse inertia, symmetrised in f64: R I^-1 R^T in f32 is symmetric only to
+        // about 1e-7, which made K unsymmetric, and Cholesky (which reads one triangle) then
+        // solved a slightly different matrix (backward error 4e-10 on a 5-row system)
+        let m = ii.as_dmat3();
+        let m = (m + m.transpose()) * 0.5;
+        (body, jl, ja, jl * inv as f64, m * ja)
+    };
+    let b = if cs.b_is_terrain { u32::MAX } else { cs.bi };
+    [side(cs.ai, -1.0, cs.ra, cs.inv_a, cs.ii_a), side(b, 1.0, cs.rb, cs.inv_b, cs.ii_b)]
+}
+
+/// The rows' contact matrix K = J M^-1 J^T, sparse: rows couple only through a shared body
+/// that moves. K_ij sums over the shared bodies, row i's sides first, in a fixed order.
+fn contact_csr(sides: &[[RowSide; 2]]) -> super::bounce_lcp::Csr {
+    let n = sides.len();
+    let mut by_body: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
+    for (i, sd) in sides.iter().enumerate() {
+        for (t, side) in sd.iter().enumerate() {
+            if side.0 != u32::MAX { by_body.entry(side.0).or_default().push((i, t)); }
+        }
+    }
+    let mut acc = vec![0.0f64; n];
+    let mut seen = vec![false; n];
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut touched = vec![i];
+        seen[i] = true;
+        for si in &sides[i] {
+            if si.0 == u32::MAX { continue; }
+            for &(j, t) in &by_body[&si.0] {
+                let sj = &sides[j][t];
+                acc[j] += si.1.dot(sj.3) + si.2.dot(sj.4);
+                if !seen[j] { seen[j] = true; touched.push(j); }
+            }
+        }
+        touched.sort_unstable();
+        rows.push(touched.iter().map(|&j| { let v = acc[j]; acc[j] = 0.0; seen[j] = false; (j, v) }).collect());
+    }
+    super::bounce_lcp::Csr::from_rows(rows)
+}
+
+/// The rows' connected components: rows linked through a body that moves (an immovable side
+/// links nothing). Each is its own system, solved alone: a bounce elsewhere in the world adds
+/// neither to its size nor to its solves. Row indices ascend in each; components are ordered
+/// by their first row, so the solve order is fixed.
+fn row_components(sides: &[[RowSide; 2]], num_bodies: usize) -> Vec<Vec<usize>> {
+    fn find(p: &mut [u32], mut x: u32) -> u32 {
+        while p[x as usize] != x { let g = p[p[x as usize] as usize]; p[x as usize] = g; x = g; }
+        x
+    }
+    let mut parent: Vec<u32> = (0..num_bodies as u32).collect();
+    for sd in sides {
+        if sd[0].0 != u32::MAX && sd[1].0 != u32::MAX {
+            let (a, b) = (find(&mut parent, sd[0].0), find(&mut parent, sd[1].0));
+            if a != b { parent[a.max(b) as usize] = a.min(b); }
+        }
+    }
+    let mut slot = vec![usize::MAX; num_bodies];
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    for (i, sd) in sides.iter().enumerate() {
+        let body = if sd[0].0 != u32::MAX { sd[0].0 } else { sd[1].0 };
+        if body == u32::MAX { comps.push(vec![i]); continue; }
+        let r = find(&mut parent, body) as usize;
+        if slot[r] == usize::MAX { slot[r] = comps.len(); comps.push(Vec::new()); }
+        comps[slot[r]].push(i);
+    }
+    comps
+}
+
+
+
+/// W6: the end-of-step normal velocity of a bounce found at its time of impact inside the
+/// step, and, when the pair started apart, the pseudo-velocity that moves it to where the
+/// bounce leaves it (the integration moves it by `v_end dt` otherwise).
+fn toi_bounce(s0: f32, v0: f32, a: f32, e: f32, dt: f32) -> (f32, Option<f32>) {
+    // Smallest root of s0 + v0 t + a t^2 / 2 = 0, written without dividing by a; no root in
+    // [0, dt] while the contact binds: it bounces at the step's end (PARITY_SPEC W6, L3)
+    let t_c = if s0 <= 0.0 { 0.0 } else {
+        let disc = v0 * v0 - 2.0 * a * s0;
+        let den = if disc >= 0.0 { -v0 + disc.sqrt() } else { 0.0 };
+        if den > 0.0 { (2.0 * s0 / den).min(dt) } else { dt }
+    };
+    let v_out = (-e * (v0 + a * t_c)).max(0.0);
+    let tau = dt - t_c;
+    let rise = v_out * tau + 0.5 * a * tau * tau;
+    // Too weak to leave within the step: it ends at rest on the contact
+    let (v_end, s_end) = if rise < 0.0 { (0.0, 0.0) } else { ((v_out + a * tau).max(0.0), rise) };
+    (v_end, (s0 > 0.0).then(|| (s_end - s0) / dt - v_end))
 }
 
 /// One manifold's friction under patch friction (`MatPairProps::patch_friction`): sliding at
@@ -308,6 +447,16 @@ impl World {
         let slop = 0.005;
         let num_bodies = self.bodies.len();
 
+        // Bodies in any joint (PARITY_SPEC W6 leaves their contacts as they were)
+        let mut jointed = vec![false; num_bodies];
+        for k in self.joints.kinds().iter() {
+            let (a, b) = match k {
+                riftphys_articulation::bodies::JointKind::Distance(j) => (j.a.0, j.b.0),
+                riftphys_articulation::bodies::JointKind::D6(j) => (j.a.0, j.b.0),
+            };
+            for x in [a, b] { if let Some(f) = jointed.get_mut(x as usize) { *f = true; } }
+        }
+
         // 1. Constraint Pre-processing
         let constraints: Vec<ContactConstraint> = contacts.iter().map(|c| {
             let ai = self.colliders[c.a_collider].body.0;
@@ -346,6 +495,7 @@ impl World {
                 soft: pair.stiffness > 0.0,
                 soft_jn: 0.0,
                 patch: false,
+                toi: false, approach: 0.0, toi_s0: 0.0, toi_e: 0.0, toi_va: (0.0, 0.0), toi_vb: (0.0, 0.0),
             };
             let pen = c.depth - margin;
             cs.depth_bias = if pen > 0.0 { ((pen - slop).max(0.0) * (beta / dt)).min(2.0) } else { pen / dt };
@@ -355,6 +505,7 @@ impl World {
             let v_pre = ((vb.lin + vb.ang.cross(rb)) - (va.lin + va.ang.cross(ra))).dot(normal);
             // Approach speed at mid-step (between the start-of-step and after-gravity velocities)
             let v_rel_n = 0.5 * (v_pre + contact_rel_vel(&self.bodies, &cs).dot(normal));
+            cs.approach = v_rel_n;
             if cs.soft {
                 // Hunt-Crossley: f = k x (1 + d x'), x the true penetration, x' its rate (the
                 // mid-step approach speed); never pulls. No rigid row, so nothing to bias.
@@ -366,7 +517,26 @@ impl World {
                 return cs;
             }
             // Applied after the solve, only to contacts that carried load (see below)
-            if v_rel_n < -1.0 { cs.restitution_bias = -pair.restitution * v_rel_n; }
+            if v_rel_n < -1.0 {
+                cs.restitution_bias = -pair.restitution * v_rel_n;
+                // W6: free bodies bounce at their time of impact; jointed ones as before
+                if !jointed[ai as usize] && (b_is_terrain || !jointed[bi as usize]) {
+                    // The integrator's motion model: linear velocity from the end of last step,
+                    // host impulses as force over this one (step.rs, the ballistic average)
+                    let start = |id: u32| {
+                        let v = pre(id);
+                        riftphys_core::Velocity { lin: self.last_lin_vel.get(id as usize).copied().unwrap_or(v.lin), ang: v.ang }
+                    };
+                    let at = |v: riftphys_core::Velocity, r: Vec3| (v.lin + v.ang.cross(r)).dot(normal);
+                    let va = (at(start(ai), ra), at(self.bodies.vel(ai), ra));
+                    let vb = if b_is_terrain { (0.0, 0.0) } else { (at(start(bi), rb), at(self.bodies.vel(bi), rb)) };
+                    cs.toi = true;
+                    cs.toi_s0 = -pen;
+                    cs.toi_e = pair.restitution;
+                    cs.toi_va = va;
+                    cs.toi_vb = vb;
+                }
+            }
             cs
         }).collect();
 
@@ -764,13 +934,273 @@ impl World {
         // 3b. Restitution (as Box2D v3's relax pass): once the solve has settled which contacts
         // actually stop an approach (normal impulse > 0), bounce those at e x approach speed.
         // In the iterations, a speculative contact whose gap absorbs the approach must not bounce.
+        // Free bodies' contacts (PARITY_SPEC W6) bounce at their time of impact: the target is
+        // the velocity at the step's end, and a pseudo row fixes the position the integration
+        // gives. Contacts on jointed bodies bounce as before: one sweep, first.
         for (c_idx, cs) in constraints.iter().enumerate() {
-            if cs.restitution_bias <= 0.0 || acc_jn[c_idx] <= 0.0 { continue; }
+            if cs.toi || cs.restitution_bias <= 0.0 || acc_jn[c_idx] <= 0.0 { continue; }
             let v = contact_rel_vel(&self.bodies, cs).dot(cs.normal);
             let old = acc_jn[c_idx];
             let new = (old + (cs.restitution_bias - v) * cs.m_n).max(0.0);
             acc_jn[c_idx] = new;
             apply_contact_impulse(&mut self.bodies, cs, cs.normal * (new - old));
+        }
+        let loaded_at = |c_idx: usize, acc_jn: &[f32]| {
+            let cs = &constraints[c_idx];
+            acc_jn[c_idx] > 0.0 || cs.soft_jn > 0.0 || acc_jt[2 * c_idx] != 0.0 || acc_jt[2 * c_idx + 1] != 0.0
+        };
+        // Support reaches down a whole pile: grow `involved` through rigid loaded contacts to a
+        // fixed point, stopping at static, sleeping and jointed bodies (a box dropped on a
+        // two-box stack would otherwise drive the bottom box into the floor). Compliant contacts
+        // aren't supports in either pass: their Hunt-Crossley force answers on later steps.
+        let grow = |involved: &mut Vec<bool>, acc_jn: &[f32]| loop {
+            let mut changed = false;
+            for (c_idx, cs) in constraints.iter().enumerate() {
+                if cs.soft || cs.b_is_terrain || !loaded_at(c_idx, acc_jn) { continue; }
+                for (x, y, inv_y) in [(cs.ai, cs.bi, cs.inv_b), (cs.bi, cs.ai, cs.inv_a)] {
+                    if involved[x as usize] && !involved[y as usize] && inv_y > 0.0 && !jointed[y as usize] {
+                        involved[y as usize] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed { break; }
+        };
+        let partner = |cs: &ContactConstraint, id: u32| if cs.b_is_terrain { u32::MAX } else if id == cs.ai { cs.bi } else { cs.ai };
+        // `cs` with jointed bodies immovable (their joint rows aren't in these passes) and its
+        // normal effective mass; None if neither side can move
+        let free_only = |cs: &ContactConstraint| -> Option<ContactConstraint> {
+            let mut cs = *cs;
+            if jointed[cs.ai as usize] { cs.inv_a = 0.0; cs.ii_a = Mat3::ZERO; }
+            if cs.b_is_terrain || jointed[cs.bi as usize] { cs.inv_b = 0.0; cs.ii_b = Mat3::ZERO; }
+            let (ca, cb) = (cs.ra.cross(cs.normal), cs.rb.cross(cs.normal));
+            let k = cs.inv_a + cs.inv_b + ca.dot(cs.ii_a.mul_vec3(ca)) + cb.dot(cs.ii_b.mul_vec3(cb));
+            (k > 1e-9).then(|| { cs.m_n = 1.0 / k; cs })
+        };
+        let mut stats = super::world::BounceStats {
+            max_approach: constraints.iter().filter(|cs| !cs.soft).map(|cs| -cs.approach).fold(0.0, f32::max),
+            ..Default::default()
+        };
+        let pass_clock = std::time::Instant::now();
+        self.last_bounce_x.clear();
+        let toi_set: Vec<bool> = constraints.iter().enumerate().map(|(i, cs)| cs.toi && cs.restitution_bias > 0.0 && acc_jn[i] > 0.0).collect();
+        let mut toi_rows: Vec<(usize, f32)> = Vec::new();
+        let mut pseudo_rows: Vec<(usize, f32)> = Vec::new();
+        if toi_set.iter().any(|&t| t) {
+            // Loaded contacts outside the bounce, per body: who each one is with
+            let mut rests_on: Vec<Vec<u32>> = vec![Vec::new(); num_bodies];
+            for (c_idx, cs) in constraints.iter().enumerate() {
+                if toi_set[c_idx] || !loaded_at(c_idx, &acc_jn) { continue; }
+                rests_on[cs.ai as usize].push(partner(cs, cs.ai));
+                if !cs.b_is_terrain { rests_on[cs.bi as usize].push(partner(cs, cs.bi)); }
+            }
+            for (c_idx, cs) in constraints.iter().enumerate() {
+                if !toi_set[c_idx] { continue; }
+                // A side resting on something other than its partner in this impact is supported
+                // there: it is struck from its start velocity, with its forces balanced (a box on
+                // the floor is met at g by a box falling onto it, and struck still from the side)
+                let side = |id: u32, (start, after): (f32, f32)| {
+                    let other = partner(cs, id);
+                    if rests_on[id as usize].iter().any(|&p| p != other) { (start, start) } else { (start, after) }
+                };
+                let a_side = side(cs.ai, cs.toi_va);
+                let b_side = if cs.b_is_terrain { (0.0, 0.0) } else { side(cs.bi, cs.toi_vb) };
+                let v0 = b_side.0 - a_side.0;
+                let acc = ((b_side.1 - a_side.1) - v0) / dt;
+                let (v_end, pseudo) = toi_bounce(cs.toi_s0, v0, acc, cs.toi_e, dt);
+                toi_rows.push((c_idx, v_end));
+                if let Some(u) = pseudo { pseudo_rows.push((c_idx, u)); }
+            }
+            // The bounced bodies' other loaded contacts join as push-only rows, each allowing no
+            // approach beyond its gap (a fresh accumulator >= 0): the floor
+            // under a struck box pushes back along its own normal only, so a side hit still
+            // shares momentum, and a box bounces off a box resting on the floor
+            let mut involved = vec![false; num_bodies];
+            for &(c_idx, _) in &toi_rows {
+                let cs = &constraints[c_idx];
+                involved[cs.ai as usize] = true;
+                if !cs.b_is_terrain { involved[cs.bi as usize] = true; }
+            }
+            grow(&mut involved, &acc_jn);
+            let support: Vec<(ContactConstraint, f32)> = constraints.iter().enumerate().filter_map(|(c_idx, cs)| {
+                if toi_set[c_idx] || cs.soft || acc_jn[c_idx] <= 0.0 { return None; }
+                if !involved[cs.ai as usize] && (cs.b_is_terrain || !involved[cs.bi as usize]) { return None; }
+                // No approach beyond what the gap allows (the main solve's target, capped at 0):
+                // holding only the approach left after the iterations let a struck stack keep
+                // sinking under the impact, and the projection then popped it back up
+                let row = free_only(cs)?;
+                Some((row, cs.depth_bias.min(0.0)))
+            }).collect();
+            // One list: the bounces (accumulating into acc_jn) and the supports (fresh accumulators)
+            let mut rows: Vec<(ContactConstraint, f32, Option<usize>)> = toi_rows.iter().map(|&(c_idx, t)| (constraints[c_idx], t, Some(c_idx))).collect();
+            rows.extend(support.into_iter().map(|(row, t)| (row, t, None)));
+            let mut sup_acc = vec![0.0f32; rows.len()];
+            stats.toi_rows = toi_rows.len();
+            stats.support_rows = rows.len() - toi_rows.len();
+            // Each connected component alone: up to `bounce_direct_max` rows (DIRECT_MAX) solved
+            // directly (`bounce_qp`); above it, or if that didn't converge in BOUNCE_SOLVES,
+            // swept from where it got to, and counted in `fallbacks`
+            let sides_all: Vec<[RowSide; 2]> = rows.iter().map(|(row, _, _)| row_sides(row)).collect();
+            let comps = row_components(&sides_all, num_bodies);
+            stats.components = comps.len();
+            for comp in &comps {
+                let n = comp.len();
+                BOUNCE_LARGEST.fetch_max(n as u64, std::sync::atomic::Ordering::Relaxed);
+                let mut sweep = n > self.bounce_direct_max;
+                if !sweep {
+                    let sides: Vec<[RowSide; 2]> = comp.iter().map(|&i| sides_all[i]).collect();
+                    let k = contact_csr(&sides);
+                    let b: Vec<f64> = comp.iter().map(|&i| {
+                        let (row, target, _) = &rows[i];
+                        (*target - contact_rel_vel(&self.bodies, row).dot(row.normal)) as f64
+                    }).collect();
+                    let acc0: Vec<f64> = comp.iter().map(|&i| match rows[i].2 { Some(c_idx) => acc_jn[c_idx], None => sup_acc[i] } as f64).collect();
+                    let (delta, info) = super::bounce_lcp::bounce_qp(&k, &b, &acc0, BOUNCE_SOLVES, self.bounce_dense_reference);
+                    stats.solves = stats.solves.max(info.solves);
+                    if n > stats.largest { stats.largest = n; stats.k_nnz = info.k_nnz; stats.l_nnz = info.l_nnz; }
+                    stats.dense_check = stats.dense_check.max(info.check);
+                    stats.backward_error = stats.backward_error.max(info.backward);
+                    stats.true_residual = stats.true_residual.max(info.true_residual);
+                    sweep = !info.converged;
+                    self.last_bounce_x.extend_from_slice(&delta);
+                    for (q, &i) in comp.iter().enumerate() {
+                        let (row, _, c) = &rows[i];
+                        let old = match c { Some(c_idx) => acc_jn[*c_idx], None => sup_acc[i] };
+                        let new = ((old as f64 + delta[q]) as f32).max(0.0);
+                        match c { Some(c_idx) => acc_jn[*c_idx] = new, None => sup_acc[i] = new }
+                        apply_contact_impulse(&mut self.bodies, row, row.normal * (new - old));
+                    }
+                }
+                if !sweep { continue; }
+                stats.fallbacks += 1;
+                BOUNCE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for it in 0..BOUNCE_SWEEPS {
+                    stats.sweeps = stats.sweeps.max(it + 1);
+                    let mut change = 0.0f32;
+                    for m in 0..n {
+                        let i = comp[if it % 2 == 0 { m } else { n - 1 - m }];
+                        let (row, target, c) = &rows[i];
+                        let v = contact_rel_vel(&self.bodies, row).dot(row.normal);
+                        let old = match c { Some(c_idx) => acc_jn[*c_idx], None => sup_acc[i] };
+                        let new = (old + (target - v) * row.m_n).max(0.0);
+                        match c { Some(c_idx) => acc_jn[*c_idx] = new, None => sup_acc[i] = new }
+                        apply_contact_impulse(&mut self.bodies, row, row.normal * (new - old));
+                        change = change.max((new - old).abs() / row.m_n / (1.0 + target.abs()));
+                    }
+                    if change < BOUNCE_TOL { break; }
+                }
+            }
+        }
+
+        // 3c. The bounce's position (W6): pseudo-velocities along the bounced contacts' normals,
+        // added to the integration and then dropped. The involved bodies' other loaded contacts
+        // keep their gaps (rows with target 0, both ways: a push-only row would let the pull lift
+        // a box resting on the floor off it), along their own normals only, so a body struck from
+        // the side still moves sideways.
+        self.last_bounce_residual = 0.0;
+        if !pseudo_rows.is_empty() {
+            let mut in_set = vec![false; constraints.len()];
+            let mut involved = vec![false; num_bodies];
+            for &(c_idx, _) in &pseudo_rows {
+                in_set[c_idx] = true;
+                let cs = &constraints[c_idx];
+                involved[cs.ai as usize] = true;
+                if !cs.b_is_terrain { involved[cs.bi as usize] = true; }
+            }
+            grow(&mut involved, &acc_jn);
+            let mut rows: Vec<(ContactConstraint, f32)> = pseudo_rows.iter()
+                .filter_map(|&(c_idx, u)| free_only(&constraints[c_idx]).map(|cs| (cs, u))).collect();
+            for (c_idx, cs) in constraints.iter().enumerate() {
+                if in_set[c_idx] || cs.soft || !loaded_at(c_idx, &acc_jn) { continue; }
+                if !involved[cs.ai as usize] && (cs.b_is_terrain || !involved[cs.bi as usize]) { continue; }
+                if let Some(row) = free_only(cs) { rows.push((row, 0.0)); }
+            }
+            let mut pseudo = vec![(Vec3::ZERO, Vec3::ZERO); num_bodies];
+            let rel = |p: &[(Vec3, Vec3)], cs: &ContactConstraint| {
+                let (la, wa) = p[cs.ai as usize];
+                let (lb, wb) = if cs.b_is_terrain { (Vec3::ZERO, Vec3::ZERO) } else { p[cs.bi as usize] };
+                ((lb + wb.cross(cs.rb)) - (la + wa.cross(cs.ra))).dot(cs.normal)
+            };
+            stats.pseudo_rows = pseudo_rows.len();
+            // Each connected component alone, as the velocity pass: one direct solve, or swept
+            // above `bounce_direct_max` rows (counted in `fallbacks`)
+            let sides_all: Vec<[RowSide; 2]> = rows.iter().map(|(cs, _)| row_sides(cs)).collect();
+            let mut acc = vec![(glam::DVec3::ZERO, glam::DVec3::ZERO); num_bodies];
+            let mut direct = vec![false; num_bodies];
+            for comp in &row_components(&sides_all, num_bodies) {
+                let n = comp.len();
+                if n <= self.bounce_direct_max {
+                    let sides: Vec<[RowSide; 2]> = comp.iter().map(|&i| sides_all[i]).collect();
+                    let k = contact_csr(&sides);
+                    let u: Vec<f64> = comp.iter().map(|&i| rows[i].1 as f64).collect();
+                    let (x, be) = super::bounce_lcp::pseudo_solve(&k, &u);
+                    stats.backward_error = stats.backward_error.max(be);
+                    for (q, sd) in sides.iter().enumerate() {
+                        for side in sd {
+                            if side.0 == u32::MAX { continue; }
+                            let e = &mut acc[side.0 as usize];
+                            e.0 += side.3 * x[q];
+                            e.1 += side.4 * x[q];
+                            direct[side.0 as usize] = true;
+                        }
+                    }
+                    stats.pseudo_solves = 1;
+                    continue;
+                }
+                stats.fallbacks += 1;
+                BOUNCE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for it in 0..BOUNCE_SWEEPS {
+                    stats.pseudo_sweeps = stats.pseudo_sweeps.max(it + 1);
+                    let mut change = 0.0f32;
+                    for m in 0..n {
+                        let (cs, u) = &rows[comp[if it % 2 == 0 { m } else { n - 1 - m }]];
+                        let d = u - rel(&pseudo, cs);
+                        change = change.max(d.abs() / (1.0 + u.abs()));
+                        let j = cs.normal * (d * cs.m_n);
+                        if cs.inv_a > 0.0 {
+                            let e = &mut pseudo[cs.ai as usize];
+                            e.0 -= j * cs.inv_a;
+                            e.1 -= cs.ii_a.mul_vec3(cs.ra.cross(j));
+                        }
+                        if cs.inv_b > 0.0 {
+                            let e = &mut pseudo[cs.bi as usize];
+                            e.0 += j * cs.inv_b;
+                            e.1 += cs.ii_b.mul_vec3(cs.rb.cross(j));
+                        }
+                    }
+                    if change < BOUNCE_TOL { break; }
+                }
+            }
+            for (b, a) in acc.iter().enumerate() {
+                if direct[b] { pseudo[b] = (a.0.as_vec3(), a.1.as_vec3()); }
+            }
+            self.last_bounce_residual = rows.iter().map(|(cs, u)| (u - rel(&pseudo, cs)).abs()).fold(0.0, f32::max);
+            stats.residual = self.last_bounce_residual;
+            self.bounce_pseudo = pseudo;
+        }
+
+        // A diagnostic only: wall time never feeds the simulation
+        if stats.toi_rows > 0 { stats.pass_us = pass_clock.elapsed().as_micros() as u64; }
+        self.last_bounce_stats = stats;
+
+        // Bodies whose contacts carried load this step; the rest may move ballistically (W6, H2)
+        self.contact_loaded.clear();
+        self.contact_loaded.resize(num_bodies, false);
+        for (c_idx, cs) in constraints.iter().enumerate() {
+            let loaded = acc_jn[c_idx] > 0.0 || cs.soft_jn > 0.0 || acc_jt[2 * c_idx] != 0.0 || acc_jt[2 * c_idx + 1] != 0.0;
+            if loaded {
+                self.contact_loaded[cs.ai as usize] = true;
+                if !cs.b_is_terrain { self.contact_loaded[cs.bi as usize] = true; }
+            }
+        }
+        for (k, p) in patches.iter().enumerate() {
+            if patch_acc[3 * k] != 0.0 || patch_acc[3 * k + 1] != 0.0 || patch_acc[3 * k + 2] != 0.0 {
+                for &i in &p.points {
+                    let cs = &constraints[i];
+                    self.contact_loaded[cs.ai as usize] = true;
+                    if !cs.b_is_terrain { self.contact_loaded[cs.bi as usize] = true; }
+                }
+            }
         }
 
         // 4. Write back the final normal impulses to the contact array

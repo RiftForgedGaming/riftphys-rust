@@ -33,6 +33,10 @@ impl World {
     pub fn step(&mut self, dt: Scalar) -> StepStats {
         self.schedule.clear();
         self.rotor_pending.clear();
+        self.bounce_pseudo.clear();
+        self.contact_loaded.clear();
+        self.last_bounce_residual = 0.0;
+        self.last_bounce_stats = Default::default();
         self.tick = self.tick.wrapping_add(1);
         self.ledger.clear();
         self.reset_provenance();
@@ -160,6 +164,40 @@ impl World {
             jointed_body[a as usize] = true;
             jointed_body[b as usize] = true;
         }
+        // PARITY_SPEC W6 (H2): a body in no joint whose contacts all carried no load this step
+        // (speculative ones within reach) and are all separating moves ballistically too, as
+        // long as the averaged motion stays within each contact's gap at the step's start.
+        // Semi-implicit there lost about v dt / 2 off a slow rebound's apex.
+        let loaded = |i: usize| self.contact_loaded.get(i).copied().unwrap_or(false);
+        let mut ballistic: Vec<bool> = (0..count as usize).map(|i| !constrained[i] || (!jointed_body[i] && !loaded(i))).collect();
+        for c in &contacts {
+            let a = self.colliders[c.a_collider].body.0 as usize;
+            let b = (c.b_collider != TERRAIN_CI).then(|| self.colliders[c.b_collider].body.0 as usize);
+            if !ballistic[a] && b.map_or(true, |b| !ballistic[b]) { continue; }
+            let moving = |id: usize| {
+                let v = self.bodies.vel(id as u32);
+                let lin = if ballistic[id] { (self.last_lin_vel.get(id).copied().unwrap_or(v.lin) + v.lin) * 0.5 } else { v.lin };
+                (lin, v.ang)
+            };
+            let (la, wa) = moving(a);
+            let ra = c.point - self.bodies.pose(a as u32).pos;
+            let (lb, wb, rb) = match b {
+                Some(b) => { let (l, w) = moving(b); (l, w, c.point - self.bodies.pose(b as u32).pos) }
+                None => (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO),
+            };
+            let approach = ((lb + wb.cross(rb)) - (la + wa.cross(ra))).dot(c.normal);
+            // The last step before arriving keeps the semi-implicit update the at-rest behaviour
+            // was built on (all-ballistic arrival: a 45-degree yawed stack landing from 1 cm
+            // rocked for 3 s): a contact the end velocity would reach within two steps
+            let (va, vb) = (self.bodies.vel(a as u32), b.map(|b| self.bodies.vel(b as u32)).unwrap_or_default());
+            let v_end = ((vb.lin + vb.ang.cross(rb)) - (va.lin + va.ang.cross(ra))).dot(c.normal);
+            let s0 = -(c.depth - MELEE_CCD_MARGIN);
+            if s0 + 2.0 * v_end * dt < 0.0 || s0 + approach * dt < 0.0 {
+                ballistic[a] = false;
+                if let Some(b) = b { ballistic[b] = false; }
+            }
+        }
+        self.last_ballistic.clone_from(&ballistic);
         for i in 0..count {
             if !self.bodies.is_dynamic(i) || !self.sleep.is_awake(i as usize) { continue; }
             let mut pose = self.bodies.pose(i);
@@ -171,7 +209,7 @@ impl World {
             // step's (exact for constant forces, gravity and thrust alike; semi-implicit Euler
             // overshoots a fall by a dt t / 2, 1.7% in 1 s at 60 Hz). Constrained bodies keep
             // the semi-implicit update the contact and joint solves were built against.
-            if !constrained[i as usize] {
+            if ballistic[i as usize] {
                 let v0 = self.last_lin_vel.get(i as usize).copied().unwrap_or(vel.lin);
                 pose.pos += (v0 - vel.lin) * (0.5 * dt);
             }
@@ -200,6 +238,13 @@ impl World {
                     }
                     vel.ang = w_end;
                     self.bodies.set_vel(i, vel);
+                }
+            }
+            // A bounced free body's pseudo-velocity (W6): moves it, never enters its velocity
+            if let Some(&(pl, pa)) = self.bounce_pseudo.get(i as usize) {
+                pose.pos += pl * dt;
+                if pa.length_squared() > 0.0 {
+                    pose.rot = (Quat::from_axis_angle(pa.normalize(), pa.length() * dt) * pose.rot).normalize();
                 }
             }
             self.bodies.set_pose(i, pose);

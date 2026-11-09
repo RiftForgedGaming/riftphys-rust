@@ -249,11 +249,14 @@ fn tilt_deg(q: Quat) -> f32 { (q * Vec3::Y).dot(Vec3::Y).clamp(-1.0, 1.0).acos()
 #[test]
 fn yawed_stacks_stand() {
     // The middle box of 3 yawed: at 45 degrees no corner of either box is inside the other, so
-    // the corner test gave one centre point and the stack toppled in about 2 s
+    // the corner test gave one centre point and the stack toppled in about 2 s.
+    // Started touching: landing from a gap is fragile at 45 degrees (it rocks for seconds after
+    // some gaps, before W6 too) and is AT_REST_SPEC R3b, gated by w6_bits_probe's
+    // w6_yawed_gap_sweep. This test is the resting contact.
     for (deg, hz, gate) in [(3.0f32, 60.0f32, 1e-4f32), (3.0, 240.0, 1e-4), (45.0, 60.0, 1e-4), (45.0, 240.0, 1e-4)] {
         let mut w = world();
         let ids: Vec<BodyId> = (0..3).map(|i| {
-            let b = boxed(&mut w, Vec3::new(0.0, 0.1 + 0.21 * i as f32, 0.0), Vec3::new(0.2, 0.1, 0.2), 5.0, MaterialId::Wood, false);
+            let b = boxed(&mut w, Vec3::new(0.0, 0.1 + 0.2 * i as f32, 0.0), Vec3::new(0.2, 0.1, 0.2), 5.0, MaterialId::Wood, false);
             if i == 1 { w.set_body_pose(b, Isometry { pos: w.get_body_pose(b).pos, rot: Quat::from_rotation_y(deg.to_radians()) }); }
             b
         }).collect();

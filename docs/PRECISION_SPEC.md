@@ -351,6 +351,11 @@ a real workload. URIEL's arm and biped work within 2 m of the origin at 240 Hz, 
 - Route every `f32` transcendental call in simulation code through the `libm` crate, as `glam`
   already does.
 - Add a lint or test that fails on new direct calls.
+- Known calls in the hashed path (the Reviewer, 2026-11-09; they predate W6, whose solve is
+  clean): `mu_dynamic` (`solver.rs:397`, the Stribeck curve) uses `.powi(2)` and `.exp()` on
+  every friction row; `patch_radius` (`solver.rs:256`) uses `.powi(2)`. `exp` comes from the
+  platform's math library and isn't correctly rounded; `powi`'s precision is unspecified. Both
+  `.powi(2)` can become `x * x` (exact either way) at no cost even if D2 is no.
 - Acceptance: the same scene hashes identically on Windows (MSVC) and Linux (GNU) for 10,000
   steps. That needs a Linux runner; the RiftForged determinism harness has one.
 

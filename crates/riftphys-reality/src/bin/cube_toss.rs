@@ -172,6 +172,7 @@ fn main() {
             show(t, &p, table_y, hz);
         }
     }
+    println!("W6 bounce fallbacks to sweeping: {}, largest component {} rows", riftphys_world::world::solver::bounce_fallbacks_total(), riftphys_world::world::solver::bounce_largest_component());
     if let Some(path) = get("--out") {
         std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap()).unwrap();
         println!("\nwrote {}", path);

@@ -1,8 +1,10 @@
 # Real-world parity: definition and remaining work
 
 Status: proposed 2026-11-06. The definition in section 2 needs the Designer's sign-off. W1 and
-W2 are built (section 3.7). W3a and W4b are built and committed 2026-11-08 (section 3.8). W3 and W4 wait on
-their data downloads (D5); W5 and W6 only if triggered.
+W2 are built (section 3.7). W3a and W4b are built and committed 2026-11-08 (section 3.8).
+2026-11-08: the Designer answered D1–D3 and D6 (section 5). W6 is now required and next
+(section 3.6), then the D6 split (3.9). W3 and W4 wait on their data downloads (D5, sizes in
+section 5); D4 is open. W5 only if triggered.
 
 **Why.** The Designer's rule, relayed by URIEL Orchestration on 2026-11-06: URIEL physics
 training resumes only once RiftPhys matches real-world reference values. argref then bumps its
@@ -155,7 +157,7 @@ than 2 SE. Also report the energy decay rate per run against the measured one.
 ### 3.4 W4: Cassie jumping impacts (P4)
 
 **Data.**
-- **Source:** github.com/DAIRLab/cassie_impact_dataset, BSD-3, under 1 MB, recorded on the
+- **Source:** github.com/DAIRLab/cassie_impact_dataset, BSD-3, 1.32 MB (96 files), recorded on the
   robot in 2021.
 - **Contents:**
   - 22 jumps, recorded at 2000 Hz around the first impact;
@@ -256,13 +258,351 @@ which the paper itself names as the limit for Drake and MuJoCo.
   through the lever arm, so a limit feels the inertia about the pivot.
 - **When:** only if W3 or W4 shows the problem. Neither the arm nor the biped hits it today.
 
-### 3.6 W6: restitution at 60 Hz (only if drone scenes bounce)
+### 3.6 W6: restitution at 60 Hz (required: D3, 2026-11-08)
 
-- **The problem:** a bounce reverses the velocity for the whole step, losing gravity's effect
-  over the part after impact (13% at 60 Hz).
-- **The fix:** a sub-step time of impact for restitution, splitting the step at the contact
-  time.
-- **When:** only if decision D3 says drone scenes need it.
+**Required, and first** (D3: "if a drone falls it should bounce"). Drafted 2026-11-08, for review
+before building.
+
+**Measured at b1ebad0** (`riftphys-fidelity`): a rubber ball (e 0.80) dropped from 1 m rebounds
+to 0.7234 m at 60 Hz against e² h = 0.640 (+13.0%), and 0.6626 m at 240 Hz (+3.5%).
+
+**The cause is the bounce step's position, not its velocity.** Worked through at 60 Hz:
+- The ball starts the impact step 43.5 mm above the floor at 4.25 m/s. Contacts are speculative,
+  so the step's solve closes the gap, and restitution then sets the end velocity to
+  e × (mid-step approach speed) = 3.47 m/s.
+- A body with contacts moves semi-implicitly, x += v_end dt, so the ball ends the step 58 mm
+  *higher* than it started, at 101 mm. It never went down the 43.5 mm to the floor.
+- In truth the ball falls 10.0 ms to the floor, bounces at e × 4.35 = 3.48 m/s and rises for the
+  remaining 6.6 ms, ending at 23 mm moving at 3.41 m/s.
+- The extra 78 mm is the overshoot: 12% of 0.64 m. The velocity is only 1.6% off. At 240 Hz the
+  same error is a quarter as large.
+- A free-flying body already moves exactly under constant gravity (the ballistic average in
+  step.rs); only the bounce step is wrong.
+
+**The fix: a time of impact inside the step, for the bounce's velocity and its position.**
+- **Per contact, when it is built** (rigid contacts with a restitution bias, as today: approach
+  faster than 1 m/s, mid-step), store along the normal:
+  - s0, the gap at the start of the step (−pen, from the start-of-step narrowphase);
+  - v0, the relative velocity at the start of the step (already computed, `v_pre`);
+  - a, the relative acceleration from this step's forces: (velocity after forces − v0) / dt.
+- **Time of impact:** the smallest t_c in [0, dt] with s0 + v0 t + ½ a t² = 0. t_c = 0 when
+  s0 ≤ 0 (already touching), dt when there's no root (it can't arrive this step).
+- **Velocity:** v_imp = v0 + a t_c, v_out = −e v_imp, τ = dt − t_c. The restitution pass's target
+  becomes v_end = v_out + a τ (today: −e × the mid-step approach). The pass is otherwise as today:
+  only contacts that carried load, accumulated impulse ≥ 0.
+- **Position:** the gap at the end should be s_end = max(0, v_out τ + ½ a τ²). The body's
+  integration gives s0 + v_end dt. The difference goes in as a pseudo-velocity along the normal
+  (as Bullet's split impulse): target u = (s_end − s0) / dt − v_end, solved with the contact's
+  normal effective mass on per-body pseudo-velocities (linear and angular), a few Gauss-Seidel
+  sweeps over the bounced contacts, unclamped. Only when s0 > 0: a contact already penetrating
+  is the position projection's job.
+  - The integration adds the pseudo-velocity to the pose (x += (v + u_lin) dt, and a turn by
+    u_ang dt) and discards it. It never enters the stored velocity, the warm start, the carried
+    state or the hash, and since `predicted_poses` are taken after it, the XPBD velocity update
+    doesn't turn it into velocity.
+  - In the worked case u = −4.65 m/s: the ball ends the step at 23 mm, moving up at 3.41 m/s.
+- **Scope: bodies in no joint.** A contact on a jointed body (the biped's feet, the arm's links)
+  keeps today's restitution exactly, so the biped and the arm stay bit-identical and URIEL's
+  numbers don't move. Extending it to jointed bodies needs the joint rows in the pseudo solve;
+  that waits until a workload needs it (the biped's rubber feet land slower than 1 m/s when
+  standing; a fall would be the case).
+- **Unchanged:** compliant (Hunt-Crossley) contacts; the 1 m/s threshold; which contacts bounce;
+  everything at rest (no contact approaching faster than 1 m/s gets a bias).
+
+**Revised after the RiftPhys Reviewer's review (2026-11-08: 2 high, 1 medium, 4 low):**
+- **H1, the pseudo solve freezes bodies held elsewhere.** u is always negative (it pulls the pair
+  together), so a box bouncing on a resting box would lift the lower box about 38 mm with no
+  velocity, off its own floor contact. A body is immovable in the pseudo solve (inverse mass and
+  inertia 0) when it has a contact outside the bounced set that carried load (normal, friction
+  or soft impulse), or any contact with a jointed body: the shock pass's freeze rule. Test: a box
+  dropped onto a resting box; the lower box moves < 1 mm across the bounce, and the total energy
+  doesn't rise.
+- **H2, free bodies in speculative range move ballistically.** `constrained` (step.rs) counts
+  every contact, speculative ones with zero impulse included, and the reach is 5 cm + |v| dt.
+  So a slow rebound flies its whole arc semi-implicitly and loses about ½ v_out dt at the apex.
+  In the Reviewer's 1-D model (an ideal impact step, range as in the code), the second bounce
+  comes out 17% low for the drone case and 23% low for 1 m with e 0.4. Fix: a body in no joint
+  whose contacts all ended the solve with zero impulse (normal, friction, patch, soft) uses the
+  ballistic average (step.rs:174). That brings every case in the model within 0.1%.
+  - **Guard (added in the build):** the average starts from last step's velocity, so with a host
+    impulse decelerating the body (a drone landing under thrust) it can approach faster than
+    the end velocity the speculative bound accepted. A body goes ballistic only if, for each of
+    its contacts, the gap at the step's start covers the averaged approach: s0 + v_avg·n dt ≥ 0.
+    Otherwise it stays semi-implicit, as today.
+  - Free bodies hovering within reach of the ground (drone takeoff and landing, a box tossed
+    near a table) change, and so do their golden hashes. Jointed bodies don't.
+- **L1, the motion model is the integrator's:** v0's linear part is `last_lin_vel` (as the
+  ballistic average), the angular part the start-of-step rate, and a = (velocity after this
+  step's forces and host impulses − v0) / dt. A host impulse is force over the step, as the
+  integrator treats it, so a drone landing under hover thrust gets the right impact speed.
+- **L2, the root:** t_c = 2 s0 / (−v0 + √(v0² − 2 a s0)): the smallest root for any sign of a
+  and v0, no division by a, s0 / (−v0) at a = 0. No real root, or a denominator ≤ 0, or t_c > dt:
+  t_c = dt.
+- **L3, binding with no root:** with a toward the contact, the contact can bind
+  (s0 + v_end dt < 0) though the exact path doesn't arrive within dt (by up to ½ |a| dt²). Then
+  t_c = dt: the body bounces at the step's end with s_end = 0. That's a bounce, not "no bounce".
+  The reverse (a root but no binding) needs a pointing away from the contact; such a contact
+  carries no load and keeps today's behaviour.
+- **L4, sweeps:** the restitution pass is one sequential sweep, so a box landing flat spins off
+  its first corner. Contacts on the time-of-impact path get 4 sweeps (the first as today, with
+  the accumulated clamp); the pseudo solve 8, and its residual is exposed for the tests
+  (`World::last_bounce_residual`). Jointed contacts keep the single sweep, bit for bit.
+- **v_end ≥ 0:** a bounce too weak to leave within the step (v_out τ + ½ a τ² < 0) ends at rest on
+  the contact, v_end = 0 and s_end = 0, instead of approaching again.
+- **Report (Q2):** the fidelity report says that contacts on jointed bodies still bounce the old
+  way at 60 Hz, including a free ball striking an arm link (the contact keeps today's path).
+- **Cube tosses (Q3):** re-measured, fitted and held out. The time of impact follows each contact
+  point in a straight line, ignoring rotation (a corner at 5 cm spinning 20 rad/s curves about
+  2.8 mm per 60 Hz step, the order of s0), so spin-heavy tosses are reported separately if they
+  move.
+
+**Build status (2026-11-08, uncommitted, single core):**
+- Built as revised, with three changes the build found:
+  - **Support rows, not a freeze** (the Reviewer's build review, 2 high: freezing a body held
+    elsewhere made it immovable in every direction, so a ball striking a resting crate from the
+    side gave it no share of the bounce, and a slow loaded corner of the same box suppressed its
+    fast corner's bounce). Before W6, a box dropped on a box resting on the floor barely bounced
+    (0.7 m/s at 60 Hz, 0.1 m/s at 240 Hz, against e v = 1.8): the restitution pass has no floor
+    row, so the bounce drove the lower box 5 mm into the floor, and the projection then popped
+    it 4.6–5.8 mm above rest. Now:
+    - **restitution:** the bounced bodies' other loaded rigid contacts join the 16 sweeps as
+      push-only rows (fresh accumulator ≥ 0, no more approach than before the sweeps), along
+      their own normals;
+    - **pseudo solve:** they join as rows holding their gap (pseudo approach rate 0, both ways;
+      a push-only row can't stop the pull lifting a resting box off the floor). Mutation check:
+      without them the lower box lifts 15.6 mm;
+    - **the whole pile** (the Reviewer's rework review): the involved bodies grow to a fixed
+      point through rigid loaded contacts, stopping at static, sleeping and jointed bodies, so a
+      box bouncing on a two-box stack is held up by the floor under the bottom box, not just by
+      the box below it. Compliant contacts are supports in neither pass (their Hunt-Crossley
+      force answers on later steps);
+    - jointed bodies are immovable in both (their joint rows aren't there);
+    - **solved directly, not swept** (see "Solver" below): up to 512 rows, the velocity pass is
+      an interior-point solve and the pseudo pass one least-squares solve; above that, both
+      sweep alternately to 1e-6 x (1 + |target|) m/s, at most 256 sweeps;
+    - **the support target** is the main solve's own, min(depth_bias, 0): no approach beyond the
+      gap. Holding only the approach the 8 main iterations left let a struck stack keep sinking
+      (8 mm), and the projection popped it back;
+    - **test:** a box dropped 1 m onto a two-box stack. Across the bounce the lower boxes move
+      under 0.04 mm and the top box rebounds to e² h within 0.15%; with support stopping one box
+      down (mutation) the middle box moves 8.9 mm and the rebound is 0.065 m. When the top box
+      lands for good, the stack settles into its contact slop under the extra weight, to about
+      where b1ebad0 puts it (b1ebad0 sinks it 10 mm at the first impact instead). New with W6:
+      the top box rattles while the stack settles (jolts above 0.02 m/s: 5, 11, 14 in seconds
+      1–4, none after), where b1ebad0 is still by 1 s. **Traced** (`w6_stack3_probe`, per step
+      1.4–7 s), under the Reviewer's rule: no W6 branch fires while it rattles (no bounce,
+      support or pseudo rows, no ballistic step, every contact loaded) and no contact approaches
+      faster than 0.36 m/s, so it is the aftermath of a legitimate bounce, accepted. Test
+      `a_struck_three_stack_is_still_by_5_s`: from 5 s to 6 s the stack moves 3e-9 m (60 Hz) and
+      7e-11 m (240 Hz). With unconverged sweeps (the 64-solve cap hit, below) it still rattled at
+      5 s. The stack rests about 5 mm deep per contact after the hard landing, as at b1ebad0
+      (C at 0.0951): an at-rest item, not W6's;
+    - the gap rows can contradict each other (a ball bouncing off one wall while loaded against
+      the opposite one, both normals along the pull): Gauss-Seidel then doesn't converge, and
+      `World::last_bounce_residual` reports it. An unconverged residual means the bounce lands
+      slightly short of its exact position; the velocities are unaffected. The tests assert
+      < 1e-4 m/s;
+    - friction stays out of the restitution sweeps, as before W6: a box struck from the side
+      leaves at its full share before floor friction acts in that step;
+    - **impact model:** a side resting on something other than its partner in the impact is
+      struck from its start velocity with its forces balanced (a box on the floor is met at g by
+      a box falling onto it, and is still when struck from the side).
+    - The upper box rebounds to e² h and the lower box doesn't move; a side hit splits as the
+      1-D closed form (ball 0.3000, box 2.7000 m/s at v 3, e 0.8; momentum to 4 digits); a fast
+      corner beside a slow loaded pivot leaves at 0.97–1.00 e v.
+  - **H2 narrowed.** All-ballistic flight within reach made the 45° yawed stack of
+    `yawed_stacks_stand` rock for about 3 s after landing from its 1 cm gap. The last step before
+    arriving (a contact the end velocity reaches within two steps) stays semi-implicit.
+  - **v_end ≥ 0 and s_end clamped**, as revised.
+- **Results:** every `restitution_toi_test` case passes (12). First apexes within 0.7% at 60 Hz
+  (rubber from 1 m −0.15%, was +13.0%) and 0.03% at 240 Hz; second apexes within 3%; the drone
+  −0.13%, no spin, pseudo residual 0; the tilted drone gains no energy; the zero-g head-on matches
+  the closed form to 4 digits, gap included. Jointed scenes bit-identical
+  (`w6_bits_probe.rs`, `joint_bits_probe.rs`). H1 mutation-checked: without the pseudo freeze
+  the lower box lifts 18 mm and the test fails.
+- **Open: the 45° yawed stack's landing is fragile, before W6 too.** Dropped from gaps of 0 to
+  2 cm (`w6_bits_probe.rs`, `w6_yawed_gap_sweep`), b1ebad0 rocks after 0.8, 1.2 and 2 cm (up to
+  7.2 mm moved, cold contacts while rocking) and holds after 0, 0.4, 1.0 and 1.6 cm; the test's
+  1 cm was a good draw. With W6 it rocks after 0.4, 0.8, 1.0 and 2 cm and holds after 1.2 and
+  1.6 cm. Once still, it stays still (1e-8 m over 50 s). Decided with the Reviewer:
+  `yawed_stacks_stand` starts touching, and the landing is AT_REST_SPEC R3b, gated by the sweep.
+- **First regression (suites_w6, swept build):**
+  - fidelity: rubber restitution at 60 Hz +13.03% (fail) → −0.15%; at 240 Hz +3.53% → +0.01%;
+    one case outside tolerance, was two;
+  - seams (line, ring) bit-identical; biped push sweep unchanged;
+  - cube tosses, held out, fitted: 21.0 → 15.8 (measured params 25.6 → 26.3); 570 tosses 1.6 →
+    2.6 s, the fit 100 → 306 s (the sweeps);
+  - **one failure: `stacks_stand_kept_awake`, the 10-box stack at 60 Hz moved 24.2 mm after the
+    settle second (gate 10 mm; b1ebad0 6.0 mm).**
+- **Solver (2026-11-08, after that regression).** The 10-box stack collapses through its 1 cm
+  gaps and the top box arrives at 1.48 m/s, a legitimate bounce. Its bounce pass, 39 rows, hit
+  the 256-sweep cap; with the cap lifted it converged after 2,301 sweeps and the stack moved
+  4.05 mm. Even a two-box stack needed 116–175 sweeps. Support runs down a pile as a chain, and
+  a tall stack's rocking modes are weak: Gauss-Seidel is the wrong tool. Tried in order:
+  - a plain direct solve: corners of a face give K = J M⁻¹ Jᵀ a null space (4 rows, 3
+    freedoms), so a regularised factorisation turns slightly inconsistent targets into huge
+    opposing impulses that cancel exactly but not in f32 (a pile thrown at 100 m/s). Every solve
+    is now ridge least squares, (K² + εI) x = K r, ε 1e-14 of the largest diagonal: exact when
+    rows agree, the smallest impulses when they can't;
+  - active set with one-row pivots, then block principal pivoting: they cycle (pivoting is
+    guaranteed only for positive definite K);
+  - primal active set, then projected Newton: monotone, but one bound per step, or a zigzag on
+    the pile (error 4 → 0.04 m/s in 60 solves);
+  - **built: primal-dual interior point with Mehrotra's predictor-corrector** (`bounce_qp`,
+    `world/bounce_lcp.rs`): the rows are a monotone LCP (total impulse y = acc0 + x ≥ 0, velocity
+    error w = K y + q ≥ 0, y·w = 0). Final form below;
+  - the 10-box stack moves 4.05 mm at 60 Hz (gate 10 mm, b1ebad0 6.0) and 0.07 mm at 240 Hz; the
+    at-rest suite passes (11/11).
+- **The Reviewer's reviews (2026-11-08), and the solver as it lands:**
+  - **components:** the rows split into connected components (union-find over the bodies that
+    move; an immovable side links nothing), each solved alone in a fixed order, in both passes.
+    Two unrelated bounces don't share one system, its size, or its solve count;
+  - **sparse:** K is held sparse (rows couple only through a shared body) and factored by a
+    left-looking Cholesky in a minimum-degree order computed from the row graph alone, lowest
+    index on ties (an ordered set keyed by degree, then index). Fill is small: L holds 17–28
+    entries per row below the diagonal against 24–29 in K, from 122 to 742 rows (66 bricks:
+    K 25.9, L 24.4 per row). A dense factor is kept as the test reference;
+  - **compliance, not a floor:** the solve uses K + diag(1e-12 K_ii) (constraint force mixing),
+    positive definite, so the solution and every Newton step are unique. Tried first and dropped:
+    a floor on w/y (1e-10 of the largest, then per row) with iterative refinement against the
+    unfloored matrix. Refinement against a singular K + D builds up null-space components (a
+    1000:1 case fell back), and refining only where the floor binds missed rows just above it.
+    1e-9 compliance was too much at 1000:1 (the light box's rows reach K_ii × impulse = 1e4 m/s,
+    leaving 1e-5 m/s); 1e-12 leaves 1e-8;
+  - **the stopping test** judges, against the unregularised K, that each row meets its target or
+    carries no impulse and none approaches beyond it, to 1e-7 m/s (an f32 velocity's floor).
+    An absolute 1e-8 on the regularised residual had stalled at f64 rounding at 1000:1 while y
+    drifted along K's null space (51 solves instead of 8);
+  - **K symmetrised:** each body's world inverse inertia is symmetrised in f64 when the rows are
+    built. R I⁻¹ Rᵀ in f32 is symmetric only to about 1e-7, K came out unsymmetric, and
+    Cholesky (which reads one triangle) solved a slightly different matrix: backward error 4e-10
+    on a 5-row system, now 1e-16;
+  - **the start** is scaled per row (y0 = eta / K_ii, w0 = eta). A Mehrotra-style start (a damped
+    solve, shifted positive and centred) took the 1000:1 case from 18 to 8–9 solves and the side
+    hit from 20 to 18, but not the piles (25–26 either way): W6c;
+  - **checks (`the_sparse_factor_is_right`, restitution_toi 15/15):**
+    (i) the first Newton system of each velocity solve, sparse against dense: 8e-16 to 9e-16 on
+    the pile, 1e-16 on the stack (gate 1e-12);
+    (ii') every solve's normwise backward error, infinity norms: at most 7.9e-17 on the pile,
+    1.1e-16 on the stack, 2.4e-16 at 1000:1 (gate 1e-12);
+    (iii) the outcome: no fallback, and the pile, stack and rebound gates;
+    true residual on pushing rows against the unregularised K: at most 9.6e-8 m/s (the stopping
+    tolerance), gate 1e-7.
+    Per-row sparse/dense agreement at 1e-9, asked for first, can't be had: near convergence w/y
+    spans 1e-30 to 1e30, and two backward-stable factorisations differ by cond × 1e-16;
+  - **the fallback, visible and tested:** `BounceStats` counts components and fallbacks;
+    process-wide `solver::bounce_fallbacks_total()` and `bounce_largest_component()` (diagnostics
+    outside the hash and rollback) are printed by `riftphys-fidelity`, `riftphys-cube-toss` and
+    `riftphys-uriel-seam --eval`, expected 0. `the_sweeping_fallback_stays_sane` forces it with
+    a direct limit of 8 rows (`World::set_bounce_direct_max`, tests only, not in `CarriedState`
+    or the hash): finite, no energy gained, residual ≤ 2.4e-6 m/s;
+  - **no `powi`** in the solve (its precision is unspecified, and the hash depends on it); no
+    process-environment knob anywhere in the solve.
+- **Cost** (`w6_cost_probe`: a box dropped 1 m onto brick pyramids; release, single core; the
+  bounce passes' own wall time, `BounceStats::pass_us`):
+
+  | rows (pyramid base) | dense factor (first build), bounce step | final sparse build, passes (min–median, two runs) | solves | L per row |
+  |---|---|---|---|---|
+  | 115–122 (5) | 5.3 ms | 1.6 ms | 22 | 15.4 |
+  | 155–171 (6) | 14–19 ms | 2.6–2.8 ms | 27 | 16.9 |
+  | 219–228 (7) | 42–49 ms | 4.0–4.2 ms | 27 | 19.2 |
+  | 270–293 (8) | 73–82 ms | 5.5–5.9 ms | 25 | 21.1 |
+  | 319–365 (9) | 117–134 ms | 7.5–7.9 ms | 25 | 23.2 |
+  | 374–412 (10) | 169–195 ms | 8.0–8.8 ms | 24 | 22.4 |
+  | 498 (11) | 447 ms | 11.7–12.7 ms | 25 | 24.4 |
+  | 595 (12) | — | 15.2–16.3 ms | 25 | 26.0 |
+  | 662 (13) | — | 17.3–18.4 ms | 26 | 26.2 |
+  | 742 (14) | — | 21.2–22.8 ms | 27 | 27.6 |
+
+  Final build timed 2026-11-09 on a quiet machine (CPU load 4–9%), release, single core, the
+  probe forcing the direct solve at every size; no fallbacks. **The 20-box pile** (`w6_pile_timing`,
+  the slowest bounce step of each of five runs): 3.3–3.9 ms at 60 Hz, 3.2–3.7 ms at 240 Hz.
+  **Landing gate (the Reviewer), met:** the pile at most 5 ms, and **`DIRECT_MAX` = 250**, the
+  5 ms point (between 220 rows at 4.0–4.2 ms and 279 at 5.5–5.9). Cost grows about as rows^1.4.
+  **A component above `DIRECT_MAX` falls back to Gauss-Seidel sweeping, which may not converge**
+  (2,301 sweeps on 39 rows; the path by which the 10-box stack moved 24 mm). Each fallback is
+  counted in `BounceStats::fallbacks` and `bounce_fallbacks_total()`. suites_w6final's largest
+  component was 4 rows, so its results stand. The 2 ms target is W6c.
+- **W6c (follow-up): the bounce passes under 2 ms on the 20-box pile,** whose real purpose is
+  raising `DIRECT_MAX`: the case to aim for is the largest probe component, 742 rows (the
+  105-brick pyramid; the 66-brick one is 498 rows), now 21–23 ms, within 5 ms, so large piles never reach the sweep. One ordering shared by
+  both passes where their rows coincide; buffers reused across iterations; fewer iterations
+  (25–27 on piles; the Mehrotra-style start above didn't cut them there). A bounce pass runs only
+  on a step where something approaches faster than 1 m/s, so its cost is a one-off.
+- **The 20-box pile** (the Reviewer's convergence test: a 6-5-4-3-2 brick pyramid, a box dropped
+  1 m onto its top): it moves 0.34 mm across the bounce at 60 Hz and 0.045 mm at 240 Hz. b1ebad0
+  moved it 13 mm and 6.8 mm, and didn't bounce the box (apex 1.086 m, rest 1.1). The Reviewer's
+  bound was 0.1 mm. The remainder isn't the bounce passes: Gauss-Seidel, the active set and the
+  interior point all give 0.34 mm, the exact answer of these rows. On the impact step the main
+  solve (8 iterations) leaves brick pairs separating at up to 1.4 cm/s and sideways friction
+  residue, and push-only support rows with fresh accumulators can't take a push back. Letting
+  the support rows continue the main solve's accumulator (only the total ≥ 0) gives 0.27 mm:
+  not enough to justify leaving the reviewed design. **Decided with the Reviewer:** the gate is
+  1 mm at 60 Hz and 0.2 mm at 240 Hz, and the main solve's impact handling is W6b (3.6b); W6 can
+  land before it.
+- **Final regression (suites_w6final, 2026-11-08, the final solver, `DIRECT_MAX` 512; single
+  core, `--no-fail-fast`):**
+  - workspace: 178 passed, 0 failed, 44 ignored (suites_w6 had stopped at its one failure);
+  - **bounce fallbacks to sweeping: 0** in every suite; the largest bounce component was 4 rows
+    (cube tosses), 1 (fidelity), 0 (seams), so these results hold for any `DIRECT_MAX` ≥ 4;
+  - fidelity: rubber restitution −0.15% at 60 Hz, −0.01% at 240 Hz; one case outside tolerance,
+    the large swing (energy 0.9748 after 10 s, tolerance 0.02), owned by JOINT_CONDITIONING R5;
+  - seams (line, ring), biped push sweep, cube tosses (measured params 26.4, fitted held out
+    15.8): identical to suites_w6; 570 tosses in 1.0 s;
+  - jointed scenes bit-identical to b1ebad0: 60 Hz d60114b0bb454180, 240 Hz a9ae3e4bacb3c45d;
+  - **golden hashes** (`w6_scene_hashes`, the step hash's first 8 bytes):
+
+    | scene | 60 Hz | 240 Hz |
+    |---|---|---|
+    | 20-box pile, 1 s after the drop | b6be817421a5936a | 1a15ce00411301fa |
+    | box on a two-box stack, 3 s | 56a889bb6e73d42c | 90eac03965c85039 |
+    | drone-like box flat from 2 m, 3 s | 75f5412b43fa9cc0 | a88414ba7682a6ed |
+
+**Tests (`restitution_toi_test.rs`):**
+- the fidelity bounce, rubber on rubber: apex within 1% of e² h at 60 and 240 Hz (gate 2%);
+- drops from 0.3, 1 and 3 m with e 0.4 and 0.8: apex within 2% at 60 Hz, the second bounce's apex
+  within 3% of e⁴ h;
+- **the drone** (`drone.rs`'s aluminium box on its concrete ground, pair e 0.40) dropped flat from
+  2 m at 60 Hz: rebounds to e² h within 3%; dropped tilted 20°, landing on an edge: no energy
+  gained (kinetic plus potential after the bounce ≤ before);
+- a box landing flat (4 contacts): all four bounce together, no spin picked up (|ω| < 1e-3);
+- two free bodies colliding head-on in zero gravity (a = 0): the exchange matches the
+  1-D closed form for e within 1%, at 60 Hz;
+- jointed bodies are bit-identical: a hinged pendulum striking the floor faster than 1 m/s gives
+  the same pose and velocity bits before and after (as `joint_bits_probe.rs`);
+- a rollback across a bounce replays hash for hash;
+- a box dropped 1 m onto a 20-box pile: the passes converge directly (no fallback, ≤ 64 solves),
+  the pile moves under 1 mm at 60 Hz and 0.2 mm at 240 Hz across the bounce, residual
+  < 1e-4 m/s;
+- a box dropped onto a two-box stack: no bounce, support or pseudo row runs on a step without a
+  contact approaching faster than 1 m/s (the Reviewer's rule), and the stack is still from 10 s
+  on (the rattle's length swings from 4 s to 7 s with sub-micron changes; AT_REST_SPEC R5);
+- the fallback forced (a direct limit of 8 rows): finite, no energy gained, bounded residual;
+- a 1000:1 mass ratio, both ways: converges in under 64 solves, no fallback, no energy gained;
+- the at-rest suite passes unchanged.
+
+**Regression:** fidelity at 60 and 240 Hz (restitution should now pass at 60 Hz: 19/20 or 20/20,
+the large swing being the other); the cube tosses, which bounce at e 0.125 and change (report
+measured and fitted, held out); seams and the biped, expected bit-identical. Golden step hashes
+change for scenes with bouncing free bodies.
+
+**Estimate:** half a day, plus the cube-toss re-measure.
+
+### 3.6b W6b: the main solve on impact steps (open; found 2026-11-08 building W6)
+
+- **Found:** a box dropped 1 m onto a 20-box brick pyramid (`restitution_toi_test.rs`,
+  `a_bounce_on_a_20_box_pile_converges`; `w6_bits_probe.rs`, `w6_pile_probe`). W6's bounce
+  passes solve exactly, yet the pile moves 0.34 mm across the bounce at 60 Hz and 0.045 mm at
+  240 Hz (gates 1 mm and 0.2 mm). b1ebad0 moved it 13 mm and 6.8 mm.
+- **The cause is the main solve's, on the impact step:** its 8 iterations leave brick pairs
+  separating at up to 1.4 cm/s, and sideways friction residue; box 19, beside the struck box,
+  is lifted 0.27 mm. W6's push-only support rows (fresh accumulators) can't take a push back.
+  Gauss-Seidel, an active set and the interior point all give the same 0.34 mm.
+- **Tried:** support rows continuing the main solve's accumulator (only the total ≥ 0): 0.27 mm.
+  Not taken; it leaves the reviewed design for little.
+- **To do:** the main solve's handling of a hard impact on a pile (more iterations on impact
+  steps, or friction in an exact solve of the struck component), gated by the pile test's bound
+  back at 0.1 mm.
 
 ### 3.7 Results: W1 and W2 (built 2026-11-06)
 
@@ -391,17 +731,55 @@ included:
   needs W4's Cassie model, so it goes with W4.
 - The arm keeps its isotropic armature (decision D6).
 
-**What's left for parity** needs data: W3 (double pendulum) and W4 (Cassie) wait on the
-downloads (D5), and the definition waits on the Designer's sign-off (D1–D4).
+**What's left for parity:** W6 first (D3), then W3 (double pendulum) and W4 (Cassie), which wait
+on the downloads (D5); D4 is still open.
+
+### 3.9 D6 split: the arm's axis armature, as an option (drafted 2026-11-08)
+
+**Decided (D6): keep today's arm as the default and add the axis armature beside it.** URIEL
+trains on the default without anything changing, and can switch when it's ready.
+
+- **`ArmConfig` gets `armature: ArmArmature`**, `Isotropic` (default: today's arm, bit-identical)
+  or `Axis`.
+- **`Axis`:**
+  - the reflected inertia ARMATURE[j] moves to joint j's W4b rotor row,
+    `set_d6_armature(joint, 0, ARMATURE[j])` (the arm's hinges are about joint-frame x);
+  - the child link keeps today's inertia crosswise to the joint axis:
+    `inertia += ARMATURE[j] (I − u uᵀ)`, with u the axis in the child's frame (fb.rot × x).
+    `arm.rs:230` records why: armature about the joint axis alone left the light wrist links
+    nearly massless crosswise, and wrist torques leaked into the neighbouring joints. So the
+    crosswise inertia, and the conditioning, stay as they are;
+  - the joint's total inertia about its axis is unchanged too. What changes is what that inertia
+    resists: today it resists the child's absolute rotation about the axis (a parent joint's
+    motion drags it); on the rotor row it resists the joint's relative rotation, which is how a
+    geared motor behaves.
+- **Teacher, observations and actions are unchanged;** nothing else in `riftphys-uriel` reads
+  `ARMATURE`.
+- **Tests (`arm.rs` tests):**
+  - the default arm's step hashes over 2 s of a scripted torque profile are the same before and
+    after (recorded by a probe before the change);
+  - with the parent link held, a torque on joint j accelerates it at the same rate in both modes,
+    within 1% (same inertia about the axis);
+  - zero gravity, joint 1 driven, joint 2 free (both about z; joint 0 is about y, so it can't
+    show this): joint 2's relative drift orders as the models predict,
+    |Axis| < |no armature| < |Isotropic| (the Reviewer's replacement for a "within 1e-3 rad"
+    test, which can't pass: the child's own inertia still resists absolute rotation);
+  - `Axis` mode: a 10 s seam rollout runs, finite, and its tracking is reported beside the
+    default's;
+  - a rollback in `Axis` mode replays hash for hash (the rotors are carried state).
+- **Order:** after W6.
 
 ## 4. Order and reporting
 
 **Order:**
 1. W2.
 2. W1, then the biped re-check.
-3. W3a, then W3. This gives arm parity: report to URIEL with the commits.
-4. W4b, W4a, W4. This gives biped parity: report to URIEL with the commits.
-5. W5 and W6 only if triggered.
+3. W6 (required by D3, 2026-11-08), then the D6 split (section 3.9).
+4. W3a, then W3. This gives arm parity: report to URIEL with the commits.
+5. W4b, W4a, W4. This gives biped parity: report to URIEL with the commits.
+6. W5 only if triggered.
+
+W1, W2, W3a and W4b are built. Drone parity needs W6 (P1 at 60 Hz, restitution included).
 
 **Each parity report:**
 - is a new section in `docs/PHYSICS_FIDELITY.md`;
@@ -412,16 +790,38 @@ downloads (D5), and the definition waits on the Designer's sign-off (D1–D4).
 
 ## 5. Decisions for the Designer
 
+**Answered 2026-11-08 (Designer), in short:** D1 per workload; D2 as proposed, aiming to beat
+the references; D3 W6 is required and goes first; D4 open (the Designer asked which Cassie this
+is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pending; D6 split
+(section 3.9).
+
 - **D1:** per-workload parity, so arm training resumes after P3 without waiting for P4. Or one
   bar for everything.
+  - **Decided 2026-11-08: per workload.**
 - **D2:** the comparison rule: no worse than the best reference engine by more than 2 SE.
   Alternatives: strictly better on means; or an absolute tolerance per metric.
+  - **Decided 2026-11-08: the 2 SE rule is the pass; beating the best reference is the aim.**
+    Each report says, per metric, whether RiftPhys beats, ties (within 2 SE) or trails it.
 - **D3:** the drone at 60 Hz. Is excluding restitution acceptable while drone scenes have no
   bouncing contact? If not, W6 becomes required.
+  - **Decided 2026-11-08: not acceptable, "if a drone falls it should bounce".** W6 is required
+    and comes first (section 3.6, section 4).
 - **D4:** P4 against Drake's 38.0 or MuJoCo's 30.0. The plan uses Drake: it's the engine with the
   closest contact model, and MuJoCo's soft constraints are tuned differently.
+  - **Open.** "Cassie" here is Agility Robotics' Cassie, the bipedal robot, in the DAIR Lab's
+    jumping-impact dataset (Acosta et al., "Validating Robotics Simulators on Real-World
+    Impacts", RA-L 2022), not the CASSI spectral-imaging benchmark. Proposed with D2's aim: pass
+    at Drake's 38.0, aim for MuJoCo's 30.0.
 - **D5:** downloads: the double pendulum (encoder data and CAD) and the Cassie dataset. Each needs
   the user's go-ahead with its size, given when asked.
+  - **Sizes (read from the hosts' file listings 2026-11-08, nothing downloaded):**
+    - double pendulum, Mendeley Data 7yd2ntbh3w v1 (CC BY 4.0): `Encoder_Data.zip` 1.63 MB,
+      `Double_Pendulum_CAD.zip` 23.4 MB; also listed and not planned: `Video_Tracking_Data.zip`
+      7.36 MB (tracked positions, a cross-check for the encoders) and three small scripts (61 KB);
+    - Cassie, github.com/DAIRLab/cassie_impact_dataset (BSD-3): 96 files, 1.32 MB (87 `.npy`
+      arrays, legends, a loader), not "under 1 MB" as section 3.4 says;
+    - Cassie's model, `cassie_v2.urdf` from github.com/DAIRLab/dairlib (BSD-3): 24 KB. Its
+      meshes (42 files, 3.1 MB) aren't needed: the feet are modelled as the paper's contacts.
 - **D6:** the F1 arm's armature. Today it is added isotropically to each child link's inertia
   (`arm.rs:230`). Once W4b exists, should the arm use the axis-only row (the physical model)?
   That changes the arm's dynamics and the teacher's behaviour, so argref would re-record. Or
@@ -429,3 +829,6 @@ downloads (D5), and the definition waits on the Designer's sign-off (D1–D4).
   rotor is stored, so they feel J_a only through the next step's catch-up: a step late, with
   some energy loss. The arm uses torques today, but a position-driven arm would see this.
   Cassie's actuated joints are torque-driven, so W4 isn't affected.
+  - **Decided 2026-11-08: split.** Keep today's arm as the default and add the axis armature
+    as an option, so URIEL can train on the current model without breaking what works now.
+    Design in section 3.9.

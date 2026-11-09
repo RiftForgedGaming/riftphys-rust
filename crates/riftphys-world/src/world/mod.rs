@@ -3,6 +3,7 @@ pub mod queries;
 pub mod ccd;
 pub mod contacts;
 pub mod solver;
+mod bounce_lcp;
 pub mod step;
 pub mod debug;
 pub mod harness;

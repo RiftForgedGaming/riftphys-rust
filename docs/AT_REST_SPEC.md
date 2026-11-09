@@ -450,6 +450,49 @@ Acceptance:
     (`push_recovery_20_holds`, gate 32, now prints its count). `standing_holds_still` passes. The feet are boxes on a box, so their contacts are clipped now.
 - Golden step hashes change (box contacts, and D2's hash).
 
+### R3b. The 45° stack's landing (found 2026-11-08, building PARITY_SPEC W6)
+
+- **Found:** `yawed_stacks_stand` dropped its boxes from 1 cm. W6's change to free flight within
+  reach of a contact moved that landing, and the 45° stack at 60 Hz then rocked for about 3 s
+  (6 mm) before resting with its middle box tilted 0.19°.
+- **It predates W6.** Sweeping the drop gap from 0 to 2 cm (`w6_bits_probe.rs`,
+  `w6_yawed_gap_sweep`; worst movement from 1 s to 21 s):
+  - at b1ebad0 the stack rocks after 0.8, 1.2 and 2 cm (up to 7.2 mm, cold contacts while it
+    rocks) and holds after 0, 0.4, 1.0 and 1.6 cm;
+  - with W6 it rocks after 0.4, 0.8, 1.0 and 2 cm and holds after 0, 1.2 and 1.6 cm;
+  - once still it stays still (1e-8 m over 50 s). The test's 1 cm was a good draw.
+- **While rocking,** the box-box contacts swap load between diagonal pairs from step to step
+  (0.6/0.6/0.2/0.2, then 0.2/0.2/0.6/0.6). The guess: the 4 points `reduce_to_4` keeps from the
+  clipped octagon alternate as the deepest point changes, so they start cold.
+- **Decided with the RiftPhys Reviewer:** `yawed_stacks_stand` now starts its boxes touching
+  (it still asserts every contact warm on every resting step). R3b is the landing:
+  - first log `reduce_to_4`'s kept indices over a rocking run, to confirm the alternation
+    rather than a solver rocking mode;
+  - then a first try: prefer last step's anchors when they're within a depth tolerance of the
+    deepest point;
+  - **gate:** the sweep, every gap from 0 to 2 cm, at 60 and 240 Hz, under 1e-4 m.
+
+### R5. Rest depth after a hard landing (open; found 2026-11-08, building PARITY_SPEC W6)
+
+- **Found:** a 2 kg aluminium box dropped from 1.5 m onto a two-box stack on concrete
+  (`w6_bits_probe.rs`, `w6_stack3_probe`). After the landing the stack rests about 5 mm deep per
+  contact and stays there: C (bottom) at 0.0950 for a rest height of 0.1000, B at 0.2900, A at
+  about 0.489–0.490.
+- **It predates W6.** b1ebad0 leaves the same scene at C 0.0951, B 0.2927, A 0.4925, still by
+  1 s and unchanged to 10 s. Boxes stacked gently rest within 1 mm (`boxes_rest_at_their_true_height`),
+  so it's the hard landing: the depth it drives in isn't recovered.
+- **With W6 the rest depth is about 1 cm, reached in jolts:** the top box settles about 1 cm into
+  the box below (A from about 0.499 to 0.489), in jolts above 0.02 m/s for some seconds after the
+  second landing, every contact loaded and no W6 branch firing. Both the depth and when the jolts
+  end vary between builds (still by 4 s in one, by 7 s in the next) with sub-micron differences in
+  the bounce. Accepted under the RiftPhys Reviewer's rule as aftermath; gated in
+  `restitution_toi_test.rs`, `a_struck_three_stack_rattles_only_as_aftermath` (still from 10 s).
+  That test also reports the largest rise in total energy from 1.4 s (not gated): 0.057 J at
+  60 Hz (about 3 mm of a 2 kg box), 0 at 240 Hz. A rise means the depth correction pushed out:
+  part of this item.
+- **To do:** find why the position pass leaves 5 mm (a slop, a cap on depenetration speed, or
+  the depth bias's target once the contact is warm), and gate the depth after a hard landing.
+
 ### R4. Tests
 
 - Gate `at_rest` and `stack_creep_variants` (R1's numbers) in a non-ignored test. Built:

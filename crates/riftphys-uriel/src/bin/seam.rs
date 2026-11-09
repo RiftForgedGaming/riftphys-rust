@@ -48,6 +48,7 @@ fn main() {
             println!("{} | teacher: {}", cfg.scenario(), summary(&teacher));
             println!("{} | floor:   {}", cfg.scenario(), summary(&floor));
         }
+        println!("W6 bounce fallbacks to sweeping: {}, largest component {} rows", riftphys_world::world::solver::bounce_fallbacks_total(), riftphys_world::world::solver::bounce_largest_component());
         return;
     }
 
