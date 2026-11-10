@@ -25,7 +25,7 @@ impl World {
         let mut best: Option<(f32, usize, Vec3)> = None;
         for (ci, c) in self.colliders.iter().enumerate() {
             if skip(c.body) { continue; }
-            let pose = self.bodies.pose(c.body.0);
+            let pose = c.world_pose(self.bodies.pose(c.body.0));
             if ray_aabb(origin, dir, &aabb_of(&c.shape, &pose), max_d).is_none() { continue; }
             if let Some((t, n)) = ray_shape(&c.shape, &pose, origin, dir, max_d) {
                 if best.map_or(true, |(bt, _, _)| t < bt) { best = Some((t, ci, n)); }
@@ -136,7 +136,7 @@ impl World {
                 if c.body == ig { continue; }
             }
 
-            let body_xf = self.bodies.pose(c.body.0);
+            let body_xf = c.world_pose(self.bodies.pose(c.body.0));
             if let Some(manifold) = riftphys_collision::narrowphase::collide_shapes(
                 &cap_shape, &cap_xf, &c.shape, &body_xf, 0.0
             ) {

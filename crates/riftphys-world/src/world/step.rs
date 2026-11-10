@@ -74,8 +74,8 @@ impl World {
         // 60 Hz step before any contact existed).
         let sweep: Vec<f32> = self.colliders.iter().map(|c| {
             let v = self.bodies.vel(c.body.0);
-            let reach = 0.5 * (c.aabb.max - c.aabb.min).length();
-            MELEE_CCD_MARGIN + (v.lin.length() + v.ang.length() * reach) * dt
+            // An offset collider reaches |local| + its half-diagonal from the COM (PARITY_SPEC W4d)
+            MELEE_CCD_MARGIN + (v.lin.length() + v.ang.length() * c.reach()) * dt
         }).collect();
         let swept: Vec<Aabb> = self.colliders.iter().zip(&sweep)
             .map(|(c, s)| Aabb { min: c.aabb.min - Vec3::splat(*s), max: c.aabb.max + Vec3::splat(*s) }).collect();
@@ -103,7 +103,7 @@ impl World {
             // Contact distance covers both bodies' motion this step; depths are reported with the
             // fixed margin only, so the solver reads true penetration as depth - MELEE_CCD_MARGIN
             let reach = sweep[i] + sweep[j] - MELEE_CCD_MARGIN;
-            if let Some(manifold) = collide_shapes(&ca.shape, &bodies.pose(ca.body.0), &cb.shape, &bodies.pose(cb.body.0), reach) {
+            if let Some(manifold) = collide_shapes(&ca.shape, &ca.world_pose(bodies.pose(ca.body.0)), &cb.shape, &cb.world_pose(bodies.pose(cb.body.0)), reach) {
                 for pt_idx in 0..manifold.len {
                     let pt = &manifold.points[pt_idx as usize];
                     local.push(Contact { a_collider: i, b_collider: j, point: pt.position, normal: pt.normal, depth: pt.penetration - reach + MELEE_CCD_MARGIN, env_material: None, impulse: 0.0 });
@@ -123,7 +123,7 @@ impl World {
             let mut env_buffer = Vec::new();
             for env in &self.environments { env.query_aabb(&c.aabb, &mut env_buffer); }
             for env_col in env_buffer {
-                if let Some(manifold) = collide_shapes(&c.shape, &bodies.pose(c.body.0), &env_col.shape, &env_col.transform, sweep[ci]) {
+                if let Some(manifold) = collide_shapes(&c.shape, &c.world_pose(bodies.pose(c.body.0)), &env_col.shape, &env_col.transform, sweep[ci]) {
                     for pt_idx in 0..manifold.len {
                         let pt = &manifold.points[pt_idx as usize];
                         local.push(Contact { a_collider: ci, b_collider: TERRAIN_CI, point: pt.position, normal: pt.normal, depth: pt.penetration - sweep[ci] + MELEE_CCD_MARGIN, env_material: Some(env_col.material), impulse: 0.0 });
@@ -589,7 +589,7 @@ impl World {
                     // Addressed warning: prefixed `ci` with an underscore
                     for (_ci, c) in self.colliders.iter().enumerate() {
                         if c.body != player.body && player_aabb.intersects(&c.aabb) {
-                            if let Some(m) = collide_shapes(&player_shape, &player_xf, &c.shape, &self.bodies.pose(c.body.0), 0.05) {
+                            if let Some(m) = collide_shapes(&player_shape, &player_xf, &c.shape, &c.world_pose(self.bodies.pose(c.body.0)), 0.05) {
                                 hit_normal = Some(m.points[0].normal);
                                 hit_penetration = m.points[0].penetration;
                                 hit_body = Some(c.body);

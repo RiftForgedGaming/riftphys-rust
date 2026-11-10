@@ -76,6 +76,28 @@ pub struct Collider {
     pub shape: Shape,
     pub aabb: Aabb,
     pub material: riftphys_materials::materials::Material,
+    /// The shape's pose in its body's frame (PARITY_SPEC W4d); `None` is the body's own pose.
+    pub local: Option<Isometry>,
+}
+
+impl Collider {
+    /// The shape's pose in the world, given its body's: every read of a collider's world pose
+    /// goes through here. With no offset it is `body` itself, bit for bit.
+    #[inline]
+    pub fn world_pose(&self, body: Isometry) -> Isometry {
+        match self.local {
+            None => body,
+            Some(l) => Isometry { pos: body.pos + body.rot * l.pos, rot: (body.rot * l.rot).normalize() },
+        }
+    }
+
+    /// How far the shape reaches from its body's COM, at most: its offset plus its own AABB's
+    /// half-diagonal (the swept broadphase turns this into |omega| x reach x dt).
+    #[inline]
+    pub fn reach(&self) -> f32 {
+        let half = 0.5 * (self.aabb.max - self.aabb.min).length();
+        match self.local { None => half, Some(l) => l.pos.length() + half }
+    }
 }
 
 /// One step's bounce passes (PARITY_SPEC W6), for tests and traces.
@@ -468,7 +490,7 @@ impl World {
         self.drop_warm_of(id.0);
         self.bodies.set_pose(id.0, pose);
         for c in &mut self.colliders {
-            if c.body == id { c.aabb = aabb_of(&c.shape, &pose); }
+            if c.body == id { c.aabb = aabb_of(&c.shape, &c.world_pose(pose)); }
         }
         // Armature rotors on this body's joints restart from the links (PARITY_SPEC W4b)
         let with_rotor: Vec<u32> = self.joints.kinds().iter().enumerate().filter_map(|(k, j)| match j {
@@ -577,7 +599,17 @@ impl World {
         let pose = self.bodies.pose(body.0);
         let aabb = aabb_of(&shape, &pose);
         let id = self.colliders.len() as u32;
-        self.colliders.push(Collider { body, shape, aabb, material });
+        self.colliders.push(Collider { body, shape, aabb, material, local: None });
+        ColliderId(id)
+    }
+
+    /// A collider posed at `local` in its body's frame (PARITY_SPEC W4d): a contact point off
+    /// the body's COM, such as a foot's toe. Like `add_collider` it never touches mass.
+    pub fn add_collider_at(&mut self, body: BodyId, local: Isometry, shape: Shape, material: riftphys_materials::materials::Material) -> ColliderId {
+        let id = self.colliders.len() as u32;
+        let mut c = Collider { body, shape, aabb: Aabb { min: Vec3::ZERO, max: Vec3::ZERO }, material, local: Some(local) };
+        c.aabb = aabb_of(&shape, &c.world_pose(self.bodies.pose(body.0)));
+        self.colliders.push(c);
         ColliderId(id)
     }
 
@@ -742,7 +774,7 @@ impl World {
 
     pub fn update_colliders_aabb(&mut self) {
         for collider in &mut self.colliders {
-            let pose = self.bodies.pose(collider.body.0);
+            let pose = collider.world_pose(self.bodies.pose(collider.body.0));
             collider.aabb = aabb_of(&collider.shape, &pose);
         }
     }
