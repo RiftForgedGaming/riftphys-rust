@@ -29,6 +29,13 @@ struct PosContact {
     pen0: f32,
 }
 
+/// The gyroscopic turn subdivides so that dt |dev(I^-1)| |L| stays below this per piece (it
+/// contracts below about 1), at most `TURN_MAX_SPLIT` pieces (PARITY_SPEC 3.9).
+const TURN_GAIN: f32 = 0.5;
+const TURN_MAX_SPLIT: usize = 256;
+/// Below this sine of the angle between L and w, a spin counts as principal to roundoff.
+const TURN_PRINCIPAL: f32 = 1.0e-5;
+
 impl World {
     pub fn step(&mut self, dt: Scalar) -> StepStats {
         self.schedule.clear();
@@ -220,23 +227,44 @@ impl World {
                 let l = self.bodies.inv_inertia_world(i);
                 let det = l.determinant();
                 let momentum = (det.is_finite() && det.abs() > 1e-20).then(|| l.inverse().mul_vec3(vel.ang));
-                let turn = |q: Quat, w: Vec3| -> Quat {
+                let turn = |q: Quat, w: Vec3, h: f32| -> Quat {
                     if w.length_squared() <= 1e-18 { return q; }
-                    (Quat::from_axis_angle(w.normalize(), w.length() * dt) * q).normalize()
+                    (Quat::from_axis_angle(w.normalize(), w.length() * h) * q).normalize()
                 };
                 let start = pose.rot;
-                pose.rot = turn(start, vel.ang);
+                pose.rot = turn(start, vel.ang, dt);
                 if let Some(m) = momentum {
                     let inv_local = self.bodies.inv_inertia_local_of(i);
                     let w_at = |q: Quat| { let r = riftphys_core::Mat3::from_quat(q); (r * inv_local * r.transpose()).mul_vec3(m) };
-                    // Midpoint: turn by the average of the start and end rates (second order;
-                    // turning by the start rate alone drifted the energy 34% in 10 s at 60 Hz)
-                    let mut w_end = w_at(pose.rot);
-                    for _ in 0..2 {
-                        pose.rot = turn(start, (vel.ang + w_end) * 0.5);
-                        w_end = w_at(pose.rot);
+                    // Reading w = I(q)^-1 L back through the turned inertia only contracts while the
+                    // rate moves little in a step. On a thin link (a needle, its axial inertia far
+                    // below its crosswise) a turn error lands on the small axis, amplified by the
+                    // ratio, and joint rows feed it back every step. The turn is subdivided there.
+                    // The gain is dt |dev(I^-1)| |L|, with dev the deviator (I^-1 less its mean): zero
+                    // on an isotropic body. A spin about a principal axis to roundoff (a rod swinging
+                    // flat) has no gyroscopic torque and keeps n = 1; n = 1 is the undivided midpoint
+                    // below, bit for bit.
+                    let mean = (inv_local.x_axis.x + inv_local.y_axis.y + inv_local.z_axis.z) / 3.0;
+                    let dev = inv_local - riftphys_core::Mat3::from_diagonal(Vec3::splat(mean).into());
+                    let principal = m.cross(vel.ang).length() < TURN_PRINCIPAL * m.length() * vel.ang.length();
+                    let gain = if principal { 0.0 } else { dt * dev.x_axis.length().max(dev.y_axis.length()).max(dev.z_axis.length()) * m.length() };
+                    let n = ((gain / TURN_GAIN).ceil() as usize).clamp(1, TURN_MAX_SPLIT);
+                    let h = dt / n as f32;
+                    let (mut q, mut w) = (start, vel.ang);
+                    for _ in 0..n {
+                        let q0 = q;
+                        // Midpoint: turn by the average of the start and end rates (second order;
+                        // turning by the start rate alone drifted the energy 34% in 10 s at 60 Hz)
+                        q = turn(q0, w, h);
+                        let mut w_end = w_at(q);
+                        for _ in 0..2 {
+                            q = turn(q0, (w + w_end) * 0.5, h);
+                            w_end = w_at(q);
+                        }
+                        w = w_end;
                     }
-                    vel.ang = w_end;
+                    pose.rot = q;
+                    vel.ang = w;
                     self.bodies.set_vel(i, vel);
                 }
             }
