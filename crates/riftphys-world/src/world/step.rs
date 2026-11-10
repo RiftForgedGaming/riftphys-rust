@@ -294,7 +294,7 @@ impl World {
         let start_poses: Vec<Isometry> = if has_joints {
             (0..count).map(|i| if self.bodies.is_dynamic(i) && self.sleep.is_awake(i as usize) { original_poses[i as usize] } else { self.bodies.pose(i) }).collect()
         } else { Vec::new() };
-        if has_joints { self.joints.begin_step(); }
+        if has_joints { self.joints.begin_step(); self.rotor_targets(&start_poses, dt); }
         // Static and sleeping bodies: joints between two of them are not solved this step
         let frozen: Vec<bool> = if has_joints {
             (0..count).map(|i| !self.bodies.is_dynamic(i) || !self.sleep.is_awake(i as usize)).collect()
@@ -307,6 +307,7 @@ impl World {
             // Shock propagation, as in the velocity solve: bottom-up, lower body immovable
             self.project_contacts(&pos_contacts, &mut split, true);
         }
+        if has_joints { self.rotor_carry(dt); }
 
         // --- STAGE 6: Velocity update from position corrections ---
         // XPBD: what the joint solve moved a body (final pose - predicted pose) becomes velocity.

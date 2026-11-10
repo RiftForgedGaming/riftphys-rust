@@ -552,6 +552,14 @@ fn diagnose() -> Result<(), String> {
         ("contact k x10", Params { k: b.k * 10.0, ..b }),
         ("contact d 0", Params { d: 0.0, ..b }),
         ("80 iterations", Params { iters: (80, 80), ..b }),
+        ("no contact, (80, 6)", Params { toes: false, iters: (80, 6), ..b }),
+        ("no contact, (8, 12)", Params { toes: false, iters: (8, 12), ..b }),
+        ("no contact, (8, 24)", Params { toes: false, iters: (8, 24), ..b }),
+        ("no contact, (8, 48)", Params { toes: false, iters: (8, 48), ..b }),
+        ("(80, 6)", Params { iters: (80, 6), ..b }),
+        ("(8, 24)", Params { iters: (8, 24), ..b }),
+        ("(8, 48)", Params { iters: (8, 48), ..b }),
+        ("(80, 24)", Params { iters: (80, 24), ..b }),
         ("no contact, rotors on the links", Params { toes: false, armature_on_link: 0x3ff, ..b }),
         ("rotors on the links", Params { armature_on_link: 0x3ff, ..b }),
         ("no contact, rotors on the links, springs rigid", Params { toes: false, armature_on_link: 0x3ff, rigid_springs: true, ..b }),
@@ -633,7 +641,9 @@ fn cost() -> Result<(), String> {
     let sim: f64 = trajs.iter().map(|t| t.t[t.t.len() - 1] - t.t[0]).sum();
     for hz in [240.0, 480.0, 960.0, 2000.0] {
         let t0 = std::time::Instant::now();
-        for t in &trajs { cassie::replay(&urdf, t, &Params::default(), hz, cassie::Line::Main)?; }
+        let it = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let p = Params { iters: (it("CASSIE_ITERS", 8), it("CASSIE_ITERS_POS", 6)), ..Params::default() };
+        for t in &trajs { cassie::replay(&urdf, t, &p, hz, cassie::Line::Main)?; }
         println!("{:6} Hz: {:.1} ms per simulated second ({:.2} s simulated; includes the start solve and trial steps)", hz, t0.elapsed().as_secs_f64() / sim * 1e3, sim);
     }
     Ok(())
@@ -680,6 +690,106 @@ fn position_pass(hz: f64, steps: usize, on_links: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// W4f test (f)'s expected value (the Reviewer, 2026-11-10): at jump 0's start pose, the reduced-
+/// coordinate response to a unit generalised impulse on the left knee spring, with the floating
+/// base free and both achilles rods as rigid length constraints: the left knee motor's turn per
+/// unit of spring turn. With every rotor's J_a on its joint (what W4f's converged position pass
+/// should give) and with none (what today's position pass sees).
+fn split() -> Result<(), String> {
+    use std::collections::HashMap;
+    let urdf = cassie::load_urdf()?;
+    let p = Params { toes: false, ..Params::default() };
+    let t = cassie::load_traj(&cassie::data_dir(), 0)?;
+    let (lc, _) = cassie::start_row(&urdf, &t, &p)?;
+    let c = cassie::build(&urdf, &lc, &p, false)?;
+    let names = cassie::JOINTS;
+    let qmap = |dq: Option<(usize, f64)>| -> HashMap<String, f64> {
+        names.iter().enumerate().map(|(k, j)| (j.to_string(), lc[7 + k] + dq.map_or(0.0, |(i, e)| if i == k { e } else { 0.0 }))).collect()
+    };
+    // Body COM positions and orientations in the pelvis frame at q (+ a perturbation)
+    let poses = |dq: Option<(usize, f64)>| -> Vec<(DVec3, DQuat)> {
+        let f = urdf.link_frames(&qmap(dq));
+        c.model.bodies.iter().map(|b| { let fl = f[&b.link]; (fl.point(b.com), fl.rot) }).collect()
+    };
+    let rod = |dq: Option<(usize, f64)>, side: usize| -> f64 {
+        let f = urdf.link_frames(&qmap(dq));
+        let (s, z) = if side == 0 { ("left", cassie::ROD_ON_THIGH_Z) } else { ("right", -cassie::ROD_ON_THIGH_Z) };
+        (f[&format!("heel_spring_{}", s)].point(DVec3::from(cassie::ROD_ON_HEEL)) - f[&format!("thigh_{}", s)].point(DVec3::new(0.0, 0.0, z))).length()
+    };
+    let n = 6 + names.len();
+    let nb = c.model.bodies.len();
+    let base = poses(None);
+    // Jacobians: jv[b][k], jw[b][k]
+    let mut jv = vec![vec![DVec3::ZERO; n]; nb];
+    let mut jw = vec![vec![DVec3::ZERO; n]; nb];
+    for b in 0..nb {
+        for i in 0..3 {
+            let e = [DVec3::X, DVec3::Y, DVec3::Z][i];
+            jv[b][i] = e;
+            jv[b][3 + i] = e.cross(base[b].0);
+            jw[b][3 + i] = e;
+        }
+    }
+    let eps = 1e-6;
+    for k in 0..names.len() {
+        let (pp, pm) = (poses(Some((k, eps))), poses(Some((k, -eps))));
+        for b in 0..nb {
+            jv[b][6 + k] = (pp[b].0 - pm[b].0) / (2.0 * eps);
+            let dr = pp[b].1 * pm[b].1.conjugate();
+            let dr = if dr.w < 0.0 { -dr } else { dr };
+            jw[b][6 + k] = DVec3::new(dr.x, dr.y, dr.z) * 2.0 / (2.0 * eps);
+        }
+    }
+    let g: Vec<Vec<f64>> = (0..2).map(|s| {
+        let mut row = vec![0.0; n];
+        for k in 0..names.len() { row[6 + k] = (rod(Some((k, eps)), s) - rod(Some((k, -eps)), s)) / (2.0 * eps); }
+        row
+    }).collect();
+    let solve = |a: &Vec<Vec<f64>>, rhs: &Vec<f64>| -> Vec<f64> {
+        let m = rhs.len();
+        let mut a: Vec<Vec<f64>> = a.iter().zip(rhs).map(|(r, &y)| { let mut r = r.clone(); r.push(y); r }).collect();
+        for col in 0..m {
+            let piv = (col..m).max_by(|&x, &y| a[x][col].abs().partial_cmp(&a[y][col].abs()).unwrap()).unwrap();
+            a.swap(col, piv);
+            for r in 0..m { if r != col { let f = a[r][col] / a[col][col]; for cc in col..=m { a[r][cc] -= f * a[col][cc]; } } }
+        }
+        (0..m).map(|r| a[r][m] / a[r][r]).collect()
+    };
+    let col = |name: &str| 6 + names.iter().position(|j| *j == name).unwrap();
+    for with_rotors in [false, true] {
+        let mut mm = vec![vec![0.0; n]; n];
+        for b in 0..nb {
+            let body = &c.model.bodies[b];
+            let r = glam::DMat3::from_quat(base[b].1);
+            let iw = r * body.inertia * r.transpose();
+            for i in 0..n { for k in 0..n {
+                mm[i][k] += body.mass * jv[b][i].dot(jv[b][k]) + jw[b][i].dot(iw * jw[b][k]);
+            } }
+        }
+        if with_rotors {
+            for (a, name) in cassie::ACTUATORS.iter().enumerate() {
+                let i = col(name);
+                mm[i][i] += cassie::ROTOR_INERTIA[a] * cassie::GEAR_RATIO[a] * cassie::GEAR_RATIO[a];
+            }
+        }
+        // Constrained response to a unit generalised impulse e on the spring coordinate:
+        // dq = M^-1 e - M^-1 G^T (G M^-1 G^T)^-1 G M^-1 e
+        let mut e = vec![0.0; n];
+        e[col("knee_joint_left")] = 1.0;
+        let minv_e = solve(&mm, &e);
+        let minv_gt: Vec<Vec<f64>> = g.iter().map(|gr| solve(&mm, gr)).collect();
+        let s = [[0, 1].map(|j| g[0].iter().zip(&minv_gt[j]).map(|(x, y)| x * y).sum::<f64>()), [0, 1].map(|j| g[1].iter().zip(&minv_gt[j]).map(|(x, y)| x * y).sum::<f64>())];
+        let ge: [f64; 2] = [0, 1].map(|r| g[r].iter().zip(&minv_e).map(|(x, y)| x * y).sum());
+        let det = s[0][0] * s[1][1] - s[0][1] * s[1][0];
+        let mu = [(s[1][1] * ge[0] - s[0][1] * ge[1]) / det, (-s[1][0] * ge[0] + s[0][0] * ge[1]) / det];
+        let dq: Vec<f64> = (0..n).map(|i| minv_e[i] - mu[0] * minv_gt[0][i] - mu[1] * minv_gt[1][i]).collect();
+        let ratio = dq[col("knee_left")] / dq[col("knee_joint_left")];
+        println!("{}: knee motor turn per unit knee spring turn {:+.4}; for today's step-1 spring correction +0.057: motor {:+.4} rad (measured today -0.052)",
+                 if with_rotors { "rotors in the position pass (W4f)" } else { "no rotors (today's position pass)" }, ratio, 0.057 * ratio);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -690,6 +800,7 @@ fn main() {
         Some("--diagnose") => diagnose(),
         Some("--diag-inputs") => diag_inputs(),
         Some("--cost") => cost(),
+        Some("--split") => split(),
         Some("--position-pass") => position_pass(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(4), args.get(4).map(String::as_str) == Some("links")),
         Some("--trace-knee") => trace_knee(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0)),
         Some("--rigid-check") => match (args.get(2), args.get(3)) { (Some(f), Some(o)) => rigid_check(f, o), _ => Err("usage: --rigid-check fits.json out.json".into()) },

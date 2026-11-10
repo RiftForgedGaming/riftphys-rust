@@ -1235,7 +1235,8 @@ Designer's to choose: engine work at 240 Hz (diagnosis first, each candidate iso
 RiftPhys's own 2 kHz run, as in 3.4a), or the biped workload moving to a higher physics rate under
 its 240 Hz control (sub-steps), with P4 rerun at that rate under criteria set before the run.
 - **Decided 2026-11-10 (Designer: "Engine work at 240 Hz"):** the biped keeps its 240 Hz physics
-  rate; RiftPhys is to close the gap at 240 Hz. Diagnosis first, report-only, each candidate
+  rate; RiftPhys is to close the gap at 240 Hz. **Confirmed 2026-11-10** after the diagnosis (the
+  Designer, in the Reviewer's session: "Yes, engine work"). Diagnosis first, report-only, each candidate
   isolated against RiftPhys's own 2 kHz run from the same start with the same parameters. Any engine
   change goes to the Reviewer before it's built, and P4 is rerun afterwards exactly as stated in
   3.4a and 3.4e (the same folds, fit, pairing and D9 outcomes; 7c1037c's result stays on record).
@@ -1325,34 +1326,55 @@ is confirmed (the Designer) and this design is reviewed.
 - **Where:** `D6Axis` gets two transient fields, not carried state and not hashed:
   `rotor_target: Option<f32>` (θ_r*, set by the World before stage 5 for each armature axis of an
   awake joint; None outside a step, so `solve`/`solve_joints` projections have no rotor row) and
-  `rotor_lambda` (reset in `begin_step`). `solve_d6` runs the rotor row after the three rotational
-  rows, for each axis with armature > 0 and a target, whether or not the axis row is enabled (a
+  `rotor_lambda` (reset in `begin_step`). `solve_d6` runs the rotor row before the three rotational
+  rows (so a limit on the same axis has the last word, (h)), for each axis with armature > 0 and a target, whether or not the axis row is enabled (a
   hinge's free axis is disabled); on a hinge's own axis it measures the twist in radians, elsewhere
   the small-angle measure, as `d6_row_angle`. The World reads `rotor_lambda` after stage 5 and
   updates `rotor`.
-- **Limits and springs on the same axis:** the rows iterate together. A hard limit wins (α 0
-  against α̃ 1/J_a), so a joint driven into its stop stops its rotor in the same step. That is the
+- **Limits and springs on the same axis:** the rows iterate together, the limit last in each
+  sweep. A hard limit wins (α 0 against α̃ 1/J_a), so a joint driven into its stop stops its rotor in the same step. That is the
   rigid gear's physics, and it's an impact that dissipates the rotor's ½J_a ω² as it does the links'.
 - **Unchanged:** the velocity row (W4b); rows without armature; the isotropic arm (armature in the
   body inertia); the URIEL biped (armature on the links); `set_body_pose`/`set_body_vel` rotor rules.
 
+**Reviewed 2026-11-10: approved by the Reviewer with five changes, folded in below before any
+build** ((a) at (8, 6) as well, (f) from the analytic split, the miniature knee (g), the limit
+order (h), and (d) as an energy balance). **Route confirmed the same day:** the Designer, in the
+Reviewer's session, "Yes, engine work".
+
 **Tests (criteria set before building):**
 - **(a) The split, analytic:** a fixed body, a motor link on a hinge with armature J_a, and a load
   link on a sprung hinge (same axis) to it, no gravity. Start the spring deflected. After one step
-  with many position iterations, the position pass's turns satisfy Δθ_motor / Δθ_load =
-  −I_load / (I_motor + J_a) within 2%. Today the ratio is −I_load / I_motor.
+  with many position iterations (64), the position pass's turns satisfy Δθ_motor / Δθ_load =
+  −I_load / (I_motor + J_a) within 2%. Today the ratio is −I_load / I_motor. Also run at (8, 6)
+  and report how far it is from the analytic split (report-only: a convergence gap P4 carries).
+- **Limit and rotor on the same axis (h):** the rotor row runs before the axis's limit row in each
+  sweep, so a limit is the last word. A motor driven into its stop under a constant torque ends
+  each step at the stop within the limit's tolerance (1e-3 rad) at (8, 6).
 - **(b) The units:** the same rig at 60, 240 and 2000 Hz gives the same split (the α̃ = 1/J_a pin;
   stored as 1/J_a, the 240 Hz split would be near-rigid).
 - **(c) No-op when nothing else corrects:** a free hinge with armature under a constant torque,
   no other rows: |λ_pos| below 1e-6 N m s each step, and W4b's tests (τ/(I + J_a) within 1%,
   the pendulum period, energy, rollback, the impact momentum balance) pass unchanged.
-- **(d) Energy:** the (a) rig without spring damping keeps its energy, ½J_a ω_rotor² counted, over
-  10 s at 240 Hz at least as well as with the rotors on the links.
+- **(d) Energy balance:** the (a) rig, free of gravity, spring undamped, the base free (not fixed):
+  over 2 s with no torque, the total energy (the links', ½J_a ω_rotor², the spring's) stays within
+  the band the same scene without armature keeps at 240 Hz (its max relative drift × 1.5, or 2%,
+  whichever is larger); and with the base fixed under a constant motor torque, the energy gained
+  over 0.5 s matches the work ∫τ ω_rel dt within 5%.
 - **(e) Determinism:** a rollback across steps with the rotor row replays hash for hash, with
   the rotor state as carried today.
-- **(f) The Cassie regression (from 3.4g):** jump 0, flight, knee torques only, 240 Hz. On the
-  first step the position pass turns the left knee motor joint by at most 0.026 rad in magnitude:
-  half of today's −0.052. The rotors-on-links diagnostic gives −0.016. Kept as a test.
+- **(f) The Cassie regression (from 3.4g):** jump 0, flight, knee torques only, 240 Hz, first
+  step. The expected split comes from the model (`riftphys-cassie --split`): the reduced-coordinate
+  response to a unit impulse on the left knee spring at jump 0's start, the base free and both
+  rods rigid. It gives a knee motor turn of **−0.9254** per unit spring turn without rotors, which
+  predicts today's measurement (−0.9254 × 0.057 = −0.0528, measured −0.052), and **−0.4896** with
+  them. Pass: the position pass's motor turn is within 20% of −0.4896 × (that step's measured
+  spring correction), with both printed. Kept as a test.
+- **(g) The Cassie knee in miniature:** a fixed base; the motor hinge with J_a; a light link; a
+  compliant hinge spring; a load link; no gravity; a constant motor torque. At 240 Hz against the
+  same scene at 8 kHz, the load's angle and rate over 100 ms stay within 3% of the 8 kHz run's
+  range (max |error| / max |value|). Today's build should fail it: that's the mutation check, run
+  first and reported.
 - **Bit-identical gates:** joint_bits, the W6 hashes, distance_bits, the URIEL biped's and the
   isotropic arm's goldens. Nothing outside armature axes may move.
 - **What moves, named:** the arm's `ArmArmature::Axis` results (arm.rs's Axis tests, and
@@ -1362,6 +1384,96 @@ is confirmed (the Designer) and this design is reviewed.
 - **Afterwards (report-only, then the rerun):** 3.4g's diagnosis table again. Then P4, exactly as
   stated in 3.4a and 3.4e, with the D9 outcomes, and 7c1037c's result kept on record. Contact
   stays a separate effect (3.4g): the flight fix isn't expected to close the gap alone.
+
+**Results, built 2026-11-10 (uncommitted, for review; `crates/riftphys-world/tests/rotor_position_test.rs`):**
+- **Two test-construction fixes, made before any result was judged:** (a) and (b) were set at 64
+  position iterations, and 64 isn't converged at 60 Hz (−0.4322). They run at 256, which converges
+  at every rate, so the criterion's intent, converged, is kept. (g) at 90 N m wrapped the load past
+  π within 100 ms, so it runs at 20 N m (the load turns about 0.7 rad). The thresholds are unchanged.
+- **(a) pass:** converged split −0.4193, analytic −0.4193; W4b alone, converged, −19.995 (analytic
+  −20.0). **At (8, 6): −2.651**, a large convergence gap (see below).
+- **(b) pass:** −0.4193 at 60, 240 and 2000 Hz (256 iterations), so the α̃ = 1/J_a units are right.
+- **(c) pass:** |λ_pos| < 1e-6 on a free hinge. W4b's six tests pass unchanged.
+- **(d) passes, but the torque-free half says nothing:** at 240 Hz the XPBD spring's implicit damping
+  takes nearly all the energy in 2 s with and without armature (0.998 and 1.000), so the band is
+  trivial. The work half is meaningful: 0.2311 J gained against 0.2334 J of work (1.0%).
+- **(e) pass:** the rollback replays hash for hash.
+- **(f) pass:** step-1 motor turn −0.01800 against the expected −0.4896 × 0.03616 = −0.01770 (1.7%).
+  Measured through `--position-pass` and `--split`, not yet a test.
+- **(g) fails:** 240 Hz against 8 kHz, max |error| / max |value| for angle and rate:
+  - W4b alone: 0.557 and 0.460 (the mutation check fails, as it should);
+  - with W4f at (8, 6): 0.081 and 0.103;
+  - converged ((8, 96) or more): 0.042 and 0.038 against the 3% criterion. What's left at
+    convergence is the implicit spring's damping at hω ≈ 1 (ω_n ≈ 231 rad/s), not the rotor.
+- **(h) fails, and fails before W4f too:** a motor driven into its stop at (8, 6) ends past it by
+  0.078 rad with W4f, 0.055 with W4b alone; both 4e-5 at (8, 64). The spring joint, solved after
+  the motor joint in each sweep, moves the light motor link again, so ordering within one joint
+  can't give the limit the last word at 6 iterations.
+- **Bit-identical gates hold:**
+  - the joint_bits and W6 probes are identical before and after (only timing lines differ);
+  - distance_bits, compliant_joint, distance_anchor, joint_energy and joint_armature pass;
+  - the URIEL library's 31 tests pass, the isotropic arm's, the biped's and the seam tests'
+    outputs are unchanged, and only `ArmArmature::Axis` lines move.
+- **What moved (Axis, before → after):**
+  - torque-step errors at the arm's 96 iterations: base_yaw 1.47 → 1.29%, shoulder 1.45 → 1.28%,
+    elbow 8.89 → 7.85%, forearm_roll 6.25 → 4.81%, wrist_pitch 6.46 → 5.66%;
+  - self-contact: before the first contact 0.34 → 0.03%;
+  - the D6 sine-contact probe at 96 iterations: sine over 1 s 57.16 → 53.32%, random 0.51 → 0.52%;
+    at 8–64 iterations the sine profile's 1 s error rises from 71–79% to 81–86%, while first
+    ticks fall;
+  - teacher replay over 1 s at 8 iterations: 18.6–30.1% → 11.8–19.1%; at 96: 0.53–0.87% →
+    0.66–2.49%.
+- **Cassie, 240 Hz against its own 2 kHz (3.4g's table):**
+
+  | change | before W4f | W4f at (8, 6) | W4f at 80 iterations |
+  |---|---|---|---|
+  | flight (no contact) | 86.51 | 23.26 | 3.24 |
+  | with contact (base) | 25.32 | 57.93 | 13.59 |
+
+- **Cassie against the data, unfitted at Table VI's values, 240 Hz:** before W4f, (8, 6): 65.0.
+  With W4f: (8, 6) 102.2; (8, 12) 82.9; (8, 24) 64.8; (8, 48) 56.2; (24, 24) 59.7; (80, 80) 49.3.
+  MuJoCo Euler unfitted: 48.4. At 2 kHz W4f gives 29.9 at (8, 6) (29.2 before).
+- **Reading:** converged, W4f does what it was built for. At 240 Hz, unfitted, RiftPhys comes
+  within 1 point of MuJoCo Euler, and the 240 Hz flight error against 2 kHz falls from 86.5 to 3.2.
+  At the workload's (8, 6) the rotor row is far from converged ((a): −2.65 against −0.42). The
+  Gauss–Seidel coupling through the light motor link is slow: J_a / I_motor is about 47 for the
+  knee. Cassie is then worse than before (102 against 65). **P4 is not rerun.** The next step is the
+  Reviewer's and the Designer's choice: make the rotor row converge at 6 iterations (a design
+  change), or the biped workload's position iterations (D9 fixed (8, 6)).
+
+**Review of the results (the Reviewer, 2026-11-10):** W4f is correct when converged, and the gates
+hold. Accepted: (a), (b), (c), (e) and (f), the two test fixes, and the Cassie numbers. The next
+step is option (1) as an exact block solve (3.4j), not mass splitting: putting J_a on the child's
+inertia changes the fixed point, and its absolute form is the rotors-on-links diagnostic (138.9
+with contact). Option (2), the workload's iterations, is the Designer's and waits. Changes to the
+tests, made before rerunning them:
+- **(d):** the torque-free half becomes a rigid coupling. A free 1 kg base, the motor hinge, and a
+  load locked to the motor with its COM 0.2 m off the axis, spinning at 5 rad/s, so the hinge's
+  rows work every step and the base recoils. The criterion is unchanged. Result: max drift 0.42%
+  with the rotor against 0.08% without armature, which passes (≤ max(1.5 × 0.08%, 2%)). The work
+  half stays as it was (1.0%).
+- **(g):** the spring is 36 N m/rad (hω_n = 0.15 at 240 Hz with the rotor), so the implicit spring's
+  damping is a few % at most. The 3% threshold is unchanged. Result: W4b alone 0.481 and 0.549
+  (the mutation check fails, as it should). W4f at (8, 6): angle 0.100, rate 0.029; converged the
+  same, 0.101 and 0.029. **Still a fail, and it isn't the rotor:** the 8 kHz run matches the 2-DoF
+  analytic solution (0.5196 against 0.5179 rad at 100 ms). The 240 Hz run leads it by 10%, which is
+  semi-implicit Euler's first-order step error over 24 steps (the centre of mass alone leads by 1/n,
+  4%), and is larger on the load because it moves through the spring. W4b alone lags by 50%. A
+  240 Hz-vs-8 kHz gate at 3% can't be met by any first-order integrator here. Proposed for the
+  Reviewer: gate (g) against the same 2-DoF system stepped with the engine's own scheme at 240 Hz
+  in reduced coordinates (the torque kick, drift, the implicit spring; (M + h²K) q⁺ = M q*), within
+  3%. That isolates what maximal coordinates and the rotor add.
+- **(h):** ignored, with the reason, as item 3.4i. It's a gate of 3.4j (it passes with W4g;
+  the ignore is removed).
+
+### 3.4i Limits through a light link at 6 position sweeps (open; owner RiftPhys Orchestration; logged 2026-11-10)
+
+A motor driven into its stop under torque at (8, 6) ends past the stop: by 0.055 rad with W4b
+alone and 0.078 with W4f, against 4e-5 at (8, 64) (`rotor_position_test::h_a_limit_has_the_last_word`,
+ignored with this item's number). This existed before W4f. A joint that shares the light motor
+link and is solved after the motor joint in each sweep (here the spring) moves the link again, so
+ordering rows within one joint can't give the limit the last word. The 3.4j block solve should fix
+it, and (h) at (8, 6) is one of its gates.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 

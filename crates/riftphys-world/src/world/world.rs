@@ -291,6 +291,9 @@ pub struct World {
     /// A diagnostic record (PARITY_SPEC 3.4g): when Some, each step stores every body's pose after
     /// integration and before the position pass. Read-only; it never changes the step.
     pub(super) diag_predicted: Option<Vec<Isometry>>,
+    /// W4f's rotor row in the position pass (on by default; off reproduces W4b alone, for the
+    /// mutation checks and before/after reports, PARITY_SPEC 3.4h).
+    pub(super) rotor_position_row: bool,
     pub(super) last_bounce_residual: f32,
     pub(super) last_bounce_stats: BounceStats,
     /// The W6 bounce passes' direct-solve limit, in rows per component (`DIRECT_MAX`)
@@ -425,6 +428,7 @@ impl World {
             contact_loaded: Vec::new(),
             bounce_pseudo: Vec::new(),
             diag_predicted: None,
+            rotor_position_row: true,
             last_bounce_residual: 0.0,
             last_bounce_stats: BounceStats::default(),
             bounce_direct_max: super::solver::DIRECT_MAX,
@@ -841,6 +845,14 @@ impl World {
 
     /// Restarts a joint's armature rotors from its links' relative velocity.
     pub fn reset_d6_rotor(&mut self, id: JointId) { self.rotor_init(id.0); }
+    /// An armature rotor's velocity (rad/s), as carried between steps.
+    pub fn d6_rotor_velocity(&self, id: JointId, axis: usize) -> Option<f32> { self.rotor.get(&(id.0, axis as u8)).copied() }
+    /// The angular impulse x dt the rotor row gave the links in the last step's position pass.
+    pub fn d6_rotor_position_lambda(&self, id: JointId, axis: usize) -> f32 {
+        match self.joints.kinds().get(id.0 as usize) { Some(JointKind::D6(d)) if axis < 3 => d.r[axis].rotor_lambda, _ => 0.0 }
+    }
+    /// Turns W4f's rotor row in the position pass on (the default) or off (W4b alone).
+    pub fn set_rotor_position_row(&mut self, on: bool) { self.rotor_position_row = on; }
 
     /// Armature (kg m^2) about rotational axis `axis` of a D6 joint (PARITY_SPEC W4b). Its rotor
     /// starts at the links' current relative velocity.
@@ -1011,6 +1023,42 @@ impl World {
 
     /// The joint solve inside `step`: SHAKE directions from the start-of-step poses `start`
     /// (indexed by body), or PBD.
+    /// W4f: before the position pass, each armature axis's rotor target, theta_r* = the axis
+    /// angle at the step's start + dt x omega_rotor (as the velocity solve left it). The gear is
+    /// rigid, so the rotor's angle equals the axis's at every step start and isn't carried.
+    pub(super) fn rotor_targets(&mut self, start: &[Isometry], dt: f32) {
+        if self.rotor.is_empty() || !self.rotor_position_row { return; }
+        let rotor = &self.rotor;
+        let pose = |id: u32| start.get(id as usize).copied().unwrap_or(Isometry { pos: Vec3::ZERO, rot: Quat::IDENTITY });
+        for (k, kind) in self.joints.kinds_mut().iter_mut().enumerate() {
+            let JointKind::D6(d) = kind else { continue; };
+            for i in 0..3 {
+                d.r[i].rotor_target = None;
+                if !(d.r[i].armature > 0.0) { continue; }
+                let Some(&w) = rotor.get(&(k as u32, i as u8)) else { continue; };
+                let (ra, rb) = (pose(d.a.0).rot * d.fa.rot, pose(d.b.0).rot * d.fb.rot);
+                let a0 = riftphys_articulation::bodies::d6_row_angle(d, ra, rb, i);
+                d.r[i].rotor_target = Some(a0 + dt * w);
+            }
+        }
+    }
+
+    /// W4f: after the position pass, each rotor keeps the impulse it gave the links there,
+    /// omega_rotor -= lambda_pos / (J_a dt), and the targets are cleared.
+    pub(super) fn rotor_carry(&mut self, dt: f32) {
+        if self.rotor.is_empty() { return; }
+        for (k, kind) in self.joints.kinds_mut().iter_mut().enumerate() {
+            let JointKind::D6(d) = kind else { continue; };
+            for i in 0..3 {
+                if d.r[i].rotor_target.take().is_none() { continue; }
+                let lam = d.r[i].rotor_lambda;
+                if lam != 0.0 {
+                    if let Some(w) = self.rotor.get_mut(&(k as u32, i as u8)) { *w -= lam / (d.r[i].armature * dt); }
+                }
+            }
+        }
+    }
+
     pub(super) fn solve_joints_in_step(&mut self, dt: f32, start: &[Isometry], frozen: &[bool]) {
         // Damped compliant rows measure their change from the step's start under PBD too
         let shake = (self.joint_projection == JointProjection::Shake).then_some(start);

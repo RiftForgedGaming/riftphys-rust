@@ -93,6 +93,13 @@ pub struct D6Axis {
     /// Armature, kg m^2 (rotational axes): a rotor geared rigidly to this axis (rotor inertia x
     /// gear ratio^2), feeling no gravity or contact. 0 = none. (PARITY_SPEC W4b)
     pub armature: Scalar,
+    /// The geared rotor's predicted angle for this step's position pass (PARITY_SPEC W4f): set
+    /// by the World before the pass on armature axes, cleared after. None: no rotor row (and
+    /// always outside a step). Transient, not carried state.
+    pub rotor_target: Option<Scalar>,
+    /// The rotor row's multiplier accumulated over this step's position pass (zeroed by
+    /// `begin_step`): the angular impulse x dt the links took from the rotor.
+    pub rotor_lambda: Scalar,
 }
 
 impl Default for D6Axis {
@@ -106,6 +113,8 @@ impl Default for D6Axis {
             damping: 0.0,
             friction: 0.0,
             armature: 0.0,
+            rotor_target: None,
+            rotor_lambda: 0.0,
         }
     }
 }
@@ -150,6 +159,11 @@ impl Joints {
     #[inline]
     pub fn kinds(&self) -> &[JointKind] {
         &self.kinds
+    }
+    /// The joints, mutably (the World sets W4f's per-step rotor targets through this).
+    #[inline]
+    pub fn kinds_mut(&mut self) -> &mut [JointKind] {
+        &mut self.kinds
     }
     #[inline]
     pub fn len(&self) -> usize {
@@ -204,7 +218,7 @@ impl Joints {
             match k {
                 JointKind::Distance(j) => j.lambda_acc = 0.0,
                 JointKind::D6(j) => {
-                    for r in j.t.iter_mut().chain(j.r.iter_mut()) { r.lambda_acc = 0.0; }
+                    for r in j.t.iter_mut().chain(j.r.iter_mut()) { r.lambda_acc = 0.0; r.rotor_lambda = 0.0; }
                 }
             }
         }
@@ -624,6 +638,36 @@ fn solve_d6(
     // angle in radians (limits, drives and springs are given in radians; the small-angle
     // measure 2 sin(angle / 2) put a 2.2 limit out of reach and -1.5 at -97 deg).
     let hinge = d6_hinge_axis(j);
+
+    // The geared rotor's position row (PARITY_SPEC W4f): the rotor as a virtual 1-DoF body on the
+    // axis, C = angle - theta_r with theta_r = theta_r* - lambda / J_a, an XPBD row with
+    // alpha~ = 1 / J_a (no dt^2: the rotor's inertia is a mass, not a compliance). Run before the
+    // axis's own rows so a limit on the same axis has the last word in every sweep.
+    for i in 0..3 {
+        let (j_a, Some(target)) = (j.r[i].armature, j.r[i].rotor_target) else { continue; };
+        if !(j_a > 0.0) { continue; }
+        let (pa, pb) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
+        let (ra, rb) = (pa.rot * j.fa.rot, pb.rot * j.fb.rot);
+        let u = normalize_fin(ra * units[i]);
+        if u == Vec3::ZERO { continue; }
+        let angle = d6_row_angle(j, ra, rb, i);
+        let (un, iaw, ibw) = match &shake {
+            Some((ax0, _, _, ia, ib)) => (ax0[i], *ia, *ib),
+            None => (u, bodies.inv_inertia_world(j.a.0), bodies.inv_inertia_world(j.b.0)),
+        };
+        let w = fin(un.dot(iaw * un) + un.dot(ibw * un));
+        let alpha = fin(1.0 / j_a);
+        let mut c = fin(angle - target);
+        // Wrapped to (-pi, pi]: the twist measure wraps, the predicted angle doesn't
+        let tau = std::f32::consts::TAU;
+        if c > std::f32::consts::PI { c -= tau * ((c + std::f32::consts::PI) / tau).floor(); }
+        if c <= -std::f32::consts::PI { c += tau * ((std::f32::consts::PI - c) / tau).floor(); }
+        let lambda_old = fin(j.r[i].rotor_lambda);
+        let dl = fin(-(c + fin(alpha * lambda_old)) / fin(w + alpha));
+        j.r[i].rotor_lambda = fin(lambda_old + dl);
+        bodies.apply_orientation_delta(j.a.0, fin_v(-(iaw * un) * dl));
+        bodies.apply_orientation_delta(j.b.0, fin_v( (ibw * un) * dl));
+    }
 
     for i in 0..3 {
         if !j.r[i].enabled { continue; }
