@@ -1781,6 +1781,14 @@ biped". The pin stays at 2b98bb3 and arm and drone training wait; the bump goes 
 with the full report once the biped reaches P4 and P5. Biped parity needs W4a and W4 (P4); P5's fixes
 (W1, W2) are built, and its lever-arm part waits on whether P4 shows it.
 
+**A downstream requirement (the Designer's goal, relayed by the SR&ED Bookkeeper 2026-11-10):**
+after parity, URIEL trains on parity physics, and RiftForged then "exacerbates reality" for fun
+(a game on real physics must be sped up), with URIEL learning in both. So when RiftPhys's API is
+extended for that, the "fun" layer is a separate transform over the parity core, applied and
+recorded by its parameters and version, and every parity result here stays reproducible with it
+switched off. Swapping RiftPhys in for Bullet behind RiftForged's physics API is integration
+(SR&ED project F); parity itself is B.
+
 **Each parity report:**
 - is a new section in `docs/PHYSICS_FIDELITY.md`;
 - is sent as a message to URIEL Orchestration;
