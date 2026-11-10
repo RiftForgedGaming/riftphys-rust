@@ -530,9 +530,49 @@ which the paper itself names as the limit for Drake and MuJoCo.
     Agility's model isn't stable at 240 Hz, report that and pair at 2 kHz, saying so.
   - Without D10 there is no valid P4 bar.
 - **Folds:** 5 folds over the 22 jumps, fixed before any run with seed 1, stratified by day
-  (Jan 27: 00–03 and 06–09; Feb 12: 10–23), the same for both engines. The fold list is written
-  here before the first fit. The 29-jump line adds Feb 26 (24–28), a third day, and is labelled
-  so.
+  (Jan 27: 00–03 and 06–09; Feb 12: 10–23), the same for both engines. The 29-jump line adds
+  Feb 26 (24–28), a third day, and is labelled so.
+  - **The folds, as generated before the first fit** (`cassie::folds(1)`: each day's jumps
+    shuffled by Fisher–Yates with xorshift64 seed 1, then dealt round-robin, the second day
+    continuing): fold 1 {3, 6, 14, 20, 22}; fold 2 {2, 8, 15, 16, 21}; fold 3 {1, 7, 10, 13};
+    fold 4 {9, 17, 19, 23}; fold 5 {0, 11, 12, 18}.
+- **The fit, stated before it runs (the Reviewer's review of 79affba):**
+  - **per engine and per rate:** RiftPhys at 240 Hz and (8, 6) for the pass, and separately at
+    2 kHz and (8, 6) for the line beside it; MuJoCo Euler and RK4 likewise, each at 240 Hz and
+    2 kHz;
+  - **RiftPhys's parameters:** stiffness k on a log scale over [1e3, 1e6] N/m, dissipation d over
+    [0, 3] s/m, μ over [0.01, 1] (Drake's domain in Table III, the same Hunt–Crossley form);
+    started at Table VI's Drake values (9400, 3.0, 0.45); W3's CMA-ES, initial step 0.2 in the
+    unit box, 200 evaluations, seed 1;
+  - **the objective:** the paper's loss averaged over the training jumps (the other four folds),
+    on the main line, with the decided gated half-step correction;
+  - **held out per jump:** each jump's loss from the fit of the fold that left it out; the
+    sensitivity line uses the same per-fold parameters with its own start (not refit); an
+    all-22 in-sample fit is reported beside it, since 38.0's split is unknown;
+  - **after the fit:** the held-out loss at (8, 6), 20, 80 and 320 iterations with the 240 Hz
+    parameters held fixed, so a reader can see whether the pass depends on the solver being
+    unconverged. The pass stays at (8, 6), as the Designer decided;
+  - **the pairing:** per jump against MuJoCo's stricter integrator under D2 (a bootstrap over the
+    22 jumps), the main line, then the sensitivity line.
+- **RiftPhys's fit, run 2026-11-10 as stated** (`riftphys-cassie --fit hz 200 out`; per-jump
+  results in `riftphys-parity-data/cassie_results/riftphys_{240,2000}hz.json`):
+
+  | | 240 Hz, (8, 6): the pass's rate | 2 kHz, (8, 6) |
+  |---|---|---|
+  | held out, main line, mean of the 22 | **65.53** | **29.52** |
+  | held out, sensitivity line | 65.56 | 29.51 |
+  | held out, de-lagged (diagnostic) | 77.61 | 40.95 |
+  | in-sample, all 22 | 64.72 (k 9137, d 1.519, μ 0.465) | 29.12 (k 13304, d 1.850, μ 0.433) |
+  | per fold: k (N/m), d (s/m), μ | 9571 / 1.258 / 0.407; 10054 / 1.344 / 0.469; 3547 / 3.000 / 0.493; 12278 / 1.102 / 0.471; 14191 / 1.253 / 0.458 | 12039 / 2.195 / 0.393; 12650 / 1.949 / 0.479; 12269 / 1.986 / 0.439; 15338 / 1.752 / 0.452; 13055 / 2.127 / 0.427 |
+
+  - **At 240 Hz the fit barely helps** (65.5 held out against 65.0 unfitted): the loss there is
+    dominated by the integration, not the contact parameters, and one fold ran d to its bound.
+    At 2 kHz the folds agree (k 12–15 kN/m, d 1.75–2.2, μ 0.39–0.48), near Drake's Table VI.
+  - **The iteration curve at 240 Hz, the fitted parameters held fixed:** held out 65.53 at (8, 6),
+    76.68 at 20, 88.67 at 80, 90.08 at 320. The pass's 240 Hz number depends on the solver being
+    partly converged (the integrator damping of the compliant rows is weaker there; 3.4a).
+  - **Context only (other windows):** Drake 38.0, MuJoCo 30.0. The pass is the pairing with
+    MuJoCo rerun here, which is next.
 - **Tests beyond the loss:**
   - the achilles rod's stretch equals compliance × its row force (not a fixed 1 mm: at 1e-6 m/N
     a landing can reach 1000 N per mm), and it doesn't ring (or has damping; below);
@@ -1818,6 +1858,17 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     the data better at 240 Hz, most likely because its residual acts as extra damping; that is
     noted as a finding, not credited. Still not a P4 result: the fit and the MuJoCo pairing
     remain.
+  - **The rise with iterations, checked (`riftphys-cassie --iters`, the paper's 22, unfitted).**
+    The reading above ("the residual acts as damping") is refuted. 240 Hz against RiftPhys's own
+    2 kHz run also rises with iterations: 25.3 at (8, 6), 33.2 at 20, 42.4 at 80, 44.4 at 320.
+    And (8, 6) loses less energy, not more: the mean change of total mechanical energy (rotors,
+    springs, rods and ground included; the motors' work is in it, the same at every count) over
+    50 ms is −12.7 J at (8, 6) against −20.0, −21.9 and −22.3 J at 20, 80 and 320 (at 2 kHz,
+    −14.1 to −17.6 J). So a fully converged solve gives the stiff compliant rows (leaf springs,
+    rods, contact) their full implicit-Euler damping at 240 Hz, and the partly converged (8, 6)
+    applies it more weakly: closer to the 2 kHz run and to the data. It is D9's integrator
+    damping, not a separate effect. The fit's iteration curve (below) shows how much the pass
+    depends on it.
 - **D10:** downloads for W4.
   - **Needed:** Agility's MuJoCo model, as the paper used it: github.com/osudrl/cassie-mujoco-sim
     `model/cassie.xml` (22,344 bytes) and `model/cassie-stl-meshes/` (11 STL files, 2,049,524

@@ -402,6 +402,8 @@ pub struct ModelBody {
     pub id: BodyId,
     pub mass: f64,
     pub com: DVec3,
+    /// Inertia about the COM, in the body's (its link's) axes.
+    pub inertia: DMat3,
 }
 
 /// What was built.
@@ -509,7 +511,7 @@ pub fn build(urdf: &Urdf, world: &mut World, cfg: &Config) -> Result<Model, Stri
         let id = world.add_body(pose.to_iso(), Velocity { lin: v32(v), ang: v32(w.rot * ang[l]) }, props, dynamic);
         world.set_body_sleep_allowed(id, false);
         body_of.insert(l.clone(), model.bodies.len());
-        model.bodies.push(ModelBody { link: l.clone(), id, mass: inr.mass, com: inr.com });
+        model.bodies.push(ModelBody { link: l.clone(), id, mass: inr.mass, com: inr.com, inertia: inr.inertia });
     }
     for l in &order {
         let (o, f) = &owner[l];

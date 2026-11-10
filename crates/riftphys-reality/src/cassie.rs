@@ -301,6 +301,41 @@ impl Cassie {
         out
     }
 
+    /// Total mechanical energy (J): the bodies' kinetic and gravitational energy, the leaf springs'
+    /// and rods' elastic energy, the rotors' kinetic energy (reflected inertia x the joint rate^2 / 2),
+    /// and the ground's (k pen^2 / 2 per toe sphere).
+    pub fn energy(&self, p: &Params) -> f64 {
+        let g = 9.81;
+        let mut e = 0.0;
+        for b in &self.model.bodies {
+            let (pose, v) = (self.world.get_body_pose(b.id), self.world.get_body_vel(b.id));
+            if !(b.mass > 0.0) || !self.world.inv_mass_of(b.id).is_normal() { continue; }
+            let r = glam::DMat3::from_quat(DQuat::from_xyzw(pose.rot.x as f64, pose.rot.y as f64, pose.rot.z as f64, pose.rot.w as f64));
+            let w = d(v.ang);
+            let iw = r * b.inertia * r.transpose();
+            e += 0.5 * b.mass * d(v.lin).length_squared() + 0.5 * w.dot(iw * w) + b.mass * g * pose.pos.y as f64;
+        }
+        let x = self.state();
+        for (name, k) in [("knee_joint_left", p.knee_k), ("knee_joint_right", p.knee_k), ("ankle_spring_joint_left", p.ankle_k), ("ankle_spring_joint_right", p.ankle_k)] {
+            let col = 7 + JOINTS.iter().position(|j| *j == name).unwrap();
+            e += 0.5 * k * x[col] * x[col];
+        }
+        for l in self.rod_lengths() {
+            e += 0.5 * (l - ACHILLES_LENGTH).powi(2) / p.rod_compliance as f64;
+        }
+        if p.armature {
+            for (k, name) in ACTUATORS.iter().enumerate() {
+                let col = 29 + JOINTS.iter().position(|j| j == name).unwrap();
+                e += 0.5 * ROTOR_INERTIA[k] * GEAR_RATIO[k] * GEAR_RATIO[k] * x[col] * x[col];
+            }
+        }
+        for z in self.toe_heights() {
+            let pen = p.toe_r as f64 - z;
+            if pen > 0.0 { e += 0.5 * p.k as f64 * pen * pen; }
+        }
+        e
+    }
+
     /// The toe points' vertical velocities (m/s), in the order of `toe_heights`.
     pub fn toe_vz(&self) -> [f64; 4] {
         let mut out = [0.0; 4];
@@ -379,6 +414,60 @@ pub fn loop_consistent(urdf: &Urdf, row: &[f64; 45], p: &Params) -> Result<([f64
 pub fn quat_angle(a: &[f64], b: &[f64]) -> f64 {
     let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>().abs().min(1.0);
     2.0 * dot.acos()
+}
+
+/* ───────────────────────── the folds ───────────────────────── */
+
+/// The paper's 22 jumps by recording day: 2021-01-27 (raw logs 08-11 and 14-17) and 2021-02-12
+/// (logs 20-33); the controller's gains changed between days.
+pub const JAN_27: [usize; 8] = [0, 1, 2, 3, 6, 7, 8, 9];
+pub const FEB_12: [usize; 14] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
+
+/// The five cross-validation folds (PARITY_SPEC 3.4a), fixed before any fit and stratified by
+/// day: each day's jumps shuffled by Fisher-Yates with xorshift64 seeded by `seed`, then dealt
+/// round-robin into the folds, the second day continuing where the first left off.
+pub fn folds(seed: u64) -> [Vec<usize>; 5] {
+    let mut x = seed.max(1);
+    let mut next = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    let mut out: [Vec<usize>; 5] = Default::default();
+    let mut slot = 0usize;
+    for day in [&JAN_27[..], &FEB_12[..]] {
+        let mut v = day.to_vec();
+        for i in (1..v.len()).rev() { let j = (next() % (i as u64 + 1)) as usize; v.swap(i, j); }
+        for j in v { out[slot % 5].push(j); slot += 1; }
+    }
+    for f in out.iter_mut() { f.sort(); }
+    out
+}
+
+/* ───────────────────────── the fit ───────────────────────── */
+
+/// The fitted contact parameters in the unit box (PARITY_SPEC 3.4a): stiffness k on a log scale
+/// over [1e3, 1e6] N/m, dissipation d over [0, 3] s/m, mu over [0.01, 1].
+pub fn contact_from_unit(base: &Params, x: &[f64]) -> Params {
+    let c = |v: f64| v.clamp(0.0, 1.0);
+    Params { k: 10f64.powf(3.0 + 3.0 * c(x[0])) as f32, d: (3.0 * c(x[1])) as f32, mu: (0.01 + 0.99 * c(x[2])) as f32, ..*base }
+}
+
+pub fn contact_to_unit(p: &Params) -> Vec<f64> {
+    vec![((p.k as f64).log10() - 3.0) / 3.0, p.d as f64 / 3.0, (p.mu as f64 - 0.01) / 0.99]
+}
+
+/// The mean loss of `p` over `jumps` at `hz` on `line`.
+pub fn mean_loss(urdf: &Urdf, trajs: &[Traj], jumps: &[usize], p: &Params, hz: f64, line: Line) -> f64 {
+    let mut sum = 0.0;
+    for &i in jumps {
+        let t = trajs.iter().find(|t| t.index == i).expect("loaded");
+        sum += match replay(urdf, t, p, hz, line) { Ok(r) => loss(&r.states, &t.x), Err(_) => 1e6 };
+    }
+    sum / jumps.len() as f64
+}
+
+/// Fits k, d and mu by CMA-ES (W3's: initial step 0.2 in the unit box, `evals` evaluations,
+/// `seed`) on `train`, from `start`, minimising the mean main-line loss at `hz`.
+pub fn fit(urdf: &Urdf, trajs: &[Traj], train: &[usize], start: &Params, hz: f64, evals: usize, seed: u64) -> (Params, f64) {
+    let r = crate::cmaes::minimize(|x| mean_loss(urdf, trajs, train, &contact_from_unit(start, x), hz, Line::Main), &contact_to_unit(start), 0.2, evals, seed);
+    (contact_from_unit(start, &r.x), r.f)
 }
 
 /* ───────────────────────── the loss ───────────────────────── */
@@ -477,6 +566,8 @@ pub struct Replay {
     /// The half-step trial step: the largest change of an ankle spring's rate and of any other
     /// joint's rate over it (rad/s), and the rods' length rate after it (m/s).
     pub trial: (f64, f64, f64),
+    /// Total mechanical energy at the start and after 10, 25 and 50 ms (J; `Cassie::energy`).
+    pub energy: [f64; 4],
 }
 
 /// The angular impulse (N m s) of the inputs' first-order hold over [a, b] for actuator `j`, on
@@ -570,6 +661,8 @@ pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr:
     let mut times = vec![0.0];
     let mut states = vec![c.state()];
     let mut first_contact = None;
+    let mut energy = [c.energy(p), f64::NAN, f64::NAN, f64::NAN];
+    let marks = [0.010, 0.025, 0.050];
     for k in 0..steps {
         let (a, b) = (t0 + k as f64 * h, t0 + (k + 1) as f64 * h);
         c.apply_inputs(t, a, b);
@@ -577,6 +670,9 @@ pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr:
         times.push(b - t0);
         states.push(c.state());
         if first_contact.is_none() && c.toe_heights().iter().any(|&z| z <= p.toe_r as f64) { first_contact = Some(b - t0); }
+        for (m, at) in marks.iter().enumerate() {
+            if energy[m + 1].is_nan() && b - t0 >= at - 1e-9 { energy[m + 1] = c.energy(p); }
+        }
     }
     // Linear interpolation to the sample times (the quaternion normalised, its sign aligned)
     let out = t.t.iter().map(|&tk| {
@@ -591,7 +687,7 @@ pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr:
         for j in 0..4 { r[j] /= n; }
         r
     }).collect();
-    Ok(Replay { states: out, first_contact, trial: trial_info })
+    Ok(Replay { states: out, first_contact, trial: trial_info, energy })
 }
 
 #[cfg(test)]

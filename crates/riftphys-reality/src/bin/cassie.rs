@@ -409,12 +409,92 @@ fn delag_check(lag: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// The paper's 22 at 240 Hz against RiftPhys's own 2 kHz run (same start, the decided gated
+/// correction at each rate, same parameters) at several iteration counts, with each run's loss
+/// against the data and the mean energy change over 10, 25 and 50 ms (J).
+fn iters_check() -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    println!("iterations | 240 Hz vs own 2 kHz | 240 Hz vs data | 2 kHz vs data | 240 Hz energy change at 10, 25, 50 ms | 2 kHz energy change");
+    for it in [(8u32, 6u32), (20, 20), (80, 80), (320, 320)] {
+        let p = Params { iters: it, ..Params::default() };
+        let (mut own, mut d240, mut d2k) = (0.0, 0.0, 0.0);
+        let (mut e240, mut e2k) = ([0.0f64; 3], [0.0f64; 3]);
+        for &i in PAPER_JUMPS.iter() {
+            let t = cassie::load_traj(&cassie::data_dir(), i)?;
+            let a = cassie::replay(&urdf, &t, &p, 240.0, cassie::Line::Main)?;
+            let b = cassie::replay(&urdf, &t, &p, 2000.0, cassie::Line::Main)?;
+            own += cassie::loss(&a.states, &b.states) / 22.0;
+            d240 += cassie::loss(&a.states, &t.x) / 22.0;
+            d2k += cassie::loss(&b.states, &t.x) / 22.0;
+            for k in 0..3 { e240[k] += (a.energy[k + 1] - a.energy[0]) / 22.0; e2k[k] += (b.energy[k + 1] - b.energy[0]) / 22.0; }
+        }
+        println!("{:?} | {:7.2} | {:7.2} | {:6.2} | {:+7.2} {:+7.2} {:+7.2} | {:+7.2} {:+7.2} {:+7.2}", it, own, d240, d2k, e240[0], e240[1], e240[2], e2k[0], e2k[1], e2k[2]);
+    }
+    Ok(())
+}
+
+/// The fit as stated before it ran (PARITY_SPEC 3.4a): per fold, k, d and mu fitted on the other
+/// four folds at `hz` and (8, 6); each held-out jump's loss on the main and sensitivity lines; at
+/// 240 Hz also the held-out loss at 20, 80 and 320 iterations with the fitted parameters held
+/// fixed; and an all-22 in-sample fit beside it. Writes the per-jump results as JSON to `out`.
+fn fit_all(hz: f64, evals: usize, out: &str) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let trajs: Vec<cassie::Traj> = PAPER_JUMPS.iter().map(|&i| cassie::load_traj(&cassie::data_dir(), i)).collect::<Result<_, _>>()?;
+    let start = Params::default();
+    let folds = cassie::folds(1);
+    let curve: Vec<(u32, u32)> = if hz < 1000.0 { vec![(8, 6), (20, 20), (80, 80), (320, 320)] } else { vec![(8, 6)] };
+    let mut rows = Vec::new();
+    let mut fold_params = Vec::new();
+    for (f, held) in folds.iter().enumerate() {
+        let train: Vec<usize> = PAPER_JUMPS.iter().cloned().filter(|j| !held.contains(j)).collect();
+        let (p, obj) = cassie::fit(&urdf, &trajs, &train, &start, hz, evals, 1);
+        println!("fold {} (held out {:?}): k {:.0} N/m, d {:.3} s/m, mu {:.3}; training loss {:.2}", f + 1, held, p.k, p.d, p.mu, obj);
+        fold_params.push(serde_json::json!({ "fold": f + 1, "held_out": held, "k": p.k, "d": p.d, "mu": p.mu, "train_loss": obj }));
+        for &j in held {
+            let t = trajs.iter().find(|t| t.index == j).unwrap();
+            let main = cassie::replay(&urdf, t, &p, hz, cassie::Line::Main)?;
+            let sens = cassie::replay(&urdf, t, &p, hz, cassie::Line::Sensitivity)?;
+            let at: Vec<f64> = curve.iter().map(|&it| {
+                let q = Params { iters: it, ..p };
+                cassie::replay(&urdf, t, &q, hz, cassie::Line::Main).map(|r| cassie::loss(&r.states, &t.x)).unwrap_or(f64::NAN)
+            }).collect();
+            rows.push(serde_json::json!({ "jump": j, "fold": f + 1,
+                "main": cassie::loss(&main.states, &t.x), "sensitivity": cassie::loss(&sens.states, &t.x),
+                "main_delagged": cassie::loss(&main.states, &cassie::delag(t)), "terms": cassie::loss_terms(&main.states, &t.x),
+                "first_contact_ms": main.first_contact.map(|x| x * 1e3), "iterations": curve.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>(), "by_iterations": at }));
+        }
+    }
+    let mean = |key: &str| rows.iter().map(|r| r[key].as_f64().unwrap()).sum::<f64>() / rows.len() as f64;
+    println!("{} Hz, held out, mean over the 22: main {:.2}, sensitivity {:.2}, de-lagged {:.2}", hz, mean("main"), mean("sensitivity"), mean("main_delagged"));
+    if curve.len() > 1 {
+        for (k, it) in curve.iter().enumerate() {
+            let m = rows.iter().map(|r| r["by_iterations"][k].as_f64().unwrap()).sum::<f64>() / rows.len() as f64;
+            println!("  held out at {:?} iterations (the 240 Hz parameters fixed): {:.2}", it, m);
+        }
+    }
+    let (all, all_obj) = cassie::fit(&urdf, &trajs, &PAPER_JUMPS, &start, hz, evals, 1);
+    println!("in-sample, all 22: k {:.0}, d {:.3}, mu {:.3}; loss {:.2}", all.k, all.d, all.mu, all_obj);
+    let doc = serde_json::json!({ "hz": hz, "iterations": [8, 6], "evals": evals, "seed": 1, "folds": fold_params,
+        "jumps": rows, "in_sample": { "k": all.k, "d": all.d, "mu": all.mu, "loss": all_obj } });
+    std::fs::write(out, serde_json::to_string_pretty(&doc).unwrap()).map_err(|e| e.to_string())?;
+    println!("wrote {}", out);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
         Some("--check") => check(),
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
+        Some("--iters") => iters_check(),
+        Some("--fit") => {
+            let hz = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0);
+            let evals = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(200);
+            let out = args.get(4).cloned().unwrap_or_else(|| format!("riftphys_cassie_fit_{}hz.json", hz));
+            fit_all(hz, evals, &out)
+        }
+        Some("--folds") => { for (k, f) in cassie::folds(1).iter().enumerate() { println!("fold {}: {:?}", k + 1, f); } Ok(()) }
         Some("--delag") => delag_check(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(9)),
         Some("--vs2k") => vs2k(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0)),
         Some("--correction") => correction(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(240.0)),
