@@ -138,36 +138,45 @@ fn probe(i: usize, secs: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// The loop-consistent ankle-spring rates beside an independent estimate: the slope of a line
-/// through the recorded ankle-spring angles' first 6 samples (about 2.5 ms; the estimator's IK).
-/// Reported, not gated.
+/// The loop-consistent ankle-spring rates beside an independent estimate, the slope at sample 0
+/// of a quadratic through the recorded ankle-spring angles' first 8 samples (the estimator's IK),
+/// before and after the lagged passive rates (knee springs, ankles) are taken from their
+/// positions. Reported, not gated.
 fn rates() -> Result<(), String> {
     let urdf = cassie::load_urdf()?;
     let p = Params::default();
-    println!("traj paper | ankle spring rate, loop-consistent / from the recorded angles (rad/s): left | right");
-    let (mut sign, mut far) = (0, 0);
+    println!("traj paper | ankle spring rate (rad/s): IK slope | closure from recorded rates | closure from refit passive rates   (left; right)");
+    let (mut before, mut after) = ([0usize; 2], [0usize; 2]);
+    let (mut err_b, mut err_a) = (Vec::new(), Vec::new());
     for i in 0..ALL_JUMPS {
         let t = cassie::load_traj(&cassie::data_dir(), i)?;
-        let (_, found) = cassie::loop_consistent(&urdf, &t.x[0], &p)?;
-        let mut slope = [0.0f64; 2];
-        for (k, col) in [19usize, 21].into_iter().enumerate() {
-            let n = 6;
-            let (tm, xm) = ((0..n).map(|j| t.t[j]).sum::<f64>() / n as f64, (0..n).map(|j| t.x[j][col]).sum::<f64>() / n as f64);
-            slope[k] = (0..n).map(|j| (t.t[j] - tm) * (t.x[j][col] - xm)).sum::<f64>() / (0..n).map(|j| (t.t[j] - tm).powi(2)).sum::<f64>();
-            if found[k].signum() != slope[k].signum() && found[k].abs().max(slope[k].abs()) > 0.2 { sign += 1; }
-            if (found[k] - slope[k]).abs() > 1.0 { far += 1; }
+        let (_, rec) = cassie::loop_consistent(&urdf, &t.x[0], &p)?;
+        let (_, fit) = cassie::start_row(&urdf, &t, &p)?;
+        let ik = [cassie::start_slope(&t, 19, cassie::START_FIT_SAMPLES), cassie::start_slope(&t, 21, cassie::START_FIT_SAMPLES)];
+        for k in 0..2 {
+            let tally = |c: &mut [usize; 2], v: f64, errs: &mut Vec<f64>| {
+                if v.signum() != ik[k].signum() && v.abs().max(ik[k].abs()) > 0.2 { c[0] += 1; }
+                if (v - ik[k]).abs() > 1.0 { c[1] += 1; }
+                errs.push((v - ik[k]).abs());
+            };
+            tally(&mut before, rec[k], &mut err_b);
+            tally(&mut after, fit[k], &mut err_a);
         }
-        println!("{:4} {:5} | {:+6.2} / {:+6.2} | {:+6.2} / {:+6.2}", i, if PAPER_JUMPS.contains(&i) { "yes" } else { "" }, found[0], slope[0], found[1], slope[1]);
+        println!("{:4} {:5} | {:+6.2} {:+6.2} {:+6.2} ; {:+6.2} {:+6.2} {:+6.2}", i, if PAPER_JUMPS.contains(&i) { "yes" } else { "" },
+                 ik[0], rec[0], fit[0], ik[1], rec[1], fit[1]);
     }
-    println!("of 58 legs: {} differ in sign (either above 0.2 rad/s), {} by more than 1 rad/s", sign, far);
+    let median = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    println!("of 58 legs, against the IK slope: from recorded rates {} differ in sign, {} by > 1 rad/s, median |diff| {:.2}; from refit rates {} in sign, {} by > 1 rad/s, median |diff| {:.2}",
+             before[0], before[1], median(&mut err_b), after[0], after[1], median(&mut err_a));
     Ok(())
 }
 
 /// The leaf springs standing: Cassie at a trajectory's last sample (feet down), at rest, motors
 /// locked, on the compliant ground, undamped; the springs ring as it settles into its load.
-fn stance(secs: f64) -> Result<(), String> {
+fn stance(secs: f64, k: f32) -> Result<(), String> {
     let urdf = cassie::load_urdf()?;
-    let p = Params { joint_damping: false, rod_damping: 0.0, ..Params::default() };
+    let p = Params { joint_damping: false, rod_damping: 0.0, k, ..Params::default() };
+    println!("ground stiffness {} N/m per toe", k);
     let hz = 2000.0f64;
     for i in [0usize, 5, 10, 15, 20, 23] {
         let t = cassie::load_traj(&cassie::data_dir(), i)?;
@@ -200,13 +209,36 @@ fn stance(secs: f64) -> Result<(), String> {
             // The first 0.3 s (the landing into load) left out
             let ring = &s[(0.3 * hz) as usize..];
             let f = dominant_from(ring, hz, 1.5);
-            let w = 2.0 * std::f64::consts::PI * f;
+            // The leaf springs' own modes with the foot down, above the body's bounce
+            let f5 = peak_above(ring, hz, 5.0).unwrap_or(f64::NAN);
+            let (w, w5) = (2.0 * std::f64::consts::PI * f, 2.0 * std::f64::consts::PI * f5);
             let tail = &s[s.len() / 2..];
-            print!("  {} {:.1} Hz (omega dt {:.2} at 240 Hz; settles at {:+.3} rad)", n, f, w / 240.0, tail.iter().sum::<f64>() / tail.len() as f64);
+            print!("  {} {:.1} Hz (omega dt {:.2}), above 5 Hz {:.1} Hz (omega dt {:.2} at 240 Hz); settles at {:+.3} rad", n, f, w / 240.0, f5, w5 / 240.0, tail.iter().sum::<f64>() / tail.len() as f64);
         }
         println!();
     }
     Ok(())
+}
+
+/// The largest local peak of a Hann-windowed spectrum strictly above `fmin` (Hz), in 0.25 Hz
+/// steps up to 200 Hz, with a linear trend removed: the leakage of a strong lower mode then ends
+/// at the edge rather than winning it. None if no interior peak.
+fn peak_above(x: &[f64], hz: f64, fmin: f64) -> Option<f64> {
+    let n = x.len() as f64;
+    let (mx, mk) = (x.iter().sum::<f64>() / n, (n - 1.0) / 2.0);
+    let slope = x.iter().enumerate().map(|(k, v)| (k as f64 - mk) * (v - mx)).sum::<f64>() / x.iter().enumerate().map(|(k, _)| (k as f64 - mk).powi(2)).sum::<f64>();
+    let y: Vec<f64> = x.iter().enumerate().map(|(k, v)| {
+        let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / (n - 1.0)).cos();
+        (v - mx - slope * (k as f64 - mk)) * hann
+    }).collect();
+    let power = |f: f64| {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (k, v) in y.iter().enumerate() { let a = 2.0 * std::f64::consts::PI * f * k as f64 / hz; re += v * a.cos(); im += v * a.sin(); }
+        re * re + im * im
+    };
+    let fs: Vec<f64> = (0..).map(|k| fmin + 0.25 * k as f64).take_while(|f| *f <= 200.0).collect();
+    let p: Vec<f64> = fs.iter().map(|f| power(*f)).collect();
+    (1..p.len() - 1).filter(|&k| p[k] > p[k - 1] && p[k] >= p[k + 1]).max_by(|&a, &b| p[a].partial_cmp(&p[b]).unwrap()).map(|k| fs[k])
 }
 
 fn main() {
@@ -215,7 +247,7 @@ fn main() {
         Some("--check") => check(),
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
-        Some("--stance") => stance(2.0),
+        Some("--stance") => stance(2.0, args.get(2).and_then(|a| a.parse().ok()).unwrap_or(9400.0)),
         Some("--probe") => probe(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(20), 4.0),
         _ => Err("usage: riftphys-cassie --check | --pluck | --stance | --rates | --probe [traj]".into()),
     };

@@ -302,6 +302,42 @@ impl Cassie {
     }
 }
 
+/// The passive joints whose recorded rates lag their positions by about 4.5 ms (the estimator
+/// filters them; the Reviewer measured lags of 9-10 samples, against 1 for the motor joints):
+/// the knee springs and the ankles, as (position column, rate column).
+pub const LAGGED_RATES: [(usize, usize); 4] = [(15, 37), (16, 38), (17, 39), (18, 40)];
+/// Samples for the one-sided fit at sample 0 (about 3.5 ms, before every jump's first contact).
+pub const START_FIT_SAMPLES: usize = 8;
+
+/// The derivative at sample 0 of a least-squares quadratic through column `col`'s first `n`
+/// samples: x = a + b (t - t0) + c (t - t0)^2, returning b.
+pub fn start_slope(t: &Traj, col: usize, n: usize) -> f64 {
+    let t0 = t.t[0];
+    // Normal equations for [a, b, c]
+    let mut m = [[0.0f64; 3]; 3];
+    let mut r = [0.0f64; 3];
+    for k in 0..n.min(t.x.len()) {
+        let dt = t.t[k] - t0;
+        let basis = [1.0, dt, dt * dt];
+        for i in 0..3 { r[i] += basis[i] * t.x[k][col]; for j in 0..3 { m[i][j] += basis[i] * basis[j]; } }
+    }
+    // Cramer's rule for b
+    let det3 = |a: [[f64; 3]; 3]| a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    let mut mb = m;
+    for i in 0..3 { mb[i][1] = r[i]; }
+    det3(mb) / det3(m)
+}
+
+/// Sample 0's state for the replay's start (PARITY_SPEC 3.4a): the recorded row with the lagged
+/// passive rates (knee springs, ankles) taken from a quadratic fit to their recorded positions
+/// over the first `START_FIT_SAMPLES` samples; the motor joints and the pelvis keep their
+/// recorded rates. The ankle springs are then solved by closure ([`loop_consistent`]).
+pub fn start_row(urdf: &Urdf, t: &Traj, p: &Params) -> Result<([f64; 45], [f64; 2]), String> {
+    let mut row = t.x[0];
+    for (pos, rate) in LAGGED_RATES { row[rate] = start_slope(t, pos, START_FIT_SAMPLES); }
+    loop_consistent(urdf, &row, p)
+}
+
 /// The state row with each ankle spring's rate (columns 41 and 43, unmeasured and 0 in the data)
 /// set so its achilles rod's length rate is 0: the loop-consistent start (PARITY_SPEC 3.4a). The
 /// positions already close the loop (the estimator's inverse kinematics), and the rod's rate is

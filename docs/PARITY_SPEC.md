@@ -500,6 +500,13 @@ which the paper itself names as the limit for Drake and MuJoCo.
 - **Half-step start,** as in W3, per body: v0 − ½(v1 − v0) from one trial step. The 5 ms
   before impact has no contact.
 - **Metric:** the loss above, on the paper's 22 jumps, and on all 29 as a second line.
+  - **A secondary line, decided before any fit:** the loss is measured against the recorded
+    rates, and the ankles' (weight 1) and knee springs' (0.01) lag their positions by about
+    4.5 ms (3.4a), through the impact where they change fastest, so a correct simulation is
+    penalised for the filter's delay. The paper's metric stays the pass (the same for both
+    engines, and 38.0's context). Beside it, the same loss with the knee springs' and ankles'
+    rates replaced by their recorded positions' derivative (a centred quadratic over 9 samples),
+    so each engine's loss shows how much of it is filter delay.
 - **Fit:** k, dissipation and μ by W3's CMA-ES with 5-fold cross-validation, so each jump's loss
   comes from a fit that didn't see it. The in-sample fit is reported too, since 38.0's split is
   unknown.
@@ -809,15 +816,25 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     beside it, with the model's solver settings otherwise unchanged; the reference for the pass is
     the stricter of the two on the held-out loss (D7's rule for P3). If Agility's model isn't
     stable at 240 Hz under an integrator, that is reported and that integrator pairs at 2 kHz.
-- **The recorded rates against the recorded angles (a cross-check, reported, not gated;
-  `riftphys-cassie --rates`):** each loop-consistent ankle-spring rate beside the slope of a line
-  through that spring's recorded angle over the first 6 samples (about 2.5 ms; the estimator's
-  inverse kinematics). They agree poorly: of 58 legs, 20 differ in sign (where either is above
-  0.2 rad/s) and 30 differ by more than 1 rad/s (largest: trajectory 3 left, −0.82 against
-  −6.96; trajectory 10, −0.29 / −1.52 against −3.58 / −4.44). The loop-consistent rate is built
-  from the other joints' recorded rates, so the recorded rates and positions aren't mutually
-  consistent at the first samples. That bounds how well any engine can match the window's first
-  milliseconds, for RiftPhys and MuJoCo alike.
+- **The passive joints' recorded rates lag their positions by about 4.5 ms (found by the
+  Reviewer from the data; decided before any fit).** Aligning each joint's recorded rate with the
+  derivative of its recorded position over all 29 jumps: the motor joints lag a median of 1
+  sample; the knee springs 9–10 samples; the ankles (tarsus) 9. The estimator filters the passive
+  joints' velocities, and their sample-0 values are about as large as their errors (knee spring:
+  median |slope − recorded| 0.68 / 0.54 rad/s against median |recorded| 0.63 / 0.40).
+  - **So the start (`cassie::start_row`, both engines):** the knee springs' and ankles' sample-0
+    rates come from a one-sided quadratic fit to their recorded positions over the first 8
+    samples (about 3.5 ms, before every jump's first contact); the motor joints and the pelvis
+    keep their recorded rates; then the ankle springs are solved by closure, as before. The
+    sensitivity line's construction is unchanged (the main start, the ankle springs then 0).
+  - **The validation (`riftphys-cassie --rates`, reported, not gated):** each closure's ankle-
+    spring rate against the slope at sample 0 of a quadratic through the recorded ankle-spring
+    angle's first 8 samples (the estimator's inverse kinematics, an independent estimate). From
+    the recorded rates: 15 of 58 legs differ in sign (either above 0.2 rad/s), 29 by more than
+    1 rad/s, median |difference| 1.00 rad/s (a linear slope over 6 samples gave 20 and 30). From
+    the refit rates: 2 differ in sign, both near 0; none by more than 1 rad/s; median
+    |difference| 0.05 rad/s. The recorded positions are loop-consistent at the rate level; the
+    recorded passive rates were not.
 - **Toe heights at sample 0:** 11–88 mm above the ground (sphere bottoms). The earliest ballistic
   arrival of any toe is 4.8–11.6 ms on the paper's 22, consistent with "about 5 ms before
   impact" and the public offsets already applied. So the half-step start's trial step (4.17 ms
@@ -838,16 +855,22 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     leg that was the creep. The Reviewer asked for the check rather than an interpretation;
     `riftphys-cassie --probe` prints each joint's motion, limit margin and frequency.
   - These are the swing leg's modes.
-- **Leaf springs standing** (`riftphys-cassie --stance`: a trajectory's last sample, at rest,
-  motors locked, undamped, on the compliant ground at 9400 N/m, the pelvis on a vertical guide,
-  2 kHz for 2 s, the first 0.3 s left out): the dominant mode is the body's bounce on its legs and
-  the ground, 2–2.5 Hz on all six trajectories, with the springs and the ground in series: ω dt
-  0.05–0.07 at 240 Hz, where implicit Euler keeps 0.82–0.85 per period. Its period (400–500 ms)
-  is far longer than the window. Unguided, with the motors locked, the robot toppled within 2 s
-  and its pelvis fell through the floor (only the toes collide), so the guide is needed.
-  - **So for D9:** standing, the integrator's damping is small; it bites on the swing-leg modes
-    (8.5–23.5 Hz, 0.19–0.51 per period at 240 Hz), the legs' motion relative to the body during
-    the impact.
+- **Leaf springs standing** (`riftphys-cassie --stance [k]`: a trajectory's last sample, at rest,
+  motors locked, undamped, on compliant ground, the pelvis on a vertical guide, 2 kHz for 2 s,
+  the first 0.3 s left out; trajectories 0, 5, 10, 15, 20, 23):
+  - the dominant mode is the body's bounce at 2–2.5 Hz, the same with the ground at 9400 and at
+    94,000 N/m per toe, so it is the body on the leaf springs, not the ground: the stance
+    leaf-spring mode. ω dt 0.05–0.07 at 240 Hz, keeping 0.82–0.85 per period; its period
+    (400–500 ms) is far longer than the window;
+  - above 5 Hz (the largest interior peak of a Hann-windowed spectrum of the knee- and ankle-
+    spring coordinates): 5.2–7.5 Hz (one 10.2) at 9400 N/m, mostly 7–11 Hz (one 18) at
+    94,000 N/m, so these modes couple the springs and the ground and move with the fitted k.
+    ω dt 0.13–0.29 at 240 Hz, keeping 0.42–0.67 per period;
+  - unguided, with the motors locked, the robot toppled within 2 s and its pelvis fell through
+    the floor (only the toes collide), so the guide is needed.
+  - **So for D9:** the integrator's damping is small on the stance bounce (0.82–0.85 per period),
+    moderate on the springs' modes with the foot down (0.42–0.67), and largest on the swing-leg
+    modes (0.19–0.51). "Small for stance" covers the bounce only.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
@@ -1583,8 +1606,9 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     model, hung (3.4a), they ring in two modes per leg at 8.5–23.5 Hz: ω dt 0.22–0.62 at 240 Hz,
     where implicit Euler keeps (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.19–0.51 of the amplitude per period;
     0.03–0.07 at 2 kHz. The swing-leg periods (43–118 ms) are as long as or longer than the
-    window. Standing (3.4a, on a vertical guide), the dominant mode is the body's bounce at
-    2–2.5 Hz, ω dt 0.05–0.07 at 240 Hz, keeping 0.82–0.85 per period. MuJoCo's springs aren't damped
+    window. Standing (3.4a, on a vertical guide), the body's bounce on the leaf springs is at
+    2–2.5 Hz (ω dt 0.05–0.07, keeping 0.82–0.85 per period), and the springs' modes coupled with
+    the ground at 5–11 Hz (ω dt 0.13–0.29, keeping 0.42–0.67), moving with the fitted k. MuJoCo's springs aren't damped
     numerically there, so the paired 240 Hz comparison shows it directly. The URIEL biped has no
     compliant rows, dampers or armature, and 240 Hz is already its rate: the handicap comes
     from a feature the biped workload doesn't use today.
