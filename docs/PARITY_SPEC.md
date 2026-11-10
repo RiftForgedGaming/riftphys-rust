@@ -575,40 +575,148 @@ which the paper itself names as the limit for Drake and MuJoCo.
   of 10 as "made up"; RiftPhys's compliant contact is Drake's Hunt–Crossley form
   (materials.rs), so k and d in s/m fit like for like.
 
-### 3.4b W4c and W4d: anchored distance joints, collider offsets (drafted 2026-11-10, for review)
+### 3.4b W4c and W4d: anchored distance joints, collider offsets (drafted 2026-11-10, reviewed the same day)
+
+The RiftPhys Reviewer approved both designs on 2026-11-10, with the changes folded in below:
+an accumulated damper, the SHAKE form written out, new goldens, the swept reach, and one pose
+accessor.
 
 **W4c: a distance joint with anchors and damping.**
 - **Today:** `DistanceJoint { a, b, rest, compliance, lambda_acc }` holds the two COMs at
-  `rest`, with inverse masses 1/m only.
+  `rest`, with inverse masses 1/m only. Its velocity row applies a fresh impulse every
+  iteration (no accumulator) with a Baumgarte bias.
 - **Change:** local anchors `la`, `lb` (in each body's frame) and a damping coefficient `c`
-  (N s/m), set by `World::add_distance_joint_at(a, la, b, lb, rest, compliance)` and
-  `set_distance_damping(id, c)`. The existing `add_distance_joint` keeps la = lb = 0, so every
-  scene that uses it now is bit-identical (checked by the existing hashes).
-- **Position row:** n along the anchors' separation, generalised inverse mass
-  w = 1/m_a + 1/m_b + (r_a × n)ᵀ I_a⁻¹ (r_a × n) + (r_b × n)ᵀ I_b⁻¹ (r_b × n), angular
-  corrections I⁻¹ (r × n) λ. Under SHAKE, n and the lever arms come from the start-of-step
-  anchors, as the D6 rows' do.
-- **Velocity row** (rigid rods only, as today's compliant ones act at position level): the
-  same generalised mass.
-- **Damping:** a soft velocity row along n, v_rel + γλ = 0 with γ = 1 / (c dt), as W3a's
-  damper; it runs for compliant and rigid rows alike, and only when c > 0.
-- **Tests:**
-  - a rod between two hinged levers passes torque at the lever-arm ratio (static: a weight on
-    one lever is held by the other's spring at the closed-form angle);
-  - a static load F stretches it by F × compliance;
-  - with Drake's 1e6 and 2e3, a plucked rod settles without ringing; at c = 0 it rings at the
-    closed-form frequency;
-  - the anchored row at la = lb = 0 is bit-identical to today's (hashes).
+  (N s/m). They are set by `World::add_distance_joint_at(a, la, b, lb, rest, compliance)` and
+  `set_distance_damping(id, c)`.
+- **Zero anchors and no damping run today's two functions untouched** (a branch, not
+  arithmetic). At la = lb = 0 the mixed form below would give (wa + wb)(n·n_cur) + α against
+  today's (wa + wb + α)(n·n_cur), and a zero angular delta through a quaternion update can
+  change bits. Checked by new goldens, `distance_bits_test.rs`, recorded at f781e2a before the
+  change (debug and release agree):
+
+  | scene | 60 Hz | 240 Hz |
+  |---|---|---|
+  | rigid rod | 87f81a83f9615530 | e7411745726c1915 |
+  | compliant rod | 6f111d612da3e10f | ed532e5e87913e18 |
+  | guard controller | bb57c95b1772e5eb | c1a92484be836750 |
+
+  Nothing golden covered a distance joint before.
+- **Position row, SHAKE form:**
+  - C = |x_b − x_a| − rest, measured on the current anchors; n_cur is its direction, with
+    r_a, r_b the current lever arms.
+  - Correct along n0, the start-of-step anchors' direction. The lever arms are r_a0 = R_a,start
+    l_a and r_b0, and the inverse inertias I_a0⁻¹, I_b0⁻¹ are taken at the start-of-step
+    orientations, as D6 does.
+  - The denominator is the mixed Jacobian product w_mix = (w_a + w_b)(n_cur·n0)
+    + (r_a × n_cur)ᵀ I_a0⁻¹ (r_a0 × n0) + (r_b × n_cur)ᵀ I_b0⁻¹ (r_b0 × n0).
+  - Δλ = −(C + α λ_acc) / (w_mix + α): SHAKE's Newton step, with the compliance exact.
+  - Position deltas ∓ w n0 Δλ; orientation deltas ∓ I0⁻¹ (r0 × n0) Δλ.
+  - **Fallback** to current-iterate (PBD) directions, lever arms and inertias when either body
+    turned more than `SHAKE_MAX_TURN` this step, or w_mix < ½ w_sym, where w_sym is the
+    start-of-step generalised mass.
+- **Velocity rows** are `JointRow`s in the same list the D6 rows use, so each gets an
+  accumulator, the generalised mass and the solve branch:
+  - a rigid rod: an equality row along the current n with the current lever arms, target 0, as
+    D6's locked rows (the position solve removes drift; the old Baumgarte bias isn't kept on
+    the anchored path);
+  - a compliant rod has no velocity row.
+  - **Not warm-started.** The rows start cold each step, so they add nothing to the carried
+    state or the hash.
+- **Damping (revised after the build, the Reviewer's design):** in the compliant row's own
+  position step, XPBD's damping term (Macklin, Müller and Chentanez 2016):
+  Δλ = −(C + α̃ λ_acc + γ̃ ΔC) / ((1 + γ̃) w + α̃), α̃ = compliance / dt², γ̃ = compliance c / dt,
+  where ΔC is the row's change since the step's start and w is w_mix (with its fallback).
+  - **Why:** built first as a velocity row (above, as drafted), the damper ran before the
+    spring's projection, resisted each step's fresh gravity increment, and so carried
+    c dt / (m + c dt) of a static load. A 2 kg box on a compliant rod with c = 20 at 60 Hz
+    stretched 0.857 of F × compliance, exactly that. The spring and damper are now one implicit
+    Kelvin-Voigt row; at rest ΔC = 0, so the spring carries the whole load.
+  - **The same for D6:** a compliant D6 row with damping (`set_d6_damping` on an enabled row with
+    compliance > 0) takes the same term, with ΔC from the row's start-of-step coordinate (its
+    hinge angle, alignment measure or anchor gap), and no longer emits a damper velocity row.
+    W3a's free-axis and limited dampers stay velocity rows, bit for bit. W3a's compliant-row
+    case had this flaw and is fixed here (3.8).
+  - **Hashes:** no golden scene has damping on a compliant row (the only non-test users of
+    `set_d6_damping` are the double pendulum's free hinges and the URDF loader), so none moves.
+- **The integrator's own damping of compliant rows (found building W4c):** a compliant row is
+  corrected at position level only, so it behaves like implicit Euler and loses energy by
+  itself. Measured with no damper: the amplitude falls to 0.94 per period at ω dt = 0.02 (and
+  0.73 at ω dt = 0.1); Drake's achilles spring on 0.5 kg at 2 kHz (ω dt = 0.71) undershoots
+  only to −0.36 of its start. For W4 this is Cassie's leaf springs at 240 Hz (D9). Their
+  frequencies are to be measured on the built model (hung, each spring plucked at 2 kHz), not
+  estimated, before any fit.
+- **Tests** (`distance_anchor_test.rs`, 6, and `distance_bits_test.rs`), all passing:
+  - the goldens above, bit for bit;
+  - two hinged levers joined by an anchored rod pass torque at the lever-arm ratio within 2%,
+    with the levers at 90°, 60° and 120°, rigid and at compliance 1e-5;
+  - a static load stretches the rod by F × compliance within 1% with damping 0, 20 and 200 N s/m,
+    at 60 and 240 Hz; a damped compliant hinge sags to its static angle within 1% with damping
+    0, 2 and 20 N m s/rad, at 60 and 240 Hz;
+  - the damper, where the oscillator is resolved (ω dt = 0.02 at 240 Hz; at the drafted 0.1 the
+    integrator's own decay, 0.73 per period, swamped it), measured against the undamped run's
+    decay: undamped period within 1%; at ζ = 0.1 the damped period within 2% and the damper's
+    decay per period 0.5262 against e^(−ζωT) = 0.5318; at ζ = 1 an undershoot of 1.4% of the
+    start (critical damping is the boundary; gate 2%);
+  - Drake's 1e6 and 2e3 at 2 kHz: settles with no overshoot; at c = 0 it undershoots to −0.36
+    (it doesn't ring long: see the integrator's own damping above);
+  - a closed loop (two levers, a compliant damped rod, a damped sprung hinge) released under
+    gravity: energy, counting both springs, never rises above its start (0.6900 J, to 0.6445 at
+    60 Hz and 0.6471 at 240 Hz over 5 s), and the rod stretches at most 1.9 mm.
 
 **W4d: collider offsets.**
-- **Change:** `Collider` gains `local: Isometry` (the shape's pose in the body frame, default
-  identity), set by `World::add_collider_at(body, local, shape, material)`. Every place that
-  reads a collider's world pose (broadphase AABBs, narrowphase, CCD, queries; about 46 uses)
-  takes body pose × local.
-- **The rule:** identity local gives bit-identical results; the existing hashes check it.
-- **Tests:** a sphere offset 0.5 m from a box's COM, dropped on its corner side, rests with
-  the box tilted at the closed-form angle; a spinning body's offset sphere contacts where its
-  world position says; the at-rest suite and golden hashes unchanged.
+- **Change:** `Collider` gains `local: Option<Isometry>` (the shape's pose in the body frame),
+  set by `World::add_collider_at(body, local, shape, material)`. `add_collider_at` never touches
+  mass, as `add_collider` doesn't: the URDF's mass stays authoritative.
+- **One accessor,** `Collider::world_pose(body_pose)`, which returns `body_pose` itself when
+  `local` is `None` and `body_pose * local` otherwise. Every read of a collider's world pose
+  goes through it.
+  - So identity is bit-identical by construction, not by arithmetic (q·IDENTITY turns −0.0
+    into +0.0, which atan2, copysign and 1/x see).
+  - Missing a site is impossible.
+- **The swept reach:** step.rs inflates each collider by (|v_lin| + |ω| reach) dt, with reach
+  the collider's own AABB half-diagonal and v_lin the COM's speed. For an offset collider,
+  reach becomes |local.pos| + the half-diagonal (0 + half for no offset, so bit-identical).
+  - **Why:** a toe turning at 50 rad/s at 60 Hz moves a sphere 0.1 m from the toe's COM 83 mm
+    per step, while today's sweep adds 1.4 mm. The contact would be found late, or not at all,
+    in the impact step.
+- Contacts store world points, and the solver's lever arm is point − COM, so the solver needs no
+  change. Only the toe spheres collide, and directly jointed pairs are filtered (step.rs), so
+  self-collision isn't a concern.
+- **Tests:**
+  - one offset-collider test per path: AABB and broadphase, the sphere-against-ground
+    narrowphase pair the toes use, CCD/TOI, raycast, shape cast and overlap;
+  - a free body spinning about its COM with a 1 mm sphere 0.1 m off it, approaching the floor
+    at 60 Hz, finds the contact before penetrating more than the margin (fails on today's
+    reach);
+  - the lever arm, directly: a body with one offset sphere, dropped flat so the sphere touches
+    first, has the angular velocity of the rigid-body point-impact closed form (r × J) right
+    after;
+  - a sphere offset 0.5 m from a box's COM rests with the box tilted at the closed-form angle;
+  - the at-rest suite and the golden hashes unchanged.
+
+**W4d, built (2026-11-10):** `Collider::local`, `world_pose`, `reach`; `add_collider_at`. The
+broadphase sweep, both narrowphase paths, the AABB updates, `raycast_exact` and the capsule
+sweep's discrete check read through `world_pose`; `raycast` and the capsule sweep's continuous
+part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
+`World::integrate_positions` are never called (dead code), so they aren't touched.
+- **Tests** (`collider_offset_test.rs`, 5), all passing:
+  - the AABB follows the offset, turned and after a step;
+  - `raycast_exact`, `raycast` and the capsule sweep hit the offset sphere and miss the COM;
+  - a body spinning at 50 rad/s about its COM with a 1 mm sphere 0.1 m off it, falling on the
+    floor: whenever the sphere could reach the floor within the step, its contact exists
+    (mutation-checked: with the old reach, the sphere was 87.8 mm up, within reach, with no
+    contact at 60 Hz). At 240 Hz the first impact acts at 0.17 mm deep. At 60 Hz (0.83 rad a
+    step) it acts at 5 mm deep: a linear speculative contact can't follow so coarse an arc,
+    offset or not, so that depth is printed, not gated;
+  - the lever arm, directly: a bar falling flat at 1 m/s onto one sphere 0.3 m from its COM
+    spins at the point-impact closed form within 2% (2.2906 against 2.2907 rad/s) once the
+    contact point's normal velocity is 0 (the impact takes two steps: speculative, then
+    arrival);
+  - a bar resting on two spheres 0.5 m either side of its COM stays level (under 1e-3 rad) at
+    the spheres' height (within 1 mm), at 60 and 240 Hz. This replaces the drafted tilted-box
+    test, which was the same check made indirect.
+
+**Order:** W4c, then W4d, then the W4 model.
 
 ### 3.5 W5: lever-arm conditioning (P5, only if shown)
 
@@ -1050,7 +1158,8 @@ Builds and tests ran single-core while URIEL's holonomy run was going.
 `World::set_d6_damping(joint, angular, axis, c, tau_f)`), velocity rows on any axis, free ones
 included:
 - **Damper:** a soft row, v + γλ = 0 with γ = 1 / (c dt), so the impulse is −c dt v_end:
-  implicit, stable for any c. Its per-step factor is 1 / (1 + c dt / I), a rate of
+  implicit, stable for any c. (On a compliant row this carried part of a static load; since
+  W4c a compliant row's damping is XPBD's damping term in its position row, 3.4b.) Its per-step factor is 1 / (1 + c dt / I), a rate of
   ln(1 + c dt / I) / dt, which tends to c / I. A fitted c absorbs the difference; report
   c dt / I with any comparison to a paper's identified c.
 - **Friction:** target 0, impulse within ±τ_f dt.
@@ -1313,8 +1422,21 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
   - **The options:** 240 Hz, the biped's workload rate (12 steps over the window; the 2 kHz
     samples are compared against states interpolated between steps), or 2 kHz, the data's rate.
     Drake ran at 12.5–20 kHz.
-  - **Proposed:** pass at 240 Hz, since parity is per workload (D1) and P1 is judged at the
-    workload's rate; report 2 kHz beside it.
+  - **The handicap, named:** compliant rows damp themselves (3.4b). Cassie's leaf springs (knee
+    k 1500, ankle 1250 N m/rad) are estimated at ω dt ≈ 0.7 at 240 Hz, where implicit Euler keeps
+    about (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.17 of the amplitude per period; at 2 kHz ω dt ≈ 0.08. The
+    spec carries the measured values once the model is built. MuJoCo's springs aren't damped
+    numerically there, so the paired 240 Hz comparison shows it directly. The URIEL biped has no
+    compliant rows, dampers or armature, and 240 Hz is already its rate: the handicap comes
+    from a feature the biped workload doesn't use today.
+  - **Proposed (the Reviewer's wording):** pass at 240 Hz, the workload rate (D1), with 2 kHz
+    reported beside it, and what each outcome means fixed now, before any fit:
+    - (a) passes at 240 Hz: a pass;
+    - (b) fails at 240 Hz, passes at 2 kHz: a fail at the workload rate. It's put down to the
+      compliant rows' integrator damping only if a 240 Hz run with the leaf springs made rigid
+      (or their ω dt shown irrelevant) closes the gap. A follow-up item for a less dissipative
+      compliant row is logged, and it isn't reported as parity;
+    - (c) fails at both: model mismatch or the engine, investigated as usual.
 - **D10:** downloads for W4.
   - **Needed:** Agility's MuJoCo model, as the paper used it: github.com/osudrl/cassie-mujoco-sim
     `model/cassie.xml` (22,344 bytes) and `model/cassie-stl-meshes/` (11 STL files, 2,049,524
@@ -1327,6 +1449,13 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     bytes, MIT). They would be read with `pickletools` only, never unpickled, to confirm the
     position and orientation weights.
   - **Without it there is no valid P4 bar** (D4, reframed).
+  - **Downloaded 2026-11-10 (Designer: "Yes, download"):** `model/cassie.xml` and
+    `model/cassie-stl-meshes/` from osudrl/cassie-mujoco-sim at commit 188d3d7, into
+    `riftphys-parity-data/cassie-mujoco-sim/` (outside this repository; SHA-256 in its
+    SOURCE.txt). It came to 14 files, 2,242,036 bytes, not the 2.07 MB quoted: the first listing
+    was cut short and missed two meshes that `cassie.xml` references (`achilles-rod.stl`,
+    `foot-crank.stl`; 170,168 bytes). Every file matches the host's listed size. The loss-weight
+    pickles aren't downloaded.
   - Nothing else is needed: the per-jump `drake_optimal` and `mujoco_optimal` runs are on the
     raw windows (above).
 - **D5:** downloads: the double pendulum (encoder data and CAD) and the Cassie dataset. Each needs
