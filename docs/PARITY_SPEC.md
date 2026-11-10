@@ -505,8 +505,15 @@ which the paper itself names as the limit for Drake and MuJoCo.
     4.5 ms (3.4a), through the impact where they change fastest, so a correct simulation is
     penalised for the filter's delay. The paper's metric stays the pass (the same for both
     engines, and 38.0's context). Beside it, the same loss with the knee springs' and ankles'
-    rates replaced by their recorded positions' derivative (a centred quadratic over 9 samples),
-    so each engine's loss shows how much of it is filter delay.
+    rates replaced by their recorded positions' derivative, so each engine's loss shows how much
+    of it is filter delay.
+    - **The derivative:** a least-squares quadratic over 9 samples on the real sample times (not
+      an assumed 0.5 ms; they are 0.27–0.78 ms apart), centred where it can be; in the first and
+      last 4 samples the window stays 9 samples long and one-sided, ending at the sequence's
+      edge, as the start's fit does.
+    - **A diagnostic line, not a second truth:** the 9-sample window (about 4.5 ms) also smooths
+      the impact transient itself, so this line shows the filter delay's share of the loss; it
+      doesn't replace the measured rates.
 - **Fit:** k, dissipation and μ by W3's CMA-ES with 5-fold cross-validation, so each jump's loss
   comes from a fit that didn't see it. The in-sample fit is reported too, since 38.0's split is
   unknown.
@@ -865,12 +872,14 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
   - above 5 Hz (the largest interior peak of a Hann-windowed spectrum of the knee- and ankle-
     spring coordinates): 5.2–7.5 Hz (one 10.2) at 9400 N/m, mostly 7–11 Hz (one 18) at
     94,000 N/m, so these modes couple the springs and the ground and move with the fitted k.
-    ω dt 0.13–0.29 at 240 Hz, keeping 0.42–0.67 per period;
+    Most sit at ω dt 0.13–0.29 at 240 Hz, keeping 0.42–0.67 per period; the exceptions are
+    10.2 Hz at 9400 N/m (ω dt 0.27) and 18 Hz at 94,000 N/m (ω dt 0.47, keeping about 0.26);
   - unguided, with the motors locked, the robot toppled within 2 s and its pelvis fell through
     the floor (only the toes collide), so the guide is needed.
   - **So for D9:** the integrator's damping is small on the stance bounce (0.82–0.85 per period),
-    moderate on the springs' modes with the foot down (0.42–0.67), and largest on the swing-leg
-    modes (0.19–0.51). "Small for stance" covers the bounce only.
+    moderate on most of the springs' modes with the foot down (0.42–0.67, down to about 0.26 for
+    the 18 Hz one at the stiffer ground), and largest on the swing-leg modes (0.19–0.51). "Small
+    for stance" covers the bounce only.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
@@ -1608,7 +1617,8 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     0.03–0.07 at 2 kHz. The swing-leg periods (43–118 ms) are as long as or longer than the
     window. Standing (3.4a, on a vertical guide), the body's bounce on the leaf springs is at
     2–2.5 Hz (ω dt 0.05–0.07, keeping 0.82–0.85 per period), and the springs' modes coupled with
-    the ground at 5–11 Hz (ω dt 0.13–0.29, keeping 0.42–0.67), moving with the fitted k. MuJoCo's springs aren't damped
+    the ground at 5.2–18 Hz: most at ω dt 0.13–0.29 (keeping 0.42–0.67), the highest, 18 Hz with
+    the ground at 94,000 N/m, at 0.47 (keeping about 0.26); they move with the fitted k. MuJoCo's springs aren't damped
     numerically there, so the paired 240 Hz comparison shows it directly. The URIEL biped has no
     compliant rows, dampers or armature, and 240 Hz is already its rate: the handicap comes
     from a feature the biped workload doesn't use today.
