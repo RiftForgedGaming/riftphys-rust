@@ -246,8 +246,9 @@ fn peak_above(x: &[f64], hz: f64, fmin: f64) -> Option<f64> {
 fn replay_all(hz: f64, line: cassie::Line) -> Result<(), String> {
     let urdf = cassie::load_urdf()?;
     let ankle_c: Option<f64> = std::env::var("CASSIE_ANKLE_C").ok().and_then(|v| v.parse().ok());
-    let iters: u32 = std::env::var("CASSIE_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-    let iters_pos: u32 = std::env::var("CASSIE_ITERS_POS").ok().and_then(|v| v.parse().ok()).unwrap_or(iters);
+    // P4's iterations are the biped workload's (8, 6) (D9); CASSIE_ITERS[_POS] override them
+    let iters: u32 = std::env::var("CASSIE_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let iters_pos: u32 = std::env::var("CASSIE_ITERS_POS").ok().and_then(|v| v.parse().ok()).unwrap_or(if std::env::var("CASSIE_ITERS").is_ok() { iters } else { 6 });
     let p = Params { ankle_spring_c: ankle_c, iters: (iters, iters_pos), ..Params::default() };
     println!("iterations ({}, {})", iters, iters_pos);
     println!("ankle-spring damping: {}", ankle_c.map_or("the URDF's 10".to_string(), |c| c.to_string()));

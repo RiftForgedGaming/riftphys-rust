@@ -986,8 +986,14 @@ the same implicit-Euler accuracy.
   depth less the margin) and v_n the relative normal velocity (B − A, along n, positive
   separating):
   - the spring acts at the end-of-step penetration, pen0 − h v_n;
-  - Hunt–Crossley's damping linearised, c = k d max(pen0, 0), so the linear part is unconditionally
-    stable;
+  - Hunt–Crossley's damping linearised, c = k d max(pen_mid, 0), with pen_mid = pen0 − ½ h v_n0
+    the predicted mid-step penetration (v_n0 the contact's normal velocity after external forces,
+    before the solve), so the row stays linear and the linear part is unconditionally stable. At
+    rest pen_mid = pen0. (The Reviewer's change: with pen0, the arrival step always had c = 0, and
+    each later step's damping lagged a whole step of penetration growth, about 8 mm at 240 Hz and
+    2 m/s, when Hunt–Crossley's damping matters most. Dropping the k d ẋ0 Δx cross term is the
+    linearly implicit choice.) The step-start form stays available as a diagnostic
+    (`World::set_compliant_damping_at_start`);
   - in soft-step terms γ = 1 / (h (c + h k)) and β = h k / (c + h k): the row targets
     v_n,end = β pen0 / h − γ λ, so each iteration takes Δλ = m_soft (β pen0 / h − v_n − γ λ_acc),
     m_soft = 1 / (1 / m_eff + γ), with the accumulated λ clamped ≥ 0. At rest (v_n = 0) it gives
@@ -999,17 +1005,39 @@ the same implicit-Euler accuracy.
   correction for them; compliant contacts stay out of W6's bounce pass and the shock pass (as now);
   friction reads the soft row's accumulated λ; the row starts cold (no warm start, so no new
   carried state); rigid contacts untouched, bit for bit (the existing goldens).
-- **The explicit form kept as an option** (`MatPairProps::compliant_explicit`), off by default,
-  only if the cube tosses' compliant result can't be restated (below).
+  - **Why cold, when rigid contacts warm-start:** at Cassie's numbers the row is very soft at
+    240 Hz (γ ≈ 6 against 1/m_eff ≈ 0.2), so it converges in an iteration or two.
+  - **A third integrator-damping source for D9:** implicit Euler on the contact spring dissipates
+    on its own, like the leaf springs, so a 240 Hz bounce comes out below Hunt–Crossley's e.
+- **The explicit form, `MatPairProps::compliant_explicit`** (off by default). **The rule, stated
+  before the cube tosses' refit:** if the compliant line restated with the implicit form is still
+  no worse than its reference under D2 (held out, Drake and Bullet), the explicit form is dropped;
+  otherwise it stays as a pair option for the cube tosses only, and Cassie uses the implicit one.
 
-**Tests:**
+**Tests (built 2026-11-10, `compliant_contact_test.rs`, all passing):**
 - static rest at F / k within 1% at 60 Hz, 240 Hz and 2 kHz;
-- a drop at 2 kHz matching Hunt–Crossley's restitution for d (e from d ≈ 3(1 − e) / (2 v_in))
-  within a few %, reported at 240 Hz;
-- a 0.15 kg toe link on a hinge landing at 2 m/s, with k at ×1 and ×100: bounded at 240 Hz (the
-  explicit form explodes);
-- Cassie's trajectory 0 at 240 Hz scored against its own 2 kHz run, before and after;
-- the existing compliant tests (`compliant_contact_test.rs`) and the goldens.
+- the bounce against Hunt–Crossley's own ODE, integrated by RK4 at 1 µs (the e(d) relation
+  d ≈ 3(1 − e) / (2 v_in) is only approximate), gravity off, 1 m/s: at 2 kHz with k 1000 N/m on
+  1 kg (ω dt 0.016), within 5%: e 0.975 / 0.915 / 0.814 against 1.000 / 0.937 / 0.833 for d 0 /
+  0.1 / 0.3, the rest the implicit spring's own dissipation; the step-start and mid-step damping
+  agree there to 0.001. At 240 Hz (reported): 0.814 / 0.768 / 0.689. At k 10,000 (ω dt 0.05 at
+  2 kHz): 0.843 against 0.909, and 0.494 at 240 Hz;
+- a 0.15 kg toe link on a hinge whose 1 mm tip sphere lands at 2 m/s, at 240 Hz: bounded with k
+  at 9400 and 940,000 N/m (peak spin 3.8 and 2.5 rad/s from 20; under 1 mm deep). The explicit
+  form on the same scene: 730,399 rad/s and 95 mm deep at 9400, 4.5e9 rad/s at ×100;
+- a box at rest on a 20° compliant slope with μ 0.6 creeps under 1 mm in 5 s at 60 Hz (friction
+  reads the soft row's normal impulse);
+- the existing compliant tests and the goldens.
+- **The cube tosses' compliant line, restated** (`--fit --compliant --evals 350 --seed 2`, implicit
+  form; PHYSICS_FIDELITY.md 2): held out 14.0% position, 16.9 degrees, e_q 0.28 (explicit before:
+  13.2, 17.1, 0.29), against Drake's 13.5, 16.5, 0.27. Under D2 (2 SE on 285 tosses: 1.16, 2.2,
+  0.063) each is no worse than Drake, so **by the rule stated above, the explicit form is dropped**
+  (`compliant_explicit` and the step-start impulse removed). The fit: k 20068, d 2.976, mu_s 0.693,
+  mu_k 0.185 (explicit: 13591, 3.515, 0.220, 0.186). `riftphys_cube_fit_compliant.json` in the
+  parity data is the new fit; the old one is kept beside it as `..._explicit.json`.
+- **Cassie** (unfitted, Table VI contact; 3.4a): trajectory 0 at 240 Hz against its own 2 kHz run,
+  339 → 54.6 (contact ×100: 271,260 → 50.5); the paper's 22, mean loss 222.8 → 77.4 at 240 Hz and
+  30.2 → 30.6 at 2 kHz.
 
 **What moves:**
 - everything fitted with compliant contact: the cube tosses' compliant fit (22be79e,
@@ -1776,10 +1804,20 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     the 22 the count barely moves the loss (3.4a: 214–238 at 240 Hz, 28.7–30.2 at 2 kHz).
     Proposed: the pass at the workload's (8, 6), with the curve (8, 20, 80, 320) reported; if
     parity ever needs more, the URIEL report says the workload would have to adopt that count.
+    - **Decided 2026-11-10 (Designer: "Yes, use (8, 6)"):** P4 is judged at the biped workload's
+      (8, 6) solver iterations; the curve is reported beside it. The Cassie replay's default
+      becomes (8, 6).
   - **What the first measurements say about outcome (a)–(c):** unfitted, RiftPhys's 240 Hz loss
     is about eight times its 2 kHz loss, mostly from the explicit compliant contact (3.4a). A
     pass at 240 Hz likely needs an implicit compliant contact first. Not a result: the fit and
     the MuJoCo pairing aren't run.
+  - **After W4e (implicit compliant contact, 3.4d), at the decided (8, 6), unfitted (Table VI
+    contact), the paper's 22, main line:** mean loss 65.0 at 240 Hz (sensitivity 65.0; de-lagged
+    75.9) and 29.2 at 2 kHz (sensitivity 29.2; de-lagged 40.6). The 240 Hz curve now rises with
+    iterations: 65.0 at (8, 6), 77.4 at 20, 90.0 at 80, 91.4 at 320. A less converged solve fits
+    the data better at 240 Hz, most likely because its residual acts as extra damping; that is
+    noted as a finding, not credited. Still not a P4 result: the fit and the MuJoCo pairing
+    remain.
 - **D10:** downloads for W4.
   - **Needed:** Agility's MuJoCo model, as the paper used it: github.com/osudrl/cassie-mujoco-sim
     `model/cassie.xml` (22,344 bytes) and `model/cassie-stl-meshes/` (11 STL files, 2,049,524

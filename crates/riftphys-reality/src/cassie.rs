@@ -78,7 +78,8 @@ pub struct Params {
     pub armature: bool,
     /// The toe spheres (false: no contact, for the half-step start's trial step).
     pub toes: bool,
-    /// Solver iterations (velocity, position); the World's default is (20, 20).
+    /// Solver iterations (velocity, position): the biped workload's (8, 6), at which P4 is judged
+    /// (D9, decided 2026-11-10); the World's own default is (20, 20).
     pub iters: (u32, u32),
     /// Apply the measured motor torques (false: none, a diagnostic).
     pub inputs: bool,
@@ -90,7 +91,7 @@ impl Default for Params {
     fn default() -> Self {
         // Contact at Table VI's Drake values until fitted
         Self { knee_k: 1500.0, ankle_k: 1250.0, rod_compliance: 1.0e-6, rod_damping: 2.0e3, toe_r: 0.001,
-               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (20, 20), inputs: true, ankle_spring_c: None }
+               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (8, 6), inputs: true, ankle_spring_c: None }
     }
 }
 
