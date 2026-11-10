@@ -362,8 +362,8 @@ horizon, and better than Euler at 0.1, 0.25 and 0.5 s (1 s not separated):**
     solve.
 - **Feet:** toe contact as the paper models it (line or point contacts). Compliant contact
   (22be79e) is fitted the same way as for cubes.
-- **Torques:** applied from the measured motor torques through the gear ratios. There's no
-  controller, so the replay is open loop over 50 ms.
+- **Torques:** ~~applied from the measured motor torques through the gear ratios~~ (wrong: they
+  are joint-side, 3.4a). Applied as measured, open loop over 50 ms; there's no controller.
 
 **W4b design: axis-only armature** (drafted 2026-11-07 overnight, for review before building).
 - **The model:** a rotor geared rigidly to the joint, inertia J_a (rotor inertia × gear
@@ -408,13 +408,207 @@ horizon, and better than Euler at 0.1, 0.25 and 0.5 s (1 s not separated):**
   - a rollback across a step with armature replays hash for hash;
   - across an impact on a jointed limb, the rotor's momentum change equals the row impulses.
 
-**Pass (P4):** RiftPhys's loss with fitted contact parameters is ≤ 38.0 (Drake) on the same
+**Pass (P4), superseded by 3.4a (review 2026-11-10):** RiftPhys's loss with fitted contact parameters is ≤ 38.0 (Drake) on the same
 22 jumps and metric. If per-jump losses can be reproduced, use the comparison rule against
 MuJoCo's 30.0 instead.
 
 **Estimate:** about 1–2 weeks: model and loader 3–4 days, armature 1 day, replay and fit
 2–3 days, debugging the closed loops and springs the rest. The biggest risk is model mismatch,
 which the paper itself names as the limit for Drake and MuJoCo.
+
+### 3.4a W4 build plan, from the paper's code (drafted 2026-11-10, for review before building)
+
+**Sources.** I read these as text; nothing was downloaded:
+- the paper (arXiv 2110.00541, the corrected version);
+- dairlib `examples/Cassie/cassie_utils.{h,cc}` (master);
+- the paper's evaluation code, on dairlib's `contact_model_verification` branch
+  (`examples/contact_parameter_learning/`, MIT, last commit 2022-02-24).
+
+**What they show, and where 3.4 changes:**
+- **The 22 jumps** are raw logs 08–11, 14–17 and 20–33 (`log_nums_real`). In the public
+  dataset (its legend maps trajectory to log) these are trajectories 00–03, 06–09 and 10–23.
+  Trajectories 04 and 05 (logs 12 and 13) were left out. Trajectories 24–28 (2021-02-26) came
+  later.
+- **The windows differ from the public ones.**
+  - The paper simulated each jump from a fixed raw-log time, 30.60–30.66 s, and lowered the
+    pelvis 0.015 m on 11 logs.
+  - The public trajectories start about 5 ms before impact, at 30.637–30.668 s, with their own
+    offsets (−0.008 to +0.020 m). For log 08 the two windows share only 12 ms.
+  - So Drake's 38.0, and the branch's per-jump Drake and MuJoCo runs (`drake_optimal`,
+    `mujoco_optimal`), can't be paired with runs on the public data. The raw logs are only
+    available from the authors.
+- **The loss as computed** (`cassie_loss_utils.py`) is a per-jump **mean** over the samples,
+  not the sum that equation 4 shows. Only the mean gives values near 38. The terms, averaged
+  over jumps:
+  - positions (pelvis xyz and the 16 joints), weight 10 (the paper's text; the code reads its
+    weights from a pickle);
+  - velocities (pelvis translation and the 16 joints), from `print_loss_weights`, which matches
+    the text: pelvis translation 100; hip roll, knee spring and toe 0.01; ankle spring 0; the
+    rest 1;
+  - pelvis angular velocity, 5;
+  - orientation, (2 × quaternion angle distance)², weight 1 by default.
+- **The torques are joint-side**, applied with a first-order hold between the 2 kHz samples.
+  Drake's actuation port takes joint effort, and hip roll reaches 42 N·m in the data, far above
+  what its motor could give at the motor side. **3.4's "through the gear ratios" is wrong:** the
+  replay applies u directly, as u·dt of angular impulse.
+- **Reflected inertia:** rotor × ratio² from `AddCassieMultibody`, with rotor inertias (61, 61,
+  365, 365, 4.9)e-6 kg m² and ratios (25, 25, 16, 16, 50) for hip roll, hip yaw, hip pitch, knee
+  and toe. That gives J_a = 0.0381, 0.0381, 0.0934, 0.0934 and 0.0123 kg m² on each side.
+- **Springs:** the knee is 1500 and the ankle 1250 N m/rad in dairlib's code ("2300 in URDF,
+  1500 from gazebo"). The URDF says 2300 and 2000. Drake used the code's values.
+- **Loops:**
+  - Achilles rod: a spring of k 1e6 and damping 2e3 with rest length 0.5012 m, between
+    heel_spring (0.11877, −0.01, 0) and thigh (0, 0, ±0.045).
+  - Plantar rod: none. The toe torque goes straight to the toe joint.
+  - The URDF lumps the rod masses at the anchors.
+- **Contact:**
+  - four point contacts, two per foot, at (−0.0457, 0.112, 0) and (0.088, 0, 0) in the toe frame;
+  - Drake's compliant point contact, with Table VI's identified stiffness 9400 N/m, dissipation
+    3.0 s/m and μ 0.45;
+  - Drake ran at dt 5e-5 to 8e-5 s.
+- **Fit:** nevergrad NGOpt over stiffness [1e3, 1e6] (log), dissipation [0, 3] and μ [0, 1], on
+  a random 80/20 train/test split. Table VI's "average loss" doesn't say which set it covers.
+
+**Plan:**
+- **W4a: URDF loader** (`riftphys-reality/src/urdf.rs`):
+  - reads links, inertials (with the origin's rpy, rotated into the link frame), revolute and
+    fixed joints, limits and `<dynamics damping>`;
+  - fixed joints merge into the parent: mass, COM, and inertia by the parallel-axis theorem;
+  - builds bodies and hinges at a configuration q by forward kinematics, with a world rotation
+    from z-up to RiftPhys's y-up;
+  - no meshes. Contact points are named by the caller.
+  - **Tests:** a two-link URDF matches the same model built by hand (pose, inertia, the hinge's
+    period); Cassie's total mass equals the URDF's sum; fixed joints conserve mass and COM.
+- **W4: the Cassie model:**
+  - the URDF plus the dairlib constants above;
+  - the achilles rod as a distance joint with compliance 1e-6 (Drake's spring);
+  - leaf springs as compliant hinge rows (1/k);
+  - armature through `set_d6_armature`;
+  - URDF damping through `set_d6_damping`;
+  - URDF limits in radians;
+  - the four contact points as 1 mm spheres with compliant contact against the ground.
+- **The state:** dataset rows go through forward kinematics to body poses and velocities. The
+  pelvis angular velocity is world-frame (Drake's quaternion floating joint). Ankle-spring
+  velocity is unrecorded (0).
+  - **Check first:** the toe heights at the first sample. Small and positive means the public
+    offsets are already applied.
+- **Half-step start,** as in W3, per body: v0 − ½(v1 − v0) from one trial step. The 5 ms
+  before impact has no contact.
+- **Metric:** the loss above, on the paper's 22 jumps, and on all 29 as a second line.
+- **Fit:** k, dissipation and μ by W3's CMA-ES with 5-fold cross-validation, so each jump's loss
+  comes from a fit that didn't see it. The in-sample fit is reported too, since 38.0's split is
+  unknown.
+- **References and pass (rewritten after review):**
+  - **MuJoCo rerun on the public windows is the only like-for-like bar.** Drake's 38.0 and
+    MuJoCo's 30.0 are on the paper's windows (from 30.60 s, about 40 ms of flight before
+    impact, against about 5 ms here) and an unknown split, so a loss on these windows isn't
+    comparable to them. They become context lines.
+  - MuJoCo runs Agility's MJCF from cassie-mujoco-sim (the model the paper used; D10), refit
+    in its own parameters as `learn_cassie_parameters.py` does (stiffness [0, 1e6], damping
+    [0, 1000], μ [0.01, 1]), on the same folds as RiftPhys, not at Table VI's values.
+  - **Pass (P4):** per jump, held out, RiftPhys's loss is no worse than MuJoCo's under D2's rule
+    (2 SE, a bootstrap over the 22 jumps, not over samples), at 240 Hz for both (D9). If
+    Agility's model isn't stable at 240 Hz, report that and pair at 2 kHz, saying so.
+  - Without D10 there is no valid P4 bar.
+- **Folds:** 5 folds over the 22 jumps, fixed before any run with seed 1, stratified by day
+  (Jan 27: 00–03 and 06–09; Feb 12: 10–23), the same for both engines. The fold list is written
+  here before the first fit. The 29-jump line adds Feb 26 (24–28), a third day, and is labelled
+  so.
+- **Tests beyond the loss:**
+  - the achilles rod's stretch equals compliance × its row force (not a fixed 1 mm: at 1e-6 m/N
+    a landing can reach 1000 N per mm), and it doesn't ring (or has damping; below);
+  - the rod length from forward kinematics at sample 0 against 0.5012 m, per jump, before any
+    run: 1 mm of violation is a 1000 N kick on the first step;
+  - spring sag with the pelvis fixed, hanging: deflection = the static moment about the spring
+    from the model's own mass at that pose, over k;
+  - free-floating Cassie in zero g with random joint torques keeps total linear and angular
+    momentum (catches one-sided torques);
+  - a forward-kinematics round trip: a dataset row → bodies → joint q, q̇ and the pelvis
+    origin's pose and velocity read back equal the row (catches the index order, z-up to y-up,
+    and COM against origin);
+  - the loss reproduces `cassie_loss_utils.py` on synthetic cases (simulation equal to the data
+    gives 0; a known offset gives its known value);
+  - the impact check W4b deferred: across the impact, each rotor's momentum change equals its
+    row's impulses;
+  - a rollback across the impact replays hash for hash.
+
+**Review (RiftPhys Reviewer, 2026-11-10), folded in:**
+- **Blocker: the distance joint has no anchors** (bodies.rs: `DistanceJoint` and its row use
+  each body's COM and linear inverse mass only). Built as planned, the achilles rod would tie
+  the heel-spring COM to the thigh COM and pass no torque, which is the rod's whole job. **W4c,
+  below, before the model.**
+- **Mine, the same kind: colliders have no offset** (`Collider` is body, shape, AABB,
+  material; a shape sits at the body's COM). The toe points aren't at the toe's COM. **W4d,
+  below.**
+- **Torques** are confirmed joint-side, more strongly than 42 N·m shows: the largest |u| over
+  the 29 trajectories exceeds the URDF's effort on three actuators (hip roll right 117.7 against
+  112.5; knee 230.3 and 225.6 against 195.2; toe left 64.4 against 45), where motor-side peaks
+  would be 4.5, 12.2 and 0.9 N·m. So:
+  - nothing clamps to effort (the loader reads it and doesn't apply it);
+  - each torque acts as an equal and opposite pair on parent and child (`apply_torque` acts on
+    one body, so the replay calls it twice);
+  - the first-order hold is integrated over each step on the real sample times (0.27–0.78 ms
+    apart, not a uniform 0.5; a 240 Hz step spans about 8 samples).
+- **The half-step start's trial step** is 4.17 ms at 240 Hz against about 5 ms before impact,
+  with offsets up to +0.020 m. The trial step runs with contact off, and each jump's first
+  contact time is reported. The per-body form stands: v0 and v1 both satisfy the joint rows.
+- **The achilles row's damping:** Drake's spring had 2e3 N s/m. Undamped, a rod of effective
+  mass near 0.5 kg rings with a period of about 4 ms at 2 kHz, inside the window. W4c adds
+  damping to the distance row, or a test shows it doesn't ring.
+- **Ankle-spring velocity 0 isn't loop-consistent.** The rod length rate it implies at sample 0
+  is reported. Drake used 0, so 0 stays the main line. If the rate isn't small, a
+  loop-consistent start is a sensitivity line.
+- **Frames:** the dataset's and the loss's pelvis xyz and linear velocity are the pelvis frame
+  origin, not the COM: v_origin = v_com + ω × (o − c), reading the state in and computing the
+  loss. ω is world-frame: on t_00 the finite-differenced quaternion matches world-frame ω to
+  0.096 rad/s and body-frame to 0.918 (the Reviewer's check).
+- **Velocity indices:** the README's table lists ankle_spring_right before toe_left, but the
+  columns are 41 ankle_spring_left, 42 toe_left, 43 ankle_spring_right, 44 toe_right, the
+  position order. The replay uses the indices. Columns 41 and 43 are 0 throughout.
+- **The paper's z offsets** were hard-coded, not fitted: `drake_cassie_sim.py` (v1) loads
+  `optimized_z_offsets.pkl` but then sets 0, and −0.015 m for the 11 logs in
+  `log_nums_w_offset`. Velocity offsets are 0.
+- **Which learner gave Table VI:** v1 (`learn_cassie_parameters.py`, budget 5000), whose
+  parameters `cassie_impact_data.py` loads as `drake_2021_09_01_10_training_5000`. The v2 files
+  use the curated trajectories and are dated 2022.
+- Smaller: μ's lower bound is 0.01 for both engines; the URDF marks the ankle spring's damping
+  of 10 as "made up"; RiftPhys's compliant contact is Drake's Hunt–Crossley form
+  (materials.rs), so k and d in s/m fit like for like.
+
+### 3.4b W4c and W4d: anchored distance joints, collider offsets (drafted 2026-11-10, for review)
+
+**W4c: a distance joint with anchors and damping.**
+- **Today:** `DistanceJoint { a, b, rest, compliance, lambda_acc }` holds the two COMs at
+  `rest`, with inverse masses 1/m only.
+- **Change:** local anchors `la`, `lb` (in each body's frame) and a damping coefficient `c`
+  (N s/m), set by `World::add_distance_joint_at(a, la, b, lb, rest, compliance)` and
+  `set_distance_damping(id, c)`. The existing `add_distance_joint` keeps la = lb = 0, so every
+  scene that uses it now is bit-identical (checked by the existing hashes).
+- **Position row:** n along the anchors' separation, generalised inverse mass
+  w = 1/m_a + 1/m_b + (r_a × n)ᵀ I_a⁻¹ (r_a × n) + (r_b × n)ᵀ I_b⁻¹ (r_b × n), angular
+  corrections I⁻¹ (r × n) λ. Under SHAKE, n and the lever arms come from the start-of-step
+  anchors, as the D6 rows' do.
+- **Velocity row** (rigid rods only, as today's compliant ones act at position level): the
+  same generalised mass.
+- **Damping:** a soft velocity row along n, v_rel + γλ = 0 with γ = 1 / (c dt), as W3a's
+  damper; it runs for compliant and rigid rows alike, and only when c > 0.
+- **Tests:**
+  - a rod between two hinged levers passes torque at the lever-arm ratio (static: a weight on
+    one lever is held by the other's spring at the closed-form angle);
+  - a static load F stretches it by F × compliance;
+  - with Drake's 1e6 and 2e3, a plucked rod settles without ringing; at c = 0 it rings at the
+    closed-form frequency;
+  - the anchored row at la = lb = 0 is bit-identical to today's (hashes).
+
+**W4d: collider offsets.**
+- **Change:** `Collider` gains `local: Isometry` (the shape's pose in the body frame, default
+  identity), set by `World::add_collider_at(body, local, shape, material)`. Every place that
+  reads a collider's world pose (broadphase AABBs, narrowphase, CCD, queries; about 46 uses)
+  takes body pose × local.
+- **The rule:** identity local gives bit-identical results; the existing hashes check it.
+- **Tests:** a sphere offset 0.5 m from a box's COM, dropped on its corner side, rests with
+  the box tilted at the closed-form angle; a spinning body's offset sphere contacts where its
+  world position says; the at-rest suite and golden hashes unchanged.
 
 ### 3.5 W5: lever-arm conditioning (P5, only if shown)
 
@@ -1110,6 +1304,31 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     jumping-impact dataset (Acosta et al., "Validating Robotics Simulators on Real-World
     Impacts", RA-L 2022), not the CASSI spectral-imaging benchmark. Proposed with D2's aim: pass
     at Drake's 38.0, aim for MuJoCo's 30.0.
+  - **Reframed 2026-11-10 (3.4a, the Reviewer's finding):** neither number can be the bar. Both
+    are on the paper's windows, which aren't public; the public windows start up to about 40 ms later.
+    The proposal is now: P4 passes when RiftPhys is no worse than MuJoCo rerun on the public
+    windows, per jump under D2's rule, both fit on the same folds (needs D10). 38.0 and 30.0 are
+    reported as context.
+- **D9:** the physics rate for P4.
+  - **The options:** 240 Hz, the biped's workload rate (12 steps over the window; the 2 kHz
+    samples are compared against states interpolated between steps), or 2 kHz, the data's rate.
+    Drake ran at 12.5–20 kHz.
+  - **Proposed:** pass at 240 Hz, since parity is per workload (D1) and P1 is judged at the
+    workload's rate; report 2 kHz beside it.
+- **D10:** downloads for W4.
+  - **Needed:** Agility's MuJoCo model, as the paper used it: github.com/osudrl/cassie-mujoco-sim
+    `model/cassie.xml` (22,344 bytes) and `model/cassie-stl-meshes/` (11 STL files, 2,049,524
+    bytes), 2.07 MB in all.
+    - The fork has no licence file. MuJoCo Menagerie states that Agility released the original
+      under MIT.
+    - Menagerie's own `agility_cassie` (MIT, 7.8 MB) changes the collision geometry and the
+      solver, so it isn't the paper's model.
+  - **Optional:** the paper's six loss-weight pickles from the dairlib branch (6 files, 37,263
+    bytes, MIT). They would be read with `pickletools` only, never unpickled, to confirm the
+    position and orientation weights.
+  - **Without it there is no valid P4 bar** (D4, reframed).
+  - Nothing else is needed: the per-jump `drake_optimal` and `mujoco_optimal` runs are on the
+    raw windows (above).
 - **D5:** downloads: the double pendulum (encoder data and CAD) and the Cassie dataset. Each needs
   the user's go-ahead with its size, given when asked.
   - **Sizes (read from the hosts' file listings 2026-11-08, nothing downloaded):**
