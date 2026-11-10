@@ -1475,6 +1475,134 @@ link and is solved after the motor joint in each sweep (here the spring) moves t
 ordering rows within one joint can't give the limit the last word. The 3.4j block solve should fix
 it, and (h) at (8, 6) is one of its gates.
 
+### 3.4j W4g design: the armature block solve (drafted 2026-11-10, for review before building)
+
+JOINT_CONDITIONING_SPEC C5 and 3.5's W5 were held "only if W4 shows it". W4 now shows it: at the
+biped's 6 position sweeps the rotor row's split is −2.65 against a converged −0.42 (3.4h (a)). The
+cause is Gauss–Seidel coupling through a link that is light next to J_a (about 47× for Cassie's
+knee). Unlike C5's per-joint block, this block spans joints, through the light link.
+
+- **The block, per armature axis:** the rotor row of that axis; the motor joint's own enabled
+  position rows (its locked rows, a violated limit, a position drive or spring); and the rows of
+  every other D6 joint that has the motor joint's child link as a body. Cassie's knee: the knee's 3
+  translational and 2 alignment rows, its limit when violated, the rotor, and the knee spring's 6
+  rows, about 13. Distance joints stay in Gauss–Seidel: the anchored rod's SHAKE step uses the
+  non-symmetric w_mix, and it touches the thigh, not a light link.
+- **Overlapping blocks merge.** A joint in two blocks puts both in one, so a chain of motored
+  joints becomes one block. For a Cassie leg that's hip roll, yaw and pitch, the knee and the knee
+  spring: 5 D6 joints and 4 rotors, at most about 34 rows. The toe is a block of its own. Blocks are
+  formed once per step, in joint order, and are deterministic. A block over 64 rows falls back to
+  Gauss–Seidel. The step's block and fallback counts are readable (`World::armature_blocks`), so
+  the P4 report can show 0 fallbacks.
+- **The solve:** once per sweep, in place of those joints' Gauss–Seidel rows. Each row's Jacobian
+  is what `solve_d6` uses now: SHAKE's start-of-step axes, lever arms and inertias, or PBD's current
+  ones. Each residual is measured from the current poses as now: the hinge twist in radians, the
+  alignment cross product, the anchor gap; the rotor's C0 + λ_acc/J_a. Then
+  ((1 + Γ) J W Jᵀ + Ã) Δλ = −(C + Ã λ_acc + Γ ΔC), with Ã the rows' α̃ (the rotor's 1/J_a; springs'
+  compliance/dt²; 0 for rigid rows) and Γ the damped rows' γ (zero elsewhere). **Corrected at
+  review (the Reviewer, 2026-11-10, high):** that matrix isn't symmetric when coupled rows have
+  different γ (Cassie's damped springs share blocks with rigid rows), so LDLᵀ doesn't apply.
+  Left-multiplied by (I + Γ)⁻¹, the same solution comes from the symmetric system
+  [J W Jᵀ + (I + Γ)⁻¹ Ã] Δλ = −(I + Γ)⁻¹ (C + Ã λ_acc + Γ ΔC). (I + Γ)⁻¹ Ã is diagonal, so the
+  matrix is positive definite wherever J has full row rank. For one row it is W4c's scalar
+  update, divided through by (1 + γ). Factor it with LDLᵀ. **The pivot rule:** a pivot under 1e-9
+  of the largest original diagonal drops that row and column; the rest is factored without it,
+  and the dropped row gets Δλ = 0. The factorization never continues with a near-zero pivot.
+  Each body's W is one per block: its start-of-step inverse inertia under SHAKE when it turned
+  less than SHAKE_MAX_TURN, else its current one. Each row's directions follow its joint's SHAKE
+  choice, as in `solve_d6`. Apply
+  Jᵀ W Δλ to the bodies, and add Δλ into each row's `lambda_acc` and the rotor's `rotor_lambda`. The
+  rotor carry (W4f) is unchanged.
+- **Limits:** a limit row is in the block only while violated, as an equality, as the scalar row
+  is now. Its sign isn't clamped, also as now.
+- **Why not Jacobi's overshoot:** JOINT_CONDITIONING 2.1 found a joint's rows measured once and
+  applied together cycled (an eigenvalue at −1). That came from ignoring their coupling. The block
+  inverts the coupling exactly, so one sweep is one Newton step on the block's rows.
+- **Scope:** the position pass only. The velocity solve's armature row stays Gauss–Seidel.
+  **Stated before building (the Reviewer, 2026-11-10):** if Cassie's flight error against its own
+  2 kHz run differs by more than 20% between (8, 6) and (80, 6), a velocity-block follow-up is
+  logged (the same blocks, on the velocity rows).
+- **Unchanged:** every joint not in a block, so nothing without armature moves.
+
+**Gates (set before building):**
+- (a) at (8, 6) within 2% of −0.4193.
+- (h) at (8, 6): within 1e-3 rad of the stop (3.4i).
+- Cassie flight against its own 2 kHz run at (8, 6): at most 6.5 (2× the 80-iteration 3.24). With
+  contact: at most 27.2 (2× the 80-iteration 13.59).
+- The 3.4h tests (a)–(f) still pass.
+- **(g), restated at review (accepted 2026-11-10):** the 240 Hz run against the same 2-DoF system
+  stepped with the engine's own scheme in reduced coordinates at 240 Hz (the torque kick through
+  M = diag(I_m + J_a, I_l); the drift q* = q + h v; the implicit spring (M + h²K) q⁺ = M q*;
+  v⁺ = (q⁺ − q)/h), within 3% of range on the load's angle and rate. The 2-DoF analytic solution
+  and the 8 kHz run are printed beside it. W4b alone must fail it (the mutation check).
+- **Block solve against Gauss–Seidel:** a block holding a damped compliant row and a rigid row on a
+  light link gives the same Δλ as converged Gauss–Seidel (4096 sweeps), to 1e-6.
+- **Pivot rule:** a block with a duplicated row gives the same result as without the duplicate.
+- Bit-identical: joint_bits, W6, distance_bits, the URIEL biped, the isotropic arm and the seam
+  goldens. The named Axis results are reported before and after.
+- Cost per step at (8, 6), before and after, for Cassie and the Axis arm: at most 2× (C5's cost
+  criterion), reported either way.
+- Then 3.4g's table again, report-only. Then P4, rerun exactly as stated. Its report opens by saying
+  that P4 failed at 240 Hz at 7c1037c, and that this run follows the W4f and W4g engine changes,
+  under unchanged criteria.
+
+**W4g results, built 2026-11-10 (uncommitted, for review):**
+- **Tests:** `rotor_position_test` passes 9 of 9.
+  - (a) at (8, 6): −0.4193, the analytic value (W4f by Gauss–Seidel alone: −2.651).
+  - (g), restated: the 240 Hz run against the reduced-coordinate scheme gives 0.0000 and 0.0000 of
+    range; W4b alone gives 0.544 and 0.554, so the mutation check fails, as it should. Report
+    lines at 100 ms: 240 Hz 0.57205, the reduced scheme 0.57205, 8 kHz 0.51965, analytic 0.51792.
+  - (h) at (8, 6): within 1e-3 rad of the stop, so it's no longer ignored and 3.4i is closed by
+    W4g.
+  - The block against Gauss–Seidel at (8, 4096), with a damped spring (γ = 1) and rigid rows:
+    poses within 4e-7, and the rotor's λ equal (0.0008304).
+  - A duplicated hinge changes nothing (blocks (1, 0)).
+  - (d): torque-free drift 0.01% against 0.08% without armature; work 1.0%.
+- **Bit-identical gates hold:** joint_bits and W6 are identical; distance_bits, compliant_joint,
+  distance_anchor, joint_energy and joint_armature pass; the URIEL library passes 31 of 31, and
+  only `ArmArmature::Axis` lines move.
+- **The Axis arm, before W4f → W4g:**
+  - torque-step errors at the arm's 96 iterations: 0.01–8.89% → 0.01–0.08%;
+  - first-tick sine errors, 8 to 96 iterations: 4.5–87.8% → 0.03–0.09%;
+  - teacher replay at 8 iterations over 1 s: 18.6–30.1% → 0.19–0.81%;
+  - self-contact, before the first contact: 0.34 → 0.02%;
+  - the sine profile over 1 s through the self-contact: 8 iterations 78.3 → 77.8%; 16 and 32
+    iterations 77–79 → 91–92%; 96 iterations 57.2 → 31.0%. That run goes through the contact and
+    is chaotic.
+- **Cost (one core, release):** the Axis arm 201 → 295 µs per step (1.47×; W4f alone 206); the
+  Cassie replay at 240 Hz 58.7 → 102.4 ms per simulated second (1.74×), at 2 kHz 307.5 → 630.9
+  (2.05×). The (8, 6) gate is at 240 Hz: met. 0 fallbacks.
+- **The velocity side (stated gate):** Cassie in flight against its own 2 kHz run gives 13.15 at
+  (8, 6) and 12.75 at (80, 6), 3% apart, under the 20% line, so no velocity-block item is logged.
+- **Cassie gates fail:**
+
+  | 240 Hz against its own 2 kHz | before W4f | W4f | W4g | gate |
+  |---|---|---|---|---|
+  | flight, (8, 6) | 86.51 | 23.26 | **13.15** | ≤ 6.5 |
+  | with contact, (8, 6) | 25.32 | 57.93 | **72.70** | ≤ 27.2 |
+
+  - W4g by position sweeps, flight: (8, 6) 13.15, (8, 12) 8.00, (8, 24) 5.30, (8, 48) 3.89, (80, 80)
+    3.38. With contact: (8, 6) 72.70, (8, 24) 24.96, (8, 48) 17.12, (80, 24) 20.69, (80, 80) 12.29.
+  - Against the data, unfitted at Table VI's values, 240 Hz: (8, 6) 123.1, (80, 6) 116.1, (8, 24)
+    64.4, (80, 80) 49.3. At 2 kHz, (8, 6): 29.65.
+  - The knee's step-1 split is now right at (8, 6): motor −0.01289 against spring +0.02705, a ratio
+    of −0.477 against the analytic −0.4896.
+- **Reading:** the blocks do their job. The knee's split is exact, (h) holds, and the Axis arm is
+  close to converged at 8 iterations. What's left in Cassie is position-pass coupling outside the
+  blocks: the closed loop of the ankle, the ankle spring and the achilles rod (left to
+  Gauss–Seidel, with the rod's SHAKE w_mix), and contact projection between sweeps. The evidence:
+  velocity iterations barely matter, while position sweeps do (flight 13.2 → 5.3 from 6 to 24). P4
+  isn't rerun.
+
+**Review of the W4g results (the Reviewer, 2026-11-10):** W4g is accepted. The 3.4j "2× the
+converged figure" gates were too loose for P4: (8, 24) met both and still sat at 64.4 against the
+data. Two price numbers came first, both from runs already made:
+- **(a), with contact, velocity iterations against position sweeps under W4g:** (8, 6) 72.70,
+  (80, 6) 68.09; (8, 24) 24.96, (80, 24) 20.69. So it was the position sweeps.
+- **(b), option (2)'s price list under W4g:** against the data, unfitted, 240 Hz, with the cost per
+  simulated second: (8, 6) 123.1 and 101 ms; (8, 12) 87.0 and 173 ms; (8, 24) 64.4 and 319 ms;
+  (8, 48) 55.9 and 588 ms. For comparison, 2 kHz at (8, 6) under W4g gives 29.65 for 631 ms.
+
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
 Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4

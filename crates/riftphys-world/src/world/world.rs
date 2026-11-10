@@ -851,6 +851,10 @@ impl World {
     pub fn d6_rotor_position_lambda(&self, id: JointId, axis: usize) -> f32 {
         match self.joints.kinds().get(id.0 as usize) { Some(JointKind::D6(d)) if axis < 3 => d.r[axis].rotor_lambda, _ => 0.0 }
     }
+    /// Turns W4g's armature block solve on (the default) or off (W4f's Gauss-Seidel alone).
+    pub fn set_armature_blocks(&mut self, on: bool) { self.joints.set_armature_blocks(on); }
+    /// The last step's W4g armature blocks: (formed, fallen back to Gauss-Seidel over the row cap).
+    pub fn armature_blocks(&self) -> (u32, u32) { self.joints.armature_block_counts() }
     /// Turns W4f's rotor row in the position pass on (the default) or off (W4b alone).
     pub fn set_rotor_position_row(&mut self, on: bool) { self.rotor_position_row = on; }
 

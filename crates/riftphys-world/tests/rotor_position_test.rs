@@ -249,7 +249,6 @@ fn rel_err(a: &[(f32, f32)], f: &[(f32, f32)]) -> (f32, f32) {
 }
 
 #[test]
-#[ignore = "PARITY_SPEC 3.4h: at the workload's (8, 6) W4f's rotor row is far from converged (split -2.65 against -0.42); passes with the W4g block solve (3.4j)"]
 fn g_the_knee_in_miniature_matches_its_reduced_coordinate_scheme() {
     let reference = knee_reference(240.0);
     let (a0, r0) = rel_err(&knee(240.0, false), &reference);
@@ -263,7 +262,6 @@ fn g_the_knee_in_miniature_matches_its_reduced_coordinate_scheme() {
 }
 
 #[test]
-#[ignore = "PARITY_SPEC 3.4i: limits violated through a light link at 6 position sweeps (0.055 rad past the stop with W4b alone); a gate of the armature block solve"]
 fn h_a_limit_has_the_last_word() {
     let lim = D6Limit { min: -0.5, max: 0.5 };
     let mut r = rig(I_M, I_L, J_A, 1500.0, 0.0, false, (8, 6), Some(lim));
@@ -336,4 +334,63 @@ fn probe_knee_series() {
         let th_l = 0.5 * acc * t * t - (i1 / (i1 + i2)) * x;
         println!("{:5.1} ms | 240 {:.5} | 8k {:.5} | analytic {:.5} | 240 W4b {:.5}", t * 1e3, a[n].0, f[n].0, th_l, w[n].0);
     }
+}
+
+/// The (a) rig with the spring damped (a W4c damped compliant row, gamma > 0) and the motor hinge
+/// optionally duplicated (a second identical hinge: five redundant rigid rows in the block).
+fn rig_block(damping: f32, duplicate: bool, iters: (u32, u32), blocks: bool) -> Rig {
+    let mut r = rig(I_M, I_L, J_A, 1500.0, -0.06, false, iters, None);
+    r.w.set_armature_blocks(blocks);
+    if duplicate { r.w.add_hinge_joint(r.base, r.motor, iso(Quat::IDENTITY), iso(Quat::IDENTITY), 2); }
+    if damping > 0.0 {
+        // Rebuild the spring joint with damping: a fresh rig with the damped spring
+        let mut w = World::with_capacity(4, 4);
+        w.set_gravity(Vec3::ZERO);
+        w.set_solver_iterations(iters.0, iters.1);
+        let base = w.add_body(iso(Quat::IDENTITY), Velocity::default(), MassProps::infinite(), false);
+        let motor = disc(&mut w, I_M, Quat::IDENTITY);
+        let load = disc(&mut w, I_L, Quat::from_rotation_z(-0.06));
+        let mj = w.add_hinge_joint(base, motor, iso(Quat::IDENTITY), iso(Quat::IDENTITY), 2);
+        w.set_d6_armature(mj, 2, J_A);
+        if duplicate { w.add_hinge_joint(base, motor, iso(Quat::IDENTITY), iso(Quat::IDENTITY), 2); }
+        let mut d = D6Joint { a: motor, b: load, fa: iso(Quat::IDENTITY), fb: iso(Quat::IDENTITY), t: Default::default(), r: Default::default(), hinge_axis: Some(2) };
+        for i in 0..3 { d.t[i].enabled = true; d.r[i].enabled = true; }
+        d.r[2] = D6Axis { enabled: true, compliance: 1.0 / 1500.0, damping, ..Default::default() };
+        w.add_d6_joint(d);
+        w.set_armature_blocks(blocks);
+        r = Rig { w, base, motor, load, mj };
+    }
+    r
+}
+
+/// Motor and load yaw, the load's position, and the rotor's position-pass lambda after `steps`
+/// steps under a 90 N m motor torque.
+fn run_block(r: &mut Rig, steps: usize) -> (f32, f32, Vec3, f32) {
+    for _ in 0..steps {
+        r.w.apply_torque(r.motor, Vec3::new(0.0, 0.0, 90.0 / 240.0));
+        r.w.step(1.0 / 240.0);
+    }
+    (yaw(&r.w, r.motor), yaw(&r.w, r.load), r.w.get_body_pose(r.load).pos, r.w.d6_rotor_position_lambda(r.mj, 2))
+}
+
+#[test]
+fn block_matches_converged_gauss_seidel() {
+    // A damped compliant row (gamma ~ 1) and rigid rows on the light link: the block at (8, 6)
+    // against Gauss-Seidel alone at (8, 4096), one step
+    let damping = 1500.0 * 1.0 / 240.0; // gamma = c d / h = 1
+    let (mb, lb, pb, lamb) = run_block(&mut rig_block(damping, false, (8, 6), true), 1);
+    let (mg, lg, pg, lamg) = run_block(&mut rig_block(damping, false, (8, 4096), false), 1);
+    println!("block (8, 6): motor {:.7} load {:.7} rotor lambda {:.7}; Gauss-Seidel (8, 4096): motor {:.7} load {:.7} rotor lambda {:.7}", mb, lb, lamb, mg, lg, lamg);
+    assert!((mb - mg).abs() < 1.0e-6 && (lb - lg).abs() < 1.0e-6 && (pb - pg).length() < 1.0e-6, "poses differ: motor {:e}, load {:e}, position {:e}", (mb - mg).abs(), (lb - lg).abs(), (pb - pg).length());
+    assert!((lamb - lamg).abs() < 1.0e-6, "rotor lambda {:e} against {:e}", lamb, lamg);
+}
+
+#[test]
+fn a_duplicated_row_changes_nothing() {
+    let (m1, l1, p1, _) = run_block(&mut rig_block(0.0, false, (8, 6), true), 24);
+    let mut dup = rig_block(0.0, true, (8, 6), true);
+    let (m2, l2, p2, _) = run_block(&mut dup, 24);
+    println!("single hinge: motor {:.6} load {:.6}; duplicated: motor {:.6} load {:.6}; blocks {:?}", m1, l1, m2, l2, dup.w.armature_blocks());
+    assert!((m1 - m2).abs() < 1.0e-5 && (l1 - l2).abs() < 1.0e-5 && (p1 - p2).length() < 1.0e-5, "duplicate changed it: motor {:e}, load {:e}", (m1 - m2).abs(), (l1 - l2).abs());
+    assert_eq!(dup.w.armature_blocks(), (1, 0));
 }

@@ -146,11 +146,17 @@ pub enum JointKind {
 #[derive(Default)]
 pub struct Joints {
     kinds: Vec<JointKind>,
+    /// W4g's armature blocks off (PARITY_SPEC 3.4j): the rows are solved by Gauss-Seidel alone,
+    /// as W4f did (for the before/after reports and the block tests). Default: blocks on.
+    blocks_off: bool,
+    /// The last position pass's armature blocks formed, and blocks over the row cap that fell
+    /// back to Gauss-Seidel.
+    block_counts: (u32, u32),
 }
 
 impl Joints {
     pub fn new() -> Self {
-        Self { kinds: Vec::new() }
+        Self { kinds: Vec::new(), blocks_off: false, block_counts: (0, 0) }
     }
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -160,6 +166,48 @@ impl Joints {
     pub fn kinds(&self) -> &[JointKind] {
         &self.kinds
     }
+    /// Turns W4g's armature blocks on (the default) or off (Gauss-Seidel alone, as W4f).
+    pub fn set_armature_blocks(&mut self, on: bool) { self.blocks_off = !on; }
+    /// The last position pass's armature blocks: (formed, fallen back to Gauss-Seidel).
+    pub fn armature_block_counts(&self) -> (u32, u32) { self.block_counts }
+
+    /// W4g's blocks for this step: every D6 joint with a rotor target (an armature axis inside a
+    /// step), joined with every D6 joint that has its child link as a body; blocks sharing a
+    /// joint merge. Each block's joint indices ascend. Blocks whose rows could exceed
+    /// `BLOCK_MAX_ROWS` are left to Gauss-Seidel and counted.
+    fn armature_blocks(&self) -> (Vec<Vec<usize>>, u32) {
+        let n = self.kinds.len();
+        let d6 = |k: usize| match &self.kinds[k] { JointKind::D6(j) => Some(j), _ => None };
+        let motor = |k: usize| d6(k).map_or(false, |j| j.r.iter().any(|a| a.armature > 0.0 && a.rotor_target.is_some()));
+        if !(0..n).any(motor) { return (Vec::new(), 0); }
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn root(p: &mut Vec<usize>, mut x: usize) -> usize { while p[x] != x { p[x] = p[p[x]]; x = p[x]; } x }
+        let mut member = vec![false; n];
+        for k in 0..n {
+            if !motor(k) { continue; }
+            member[k] = true;
+            let child = d6(k).unwrap().b;
+            for m in 0..n {
+                if m == k { continue; }
+                if let Some(o) = d6(m) {
+                    if o.a == child || o.b == child {
+                        member[m] = true;
+                        let (rk, rm) = (root(&mut parent, k), root(&mut parent, m));
+                        if rk != rm { let (lo, hi) = (rk.min(rm), rk.max(rm)); parent[hi] = lo; }
+                    }
+                }
+            }
+        }
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        for k in 0..n { if member[k] { let r = root(&mut parent, k); groups.entry(r).or_default().push(k); } }
+        let (mut out, mut fallbacks) = (Vec::new(), 0u32);
+        for (_, g) in groups {
+            let rows: usize = g.iter().map(|&k| 6 + d6(k).unwrap().r.iter().filter(|a| a.armature > 0.0).count()).sum();
+            if rows > BLOCK_MAX_ROWS { fallbacks += 1; } else { out.push(g); }
+        }
+        (out, fallbacks)
+    }
+
     /// The joints, mutably (the World sets W4f's per-step rotor targets through this).
     #[inline]
     pub fn kinds_mut(&mut self) -> &mut [JointKind] {
@@ -342,8 +390,22 @@ impl Joints {
             if c <= 0.0 { 0.0 } else { fin(c / dt2) }
         }
 
+        // W4g (PARITY_SPEC 3.4j): inside a step, each armature axis's rotor row, its joint's rows
+        // and the rows of the D6 joints sharing its child link are solved as one block per sweep,
+        // in place of those joints' Gauss-Seidel rows, at the block's first joint in order
+        let blocks = if step_start.is_some() && !self.blocks_off { self.armature_blocks() } else { (Vec::new(), 0) };
+        self.block_counts = (blocks.0.len() as u32, blocks.1);
+        let mut in_block = vec![usize::MAX; self.kinds.len()];
+        for (bi, members) in blocks.0.iter().enumerate() { for &m in members { in_block[m] = bi; } }
+
         for _ in 0..iterations.max(1) {
-            for k in &mut self.kinds {
+            for idx in 0..self.kinds.len() {
+                if in_block[idx] != usize::MAX {
+                    let members = &blocks.0[in_block[idx]];
+                    if members[0] == idx { solve_armature_block(bodies, &mut self.kinds, members, dt, dt2, start, step_start, frozen); }
+                    continue;
+                }
+                let k = &mut self.kinds[idx];
                 let (a, b) = match k { JointKind::Distance(j) => (j.a.0, j.b.0), JointKind::D6(j) => (j.a.0, j.b.0) };
                 if is_frozen(a) && is_frozen(b) { continue; }
                 match k {
@@ -817,3 +879,234 @@ pub use D6Axis as D6AxisRow;
 pub use Generic6Dof as D6Joint;
 pub use Drive as D6Drive;
 pub use Limit as D6Limit;
+
+/* ─────────────────────────  W4g: the armature block solve  ───────────────────────── */
+
+/// The largest block W4g solves (rows); larger ones fall back to Gauss-Seidel (PARITY_SPEC 3.4j).
+pub const BLOCK_MAX_ROWS: usize = 64;
+
+#[inline]
+fn alpha_over_dt2(c: Scalar, dt2: Scalar) -> Scalar {
+    let c = fin(c).max(0.0);
+    if c <= 0.0 { 0.0 } else { fin(c / dt2) }
+}
+
+/// Which multiplier a block row accumulates into: (joint, axis).
+#[derive(Clone, Copy)]
+enum Slot { T(usize, usize), R(usize, usize), Rotor(usize, usize) }
+
+/// One position row of a block: its two bodies' linear and angular Jacobians, the residual,
+/// alpha~, gamma~, its change since the step's start (damped rows) and its accumulated lambda.
+struct BlockRow { a: u32, b: u32, la: Vec3, aa: Vec3, lb: Vec3, ab: Vec3, c: f32, alpha: f32, gamma: f32, dc: f32, lam: f32, slot: Slot }
+
+impl BlockRow {
+    /// The row's Jacobian on body `id` (zero if it doesn't touch it).
+    fn jac(&self, id: u32) -> (Vec3, Vec3) {
+        let (mut l, mut a) = (Vec3::ZERO, Vec3::ZERO);
+        if self.a == id { l += self.la; a += self.aa; }
+        if self.b == id { l += self.lb; a += self.ab; }
+        (l, a)
+    }
+    fn touches(&self, id: u32) -> bool { self.a == id || self.b == id }
+}
+
+/// A row's error as `solve_d6` takes it: locked at 0, a limit only while violated, a position
+/// drive's target (clamped into the limit), a velocity drive free at position level.
+fn row_error(r: &D6Axis, coord: f32) -> Option<f32> {
+    let mut c_err = Some(fin(coord));
+    if let Some(lim) = r.limit {
+        let (lo, hi) = (fin(lim.min), fin(lim.max));
+        c_err = if coord < lo { Some(fin(coord - lo)) } else if coord > hi { Some(fin(coord - hi)) } else { None };
+    }
+    if let Some(drive) = r.drive {
+        if !drive.vel_mode {
+            let mut t = fin(drive.target);
+            if let Some(lim) = r.limit { t = t.clamp(fin(lim.min), fin(lim.max)); }
+            c_err = Some(fin(coord - t));
+        } else if r.limit.is_none() {
+            c_err = None;
+        }
+    }
+    c_err
+}
+
+/// The rows `solve_d6` would solve for joint `m`, measured once from the current poses, with the
+/// same directions, lever arms and residuals, and W4f's rotor rows first.
+fn block_rows_d6(bodies: &Bodies, m: usize, j: &Generic6Dof, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>, step_start: Option<(Isometry, Isometry)>, out: &mut Vec<BlockRow>) {
+    let units = [Vec3::X, Vec3::Y, Vec3::Z];
+    let (pa, pb) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
+    let start = start.filter(|(sa, sb)| turned(sa.rot, pa.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb.rot) < SHAKE_MAX_TURN);
+    let shake: Option<([Vec3; 3], Vec3, Vec3)> = start.map(|(sa, sb)| {
+        let ra0 = sa.rot * j.fa.rot;
+        ([normalize_fin(ra0 * Vec3::X), normalize_fin(ra0 * Vec3::Y), normalize_fin(ra0 * Vec3::Z)],
+         fin_v(sa.rot * j.fa.pos), fin_v(sb.rot * j.fb.pos))
+    });
+    let (ra, rb) = (pa.rot * j.fa.rot, pb.rot * j.fb.rot);
+    let hinge = d6_hinge_axis(j);
+    let (ia, ib) = (j.a.0, j.b.0);
+    let row = |la: Vec3, aa: Vec3, lb: Vec3, ab: Vec3, c: f32, alpha: f32, gamma: f32, dc: f32, lam: f32, slot: Slot| BlockRow { a: ia, b: ib, la, aa, lb, ab, c, alpha, gamma, dc, lam, slot };
+
+    // W4f's rotor rows
+    for i in 0..3 {
+        let (j_a, Some(target)) = (j.r[i].armature, j.r[i].rotor_target) else { continue; };
+        if !(j_a > 0.0) { continue; }
+        let u = normalize_fin(ra * units[i]);
+        if u == Vec3::ZERO { continue; }
+        let un = shake.map_or(u, |s| s.0[i]);
+        let mut c = fin(d6_row_angle(j, ra, rb, i) - target);
+        let tau = std::f32::consts::TAU;
+        if c > std::f32::consts::PI { c -= tau * ((c + std::f32::consts::PI) / tau).floor(); }
+        if c <= -std::f32::consts::PI { c += tau * ((std::f32::consts::PI - c) / tau).floor(); }
+        out.push(row(Vec3::ZERO, -un, Vec3::ZERO, un, c, fin(1.0 / j_a), 0.0, 0.0, fin(j.r[i].rotor_lambda), Slot::Rotor(m, i)));
+    }
+    // Translational rows
+    for i in 0..3 {
+        let r = &j.t[i];
+        if !r.enabled { continue; }
+        let u = normalize_fin(ra * units[i]);
+        if u == Vec3::ZERO { continue; }
+        let xa = fin_v(pa.pos + pa.rot * j.fa.pos);
+        let xb = fin_v(pb.pos + pb.rot * j.fb.pos);
+        let coord = fin(fin_v(xb - xa).dot(u));
+        let (un, lever_a, lever_b) = match &shake { Some((ax0, la, lb)) => (ax0[i], *la, *lb), None => (u, xa - pa.pos, xb - pb.pos) };
+        let Some(c) = row_error(r, coord) else { continue; };
+        let (gamma, dc) = match (position_damped(r), step_start) {
+            (true, Some((sa, sb))) => {
+                let u0 = normalize_fin((sa.rot * j.fa.rot) * units[i]);
+                let d0 = fin_v((sb.pos + sb.rot * j.fb.pos) - (sa.pos + sa.rot * j.fa.pos));
+                (fin(r.compliance * r.damping / dt), fin(coord - d0.dot(u0)))
+            }
+            _ => (0.0, 0.0),
+        };
+        out.push(row(-un, -fin_v(lever_a.cross(un)), un, fin_v(lever_b.cross(un)), c, alpha_over_dt2(r.compliance, dt2), gamma, dc, fin(r.lambda_acc), Slot::T(m, i)));
+    }
+    // Rotational rows
+    for i in 0..3 {
+        let r = &j.r[i];
+        if !r.enabled { continue; }
+        let u = normalize_fin(ra * units[i]);
+        if u == Vec3::ZERO { continue; }
+        let measure = |ra: Quat, rb: Quat| -> f32 {
+            let mut q = ra.conjugate() * rb;
+            if q.w < 0.0 { q = -q; }
+            let v = Vec3::new(q.x, q.y, q.z);
+            let u = normalize_fin(ra * units[i]);
+            match hinge {
+                Some(f) if f == i => fin(2.0 * v[f].atan2(q.w)),
+                Some(f) => fin(fin_v(normalize_fin(ra * units[f]).cross(normalize_fin(rb * units[f]))).dot(u)),
+                None => fin(fin_v(ra * fin_v(2.0 * v)).dot(u)),
+            }
+        };
+        let angle = measure(ra, rb);
+        let un = shake.map_or(u, |s| s.0[i]);
+        let Some(c) = row_error(r, angle) else { continue; };
+        let (gamma, dc) = match (position_damped(r), step_start) {
+            (true, Some((sa, sb))) => (fin(r.compliance * r.damping / dt), fin(angle - measure(sa.rot * j.fa.rot, sb.rot * j.fb.rot))),
+            _ => (0.0, 0.0),
+        };
+        out.push(row(Vec3::ZERO, -un, Vec3::ZERO, un, c, alpha_over_dt2(r.compliance, dt2), gamma, dc, fin(r.lambda_acc), Slot::R(m, i)));
+    }
+}
+
+/// One sweep of a W4g block (PARITY_SPEC 3.4j):
+/// [J W J^T + (I + G)^-1 A] dl = -(I + G)^-1 (C + A l + G dC), factored by LDL^T; a pivot under
+/// 1e-9 of the largest diagonal drops its row and column, and that row's dl is 0.
+fn solve_armature_block(bodies: &mut Bodies, kinds: &mut [JointKind], members: &[usize], dt: Scalar, dt2: Scalar, start: Option<&[Isometry]>, step_start: Option<&[Isometry]>, frozen: &[bool]) {
+    let is_frozen = |id: u32| frozen.get(id as usize).copied().unwrap_or(false);
+    let mut rows: Vec<BlockRow> = Vec::new();
+    for &m in members {
+        let JointKind::D6(j) = &kinds[m] else { continue; };
+        if is_frozen(j.a.0) && is_frozen(j.b.0) { continue; }
+        let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
+        let s0 = step_start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
+        block_rows_d6(bodies, m, j, dt, dt2, s, s0, &mut rows);
+    }
+    let n = rows.len();
+    if n == 0 { return; }
+    // One W per body: its start-of-step inverse inertia under SHAKE when it turned little, else its current one
+    let mut ids: Vec<u32> = rows.iter().flat_map(|r| [r.a, r.b]).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let w_of: Vec<(Scalar, Mat3)> = ids.iter().map(|&id| {
+        let inv_i = match start.map(|s| frame(s, bodies, id)) {
+            Some(s) if turned(s.rot, bodies.pose(id).rot) < SHAKE_MAX_TURN => inv_inertia_at(bodies, id, s.rot),
+            _ => bodies.inv_inertia_world(id),
+        };
+        (fin(bodies.inv_mass_of(id)), inv_i)
+    }).collect();
+
+    let mut mat = vec![0.0f64; n * n];
+    let mut rhs = vec![0.0f64; n];
+    for p in 0..n {
+        for q in p..n {
+            let mut v = 0.0f64;
+            for (k, &id) in ids.iter().enumerate() {
+                if !rows[p].touches(id) || !rows[q].touches(id) { continue; }
+                let ((lp, ap), (lq, aq)) = (rows[p].jac(id), rows[q].jac(id));
+                let (w, ii) = w_of[k];
+                v += (lp.dot(lq) * w) as f64 + ap.dot(ii * aq) as f64;
+            }
+            mat[p * n + q] = v;
+            mat[q * n + p] = v;
+        }
+        let r = &rows[p];
+        let g = 1.0 + r.gamma as f64;
+        mat[p * n + p] += r.alpha as f64 / g;
+        rhs[p] = -(r.c as f64 + r.alpha as f64 * r.lam as f64 + r.gamma as f64 * r.dc as f64) / g;
+    }
+    // LDL^T with the pivot rule: a dropped row's column is never used and its dl is 0
+    let max_diag = (0..n).map(|p| mat[p * n + p]).fold(0.0f64, f64::max);
+    let tiny = 1.0e-9 * max_diag;
+    let mut l = vec![0.0f64; n * n];
+    let mut d = vec![0.0f64; n];
+    let mut dropped = vec![false; n];
+    for k in 0..n {
+        let mut dk = mat[k * n + k];
+        for s in 0..k { if !dropped[s] { dk -= l[k * n + s] * l[k * n + s] * d[s]; } }
+        if !(dk > tiny) { dropped[k] = true; continue; }
+        d[k] = dk;
+        for i in (k + 1)..n {
+            let mut v = mat[i * n + k];
+            for s in 0..k { if !dropped[s] { v -= l[i * n + s] * l[k * n + s] * d[s]; } }
+            l[i * n + k] = v / dk;
+        }
+    }
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        if dropped[i] { continue; }
+        let mut v = rhs[i];
+        for s in 0..i { if !dropped[s] { v -= l[i * n + s] * y[s]; } }
+        y[i] = v;
+    }
+    let mut x = vec![0.0f64; n];
+    for i in (0..n).rev() {
+        if dropped[i] { continue; }
+        let mut v = y[i] / d[i];
+        for s in (i + 1)..n { if !dropped[s] { v -= l[s * n + i] * x[s]; } }
+        x[i] = v;
+    }
+    // Apply J^T W dl per body, then add dl into each row's multiplier
+    for (k, &id) in ids.iter().enumerate() {
+        let (w, ii) = w_of[k];
+        let (mut dl_lin, mut dl_ang) = (Vec3::ZERO, Vec3::ZERO);
+        for (p, r) in rows.iter().enumerate() {
+            if !r.touches(id) { continue; }
+            let (lp, ap) = r.jac(id);
+            let dl = x[p] as f32;
+            dl_lin += lp * dl;
+            dl_ang += ap * dl;
+        }
+        if dl_lin != Vec3::ZERO { bodies.apply_position_delta(id, fin_v(dl_lin * w)); }
+        if dl_ang != Vec3::ZERO { bodies.apply_orientation_delta(id, fin_v(ii * dl_ang)); }
+    }
+    for (p, r) in rows.iter().enumerate() {
+        let dl = fin(x[p] as f32);
+        let m = match r.slot { Slot::T(m, _) | Slot::R(m, _) | Slot::Rotor(m, _) => m };
+        let JointKind::D6(j) = &mut kinds[m] else { continue; };
+        match r.slot {
+            Slot::T(_, i) => j.t[i].lambda_acc = fin(j.t[i].lambda_acc + dl),
+            Slot::R(_, i) => j.r[i].lambda_acc = fin(j.r[i].lambda_acc + dl),
+            Slot::Rotor(_, i) => j.r[i].rotor_lambda = fin(j.r[i].rotor_lambda + dl),
+        }
+    }
+}

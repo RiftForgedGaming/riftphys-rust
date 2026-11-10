@@ -834,6 +834,32 @@ mod tests {
         top
     }
 
+    /// PARITY_SPEC 3.4j cost gate (report-only): the Axis arm at its own iterations on the sine
+    /// profile for 1 s, wall clock per step with W4b alone, W4f (no blocks) and W4g.
+    #[test]
+    #[ignore]
+    fn w4g_axis_cost_probe() {
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        for (name, rotor_row, blocks) in [("W4b alone", false, false), ("W4f", true, false), ("W4g", true, true)] {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let mut w = World::with_capacity(16, 16);
+                let mut a = Arm::build(&mut w, &ArmConfig::for_armature(ArmArmature::Axis), Vec3::ZERO, [0.3, -0.5, -0.8, 0.4, -0.9, 0.2]);
+                w.set_rotor_position_row(rotor_row);
+                w.set_armature_blocks(blocks);
+                let t0 = std::time::Instant::now();
+                for n in 0..CONTROL_HZ * SUBSTEPS {
+                    let t = profile((n + 1) as f32 * dt, &w, &a);
+                    a.apply(&mut w, t, dt);
+                    w.step(dt);
+                }
+                best = best.min(t0.elapsed().as_secs_f64() / (CONTROL_HZ * SUBSTEPS) as f64);
+                if blocks { println!("blocks {:?}", w.armature_blocks()); }
+            }
+            println!("Axis arm, {}: {:.1} us per step (best of 5)", name, best * 1e6);
+        }
+    }
+
     /// PARITY_SPEC 3.9: the sine profile drives wrist_1 into the tool at tick 23. `Axis` stays
     /// finite and bounded through it at its own iterations and at 512 (it measured 85 rad/s; the
     /// World's undivided gyroscopic turn took the thin tool link to 1e25), and before the contact
