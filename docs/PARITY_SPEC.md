@@ -779,23 +779,43 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
 - **Rod length at sample 0:** 0.5012 m on every trajectory, both sides, to under 0.01 mm (the
   state estimator's inverse kinematics closes the loop). No first-step kick.
 - **Rod rate at sample 0, with the ankle springs' unmeasured rate as 0:** up to 0.51 m/s
-  (trajectory 1, left); 0.1–0.4 m/s is common. Not small, so the replay keeps 0 as the main line
-  (as Drake did) and adds a loop-consistent start (the ankle spring's rate solved so the rod's is
-  0) as a sensitivity line.
+  (trajectory 1, left); 0.1–0.4 m/s is common. The 0 is an estimator artifact on an unweighted
+  coordinate: the positions close the loop, so the robot's real state is loop-consistent.
+- **The start, decided before any fit (the Reviewer's review of 10af5a4):**
+  - **main line: the loop-consistent start,** for both engines. `cassie::loop_consistent` solves
+    each ankle spring's rate (one scalar per leg; the rod's rate is linear in it) so its rod's
+    length rate is 0: under 7e-7 m/s on all 29 trajectories (a test), with ankle-spring rates of
+    up to 4.46 rad/s. MuJoCo gets exactly the same starting velocities, so its equality
+    constraint doesn't resolve the inconsistency its own way.
+  - **sensitivity line: the ankle springs' rate at 0** for both engines, as Drake had it. The
+    context comparison with Drake's 38.0 sits on this line.
+  - **The half-step start works from the loop-consistent state,** and its trial step, which runs
+    with contact off, must show a rod impulse at gravity and torque scale, not closure scale. From
+    the 0 state the trial step's first projection would remove the closure as a velocity jump,
+    and −½ of it would be applied backwards (up to about 0.25 m/s of extra rod rate). The
+    sensitivity line therefore starts from the 0 state directly, with no half-step correction on
+    the ankle springs' columns.
 - **Toe heights at sample 0:** 11–88 mm above the ground (sphere bottoms). The earliest ballistic
   arrival of any toe is 4.8–11.6 ms on the paper's 22, consistent with "about 5 ms before
   impact" and the public offsets already applied. So the half-step start's trial step (4.17 ms
-  at 240 Hz) ends before any contact on the 22; the replay asserts it. Trajectory 24 (Feb 26)
-  wouldn't arrive until 82.8 ms, outside its 50 ms window: it is in the 29-jump line only, and
-  flagged there.
-- **Leaf-spring frequencies, measured** (hung: pelvis welded, motors held by velocity drives at 0,
-  no joint or rod damping, 2 kHz, 1 s, a linear trend removed): 13.5–17.5 Hz on trajectories 0
-  and 10, 12–13.5 Hz on trajectory 20's left leg; each leg's knee and ankle springs share one
-  mode through the loop. One reading, trajectory 20's right leg at 3.5 Hz, is likely a slower
-  settling mode, not the spring's. So ω dt at 240 Hz is 0.31–0.46, not the 0.7 estimated, and
-  implicit Euler keeps 0.27–0.39 of the amplitude per period there; at 2 kHz ω dt is 0.04–0.06.
-  These are the swing leg's modes. In the window the springs carry the body, so a stance pluck
-  (standing on compliant ground) is the next measurement, before the fit.
+  at 240 Hz) ends before any contact on the 22; the replay asserts it and prints each jump's
+  first-contact time. Trajectory 24 (Feb 26) wouldn't arrive until 82.8 ms, outside its 50 ms
+  window. **Decided before any fit:** it stays in the 29-jump line, labelled "no impact in
+  window"; it is never in the paper's 22, which carries the pass.
+- **Leaf-spring frequencies, measured** (hung: pelvis welded, the 10 motors locked in position by
+  a limit with min = max, no joint or rod damping, 2 kHz, the first 0.5 s, a linear trend
+  removed; trajectories 0, 5, 10, 15, 20, 23): each leg's knee spring, ankle, ankle spring and
+  rod form a 2-DoF loop with two modes, at 10.5–15 Hz and 18–23.5 Hz (8.5–23.5 Hz overall). The
+  locked motors creep under 1e-5 rad. So ω dt at 240 Hz is 0.22–0.62, where implicit Euler
+  keeps 0.19–0.51 of the amplitude per period; at 2 kHz it is 0.03–0.07. The swing-leg periods,
+  43–118 ms, are as long as or longer than the 50 ms window.
+  - **Corrected the same day:** the first measurement held the motors with velocity drives at 0,
+    which hold a rate, not an angle. The hung leg crept (the left knee 0.08 rad in 4 s) and that
+    contaminated the spectra: it gave 12–17.5 Hz, and a 3.5 Hz "mode" on trajectory 20's right
+    leg that was the creep. The Reviewer asked for the check rather than an interpretation;
+    `riftphys-cassie --probe` prints each joint's motion, limit margin and frequency.
+  - These are the swing leg's modes. In the window the springs carry the body, so a stance pluck
+    (standing on compliant ground) is the next measurement, and D9 carries both.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
@@ -1528,9 +1548,11 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     Drake ran at 12.5–20 kHz.
   - **The handicap, named:** compliant rows damp themselves (3.4b). Cassie's leaf springs (knee
     k 1500, ankle 1250 N m/rad) were estimated at ω dt ≈ 0.7 at 240 Hz. Measured on the built
-    model, hung (3.4a), they ring at 12–17.5 Hz: ω dt 0.31–0.46 at 240 Hz, where implicit Euler
-    keeps (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.27–0.39 of the amplitude per period; 0.04–0.06 at 2 kHz.
-    The stance frequencies are still to be measured. MuJoCo's springs aren't damped
+    model, hung (3.4a), they ring in two modes per leg at 8.5–23.5 Hz: ω dt 0.22–0.62 at 240 Hz,
+    where implicit Euler keeps (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.19–0.51 of the amplitude per period;
+    0.03–0.07 at 2 kHz. The swing-leg periods (43–118 ms) are as long as or longer than the
+    window. The stance frequencies, the relevant ones for the impact and possibly stiffer, are
+    still to be measured; D9 carries both. MuJoCo's springs aren't damped
     numerically there, so the paired 240 Hz comparison shows it directly. The URIEL biped has no
     compliant rows, dampers or armature, and 240 Hz is already its rate: the handicap comes
     from a feature the biped workload doesn't use today.

@@ -300,6 +300,28 @@ impl Cassie {
     }
 }
 
+/// The state row with each ankle spring's rate (columns 41 and 43, unmeasured and 0 in the data)
+/// set so its achilles rod's length rate is 0: the loop-consistent start (PARITY_SPEC 3.4a). The
+/// positions already close the loop (the estimator's inverse kinematics), and the rod's rate is
+/// linear in the ankle spring's, one scalar per leg. Returns the row and the two rates found.
+pub fn loop_consistent(urdf: &Urdf, row: &[f64; 45], p: &Params) -> Result<([f64; 45], [f64; 2]), String> {
+    let rates = |r: &[f64; 45]| -> Result<[f64; 2], String> { Ok(build(urdf, r, p, false)?.rod_rates()) };
+    let r0 = rates(row)?;
+    let mut probe = *row;
+    probe[41] += 1.0;
+    probe[43] += 1.0;
+    let r1 = rates(&probe)?;
+    let mut out = *row;
+    let mut found = [0.0; 2];
+    for (k, col) in [41usize, 43].into_iter().enumerate() {
+        let slope = r1[k] - r0[k];
+        if !(slope.abs() > 1e-9) { return Err(format!("the rod's rate doesn't depend on column {}", col)); }
+        found[k] = row[col] - r0[k] / slope;
+        out[col] = found[k];
+    }
+    Ok((out, found))
+}
+
 /// Smallest angle between two unit quaternions given as (w, x, y, z).
 pub fn quat_angle(a: &[f64], b: &[f64]) -> f64 {
     let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>().abs().min(1.0);
@@ -322,6 +344,25 @@ mod tests {
             // The unmeasured ankle-spring rates are 0
             assert!(t.x.iter().all(|r| r[41] == 0.0 && r[43] == 0.0), "trajectory {}", i);
         }
+    }
+
+    /// The loop-consistent start: each rod's length rate is under 1 mm/s, from up to 0.51 m/s
+    /// with the ankle springs' rate at 0.
+    #[test]
+    fn the_loop_consistent_start_closes_the_rods_rate() {
+        if !here() { eprintln!("skipped: the Cassie data isn't on this machine"); return; }
+        let urdf = load_urdf().unwrap();
+        let p = Params::default();
+        let (mut worst, mut biggest) = (0.0f64, 0.0f64);
+        for i in 0..ALL_JUMPS {
+            let t = load_traj(&data_dir(), i).unwrap();
+            let (row, found) = loop_consistent(&urdf, &t.x[0], &p).unwrap();
+            let r = build(&urdf, &row, &p, false).unwrap().rod_rates();
+            worst = worst.max(r[0].abs()).max(r[1].abs());
+            biggest = biggest.max(found[0].abs()).max(found[1].abs());
+        }
+        println!("loop-consistent start: worst rod rate {:.2e} m/s; ankle-spring rates up to {:.2} rad/s", worst, biggest);
+        assert!(worst < 1e-3, "rod rate {:.2e} m/s", worst);
     }
 
     /// A dataset row built into bodies and read back gives the row: joint angles and rates, the

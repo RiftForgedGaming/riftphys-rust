@@ -1,7 +1,7 @@
 //! Cassie's pre-fit checks (PARITY_SPEC 3.4a):
 //!   riftphys-cassie --check     rod length and rate, toe heights, at each trajectory's first sample
 //!   riftphys-cassie --pluck     the leaf springs' frequencies on the built model, hung at 2 kHz
-use riftphys_articulation::bodies::D6Drive;
+use riftphys_articulation::bodies::D6Limit;
 use riftphys_reality::cassie::{self, Params, ACHILLES_LENGTH, ACTUATORS, ALL_JUMPS, PAPER_JUMPS};
 
 fn check() -> Result<(), String> {
@@ -62,30 +62,40 @@ fn dominant(x: &[f64], hz: f64) -> f64 {
     best.0
 }
 
+/// Locks the 10 actuated joints at their current angles: a limit with min = max (position and
+/// velocity rows). Velocity drives at 0 held the rate, not the angle, and the hung leg crept
+/// (the left knee 0.08 rad in 4 s), which a spectrum read as a 3 Hz mode.
+fn lock_motors(c: &mut cassie::Cassie) {
+    for name in ACTUATORS {
+        let id = c.model.joints[name];
+        let q = riftphys_reality::urdf::joint_angle(&c.world, &c.model, &c.urdf, name).unwrap() as f32;
+        c.world.set_d6_limit_r(id, 0, Some(D6Limit { min: q, max: q }));
+    }
+}
+
 fn pluck() -> Result<(), String> {
     let urdf = cassie::load_urdf()?;
     // Undamped (no joint damping, no rod damping), so the frequencies are the springs' own
     let p = Params { joint_damping: false, rod_damping: 0.0, ..Params::default() };
     let hz = 2000.0f64;
-    for i in [0usize, 10, 20] {
+    for i in [0usize, 5, 10, 15, 20, 23] {
         let t = cassie::load_traj(&cassie::data_dir(), i)?;
         // Hung: the pelvis welded, at rest, from the trajectory's first pose
         let mut row = t.x[0];
         for v in row[23..45].iter_mut() { *v = 0.0; }
         let mut c = cassie::build(&urdf, &row, &p, true)?;
-        // The motors locked (velocity drives at 0), so only the springs and the loop move
-        for name in ACTUATORS {
-            let id = c.model.joints[name];
-            c.world.set_d6_drive_r(id, 0, Some(D6Drive { target: 0.0, kp: 0.0, kd: 0.0, max_impulse: 1.0e6, vel_mode: true }));
-        }
+        // The motors locked in position, so only the springs and the loop move
+        lock_motors(&mut c);
         let names = ["knee_joint_left", "ankle_spring_joint_left", "knee_joint_right", "ankle_spring_joint_right"];
         let mut series: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
-        for _ in 0..(1.0 * hz) as usize {
+        let q0: Vec<f64> = ACTUATORS.iter().map(|n| riftphys_reality::urdf::joint_angle(&c.world, &c.model, &c.urdf, n).unwrap()).collect();
+        for _ in 0..(0.5 * hz) as usize {
             c.world.step((1.0 / hz) as f32);
             for (s, n) in series.iter_mut().zip(names) { s.push(riftphys_reality::urdf::joint_angle(&c.world, &c.model, &c.urdf, n).unwrap()); }
         }
-        let drift: Vec<f64> = series.iter().map(|s| s[s.len() - 1] - s[0]).collect();
-        print!("traj {:2} (change over 1 s: {:?} rad):", i, drift.iter().map(|d| (d * 1e3).round() / 1e3).collect::<Vec<_>>());
+        let creep = ACTUATORS.iter().zip(&q0).map(|(n, a)| (riftphys_reality::urdf::joint_angle(&c.world, &c.model, &c.urdf, n).unwrap() - a).abs()).fold(0.0, f64::max);
+        println!("traj {:2}: the locked motors crept at most {:.1e} rad", i, creep);
+        print!("traj {:2}:", i);
         for (s, n) in series.iter().zip(names) {
             let f = dominant(s, hz);
             let w = 2.0 * std::f64::consts::PI * f;
@@ -96,11 +106,41 @@ fn pluck() -> Result<(), String> {
     Ok(())
 }
 
+/// Trajectory `i`, hung as in `--pluck`, for `secs`: every joint's angle range (the mode shape),
+/// its distance from its URDF limits, and the dominant frequency of each spring.
+fn probe(i: usize, secs: f64) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let p = Params { joint_damping: false, rod_damping: 0.0, ..Params::default() };
+    let hz = 2000.0f64;
+    let t = cassie::load_traj(&cassie::data_dir(), i)?;
+    let mut row = t.x[0];
+    for v in row[23..45].iter_mut() { *v = 0.0; }
+    let mut c = cassie::build(&urdf, &row, &p, true)?;
+    lock_motors(&mut c);
+    let names = riftphys_reality::cassie::JOINTS;
+    let mut series: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+    for _ in 0..(secs * hz) as usize {
+        c.world.step((1.0 / hz) as f32);
+        for (s, n) in series.iter_mut().zip(names) { s.push(riftphys_reality::urdf::joint_angle(&c.world, &c.model, &c.urdf, n).unwrap()); }
+    }
+    let half = series[0].len() / 2;
+    for (s, n) in series.iter().zip(names) {
+        let tail = &s[half..];
+        let (lo, hi) = tail.iter().fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        let lim = c.urdf.joint(n).and_then(|j| j.limit);
+        let margin = lim.map(|(l, h)| (tail.iter().cloned().fold(f64::MAX, f64::min) - l).min(h - tail.iter().cloned().fold(f64::MIN, f64::max)));
+        println!("{:26} start {:+.4} last {:+.4} swing (2nd half) {:.2e} rad  limit margin {:?}  f {:.1} Hz",
+                 n, s[0], s[s.len() - 1], hi - lo, margin.map(|m| (m * 1e3).round() / 1e3), dominant(tail, hz));
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
         Some("--check") => check(),
         Some("--pluck") => pluck(),
+        Some("--probe") => probe(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(20), 4.0),
         _ => Err("usage: riftphys-cassie --check | --pluck".into()),
     };
     if let Err(e) = r { eprintln!("{}", e); std::process::exit(1); }
