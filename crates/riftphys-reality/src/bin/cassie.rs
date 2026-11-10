@@ -245,7 +245,13 @@ fn peak_above(x: &[f64], hz: f64, fmin: f64) -> Option<f64> {
 /// each jump's loss and terms, the secondary (de-lagged) loss, first contact, and the trial step.
 fn replay_all(hz: f64, line: cassie::Line) -> Result<(), String> {
     let urdf = cassie::load_urdf()?;
-    let p = Params::default();
+    let ankle_c: Option<f64> = std::env::var("CASSIE_ANKLE_C").ok().and_then(|v| v.parse().ok());
+    let iters: u32 = std::env::var("CASSIE_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let iters_pos: u32 = std::env::var("CASSIE_ITERS_POS").ok().and_then(|v| v.parse().ok()).unwrap_or(iters);
+    let p = Params { ankle_spring_c: ankle_c, iters: (iters, iters_pos), ..Params::default() };
+    println!("iterations ({}, {})", iters, iters_pos);
+    println!("ankle-spring damping: {}", ankle_c.map_or("the URDF's 10".to_string(), |c| c.to_string()));
+    let (mut t1, mut t2) = ([0.0f64; 4], [0.0f64; 4]);
     println!("{} Hz, {:?} line, unfitted (k {}, d {}, mu {})", hz, line, p.k, p.d, p.mu);
     println!("traj | loss (pos, vel, omega, quat) | de-lagged loss | first contact (ms) | trial: d ankle spring, d other max (rad/s), rod rate (m/s)");
     let (mut sum, mut sum2) = (0.0, 0.0);
@@ -254,13 +260,16 @@ fn replay_all(hz: f64, line: cassie::Line) -> Result<(), String> {
         let r = cassie::replay(&urdf, &t, &p, hz, line)?;
         let terms = cassie::loss_terms(&r.states, &t.x);
         let l: f64 = terms.iter().sum();
-        let l2 = cassie::loss(&r.states, &cassie::delag(&t));
+        let terms2 = cassie::loss_terms(&r.states, &cassie::delag(&t));
+        let l2: f64 = terms2.iter().sum();
+        for k in 0..4 { t1[k] += terms[k] / 22.0; t2[k] += terms2[k] / 22.0; }
         sum += l;
         sum2 += l2;
         println!("{:4} | {:7.2} ({:6.2} {:6.2} {:5.2} {:5.2}) | {:7.2} | {:>6} | {:.3} {:.3} {:.4}", i, l, terms[0], terms[1], terms[2], terms[3], l2,
                  r.first_contact.map_or("none".to_string(), |f| format!("{:.1}", f * 1e3)), r.trial.0, r.trial.1, r.trial.2);
     }
     println!("mean over the 22: {:.2} (de-lagged {:.2})", sum / 22.0, sum2 / 22.0);
+    println!("mean terms (pos, vel, omega, quat): paper {:.2} {:.2} {:.2} {:.2}; de-lagged {:.2} {:.2} {:.2} {:.2}", t1[0], t1[1], t1[2], t1[3], t2[0], t2[1], t2[2], t2[3]);
     Ok(())
 }
 
@@ -318,12 +327,96 @@ fn floor(hz: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Trajectory 0's loss at `hz` with the half-step correction off, from the replay's own trial
+/// step, and from a 2 kHz trial scaled to the step; and the trial steps' rate changes, 240 Hz
+/// over 2 kHz, per coordinate (smooth dynamics give h ratio 8.33).
+fn correction(i: usize, hz: f64) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let p = Params::default();
+    let t = cassie::load_traj(&cassie::data_dir(), i)?;
+    for (name, c) in [("off", cassie::Correction::Off), ("own trial", cassie::Correction::Trial), ("2 kHz trial, scaled", cassie::Correction::Fine(1.0 / 2000.0))] {
+        let r = cassie::replay_with(&urdf, &t, &p, hz, cassie::Line::Main, c)?;
+        println!("traj {} at {} Hz, correction {:22}: loss {:.2}", i, hz, name, cassie::loss(&r.states, &t.x));
+    }
+    let (lc, _) = cassie::start_row(&urdf, &t, &p)?;
+    let (_, coarse) = cassie::trial_step(&urdf, &t, &p, &lc, 1.0 / 240.0)?;
+    let (_, fine) = cassie::trial_step(&urdf, &t, &p, &lc, 1.0 / 2000.0)?;
+    println!("trial-step rate change, 240 Hz / 2 kHz (smooth: 8.33):");
+    let names: Vec<String> = ["pelvis wx", "pelvis wy", "pelvis wz", "pelvis vx", "pelvis vy", "pelvis vz"].iter().map(|s| s.to_string()).chain(cassie::JOINTS.iter().map(|s| s.to_string())).collect();
+    for (k, col) in (23..45).enumerate() {
+        let (dc, df) = (coarse[col] - lc[col], fine[col] - lc[col]);
+        let ratio = if df.abs() > 1e-9 { dc / df } else { f64::NAN };
+        let flag = if (ratio / 8.333 - 1.0).abs() > 0.25 { "  <- outside +-25%" } else { "" };
+        println!("  {:26} 240 Hz {:+8.4}  2 kHz {:+8.4}  ratio {:6.2}{}", names[k], dc, df, ratio, flag);
+    }
+    Ok(())
+}
+
+/// Trajectory `i` at 240 Hz scored against RiftPhys's own 2 kHz run (same start, correction off,
+/// same parameters), for the base model and one ingredient toggled at a time; and the base
+/// case's error over time with first contact marked.
+fn vs2k(i: usize) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let t = cassie::load_traj(&cassie::data_dir(), i)?;
+    let base = Params::default();
+    let cases: Vec<(&str, Params)> = vec![
+        ("base", base),
+        ("no torques", Params { inputs: false, ..base }),
+        ("no armature", Params { armature: false, ..base }),
+        ("leaf springs x100 stiffer", Params { knee_k: base.knee_k * 100.0, ankle_k: base.ankle_k * 100.0, ..base }),
+        ("no joint damping", Params { joint_damping: false, ..base }),
+        ("contact k x100", Params { k: base.k * 100.0, ..base }),
+        ("80 iterations", Params { iters: (80, 80), ..base }),
+    ];
+    for (name, p) in &cases {
+        let a = cassie::replay_with(&urdf, &t, p, 240.0, cassie::Line::Main, cassie::Correction::Off)?;
+        let b = cassie::replay_with(&urdf, &t, p, 2000.0, cassie::Line::Main, cassie::Correction::Off)?;
+        println!("traj {} {:28}: 240 Hz against 2 kHz {:8.2}; against the data: 240 Hz {:8.2}, 2 kHz {:7.2}; first contact {:?} / {:?} ms",
+                 i, name, cassie::loss(&a.states, &b.states), cassie::loss(&a.states, &t.x), cassie::loss(&b.states, &t.x),
+                 a.first_contact.map(|f| (f * 1e4).round() / 10.0), b.first_contact.map(|f| (f * 1e4).round() / 10.0));
+        if *name == "base" {
+            for k in (0..t.x.len()).step_by(5) {
+                let e = cassie::loss(&a.states[k..k + 1], &b.states[k..k + 1]);
+                let knee = (a.states[k][35] - b.states[k][35], a.states[k][37] - b.states[k][37]);
+                println!("   t {:5.1} ms  per-sample loss {:8.2}  knee L rate diff {:+7.2}  knee spring L rate diff {:+7.2}", (t.t[k] - t.t[0]) * 1e3, e, knee.0, knee.1);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The de-lagged rates against the recorded rates shifted back by `lag` samples (and unshifted),
+/// over the paper's 22, on samples 4..(n - lag - 4): RMS per lagged column.
+fn delag_check(lag: usize) -> Result<(), String> {
+    let mut acc = [[0.0f64; 2]; 4];
+    let mut n = 0usize;
+    for &i in PAPER_JUMPS.iter() {
+        let t = cassie::load_traj(&cassie::data_dir(), i)?;
+        let d = cassie::delag(&t);
+        for k in 4..t.x.len() - lag - 4 {
+            for (c, (_, rate)) in cassie::LAGGED_RATES.iter().enumerate() {
+                acc[c][0] += (d[k][*rate] - t.x[k + lag][*rate]).powi(2);
+                acc[c][1] += (d[k][*rate] - t.x[k][*rate]).powi(2);
+            }
+            n += 1;
+        }
+    }
+    let names = ["knee spring L", "knee spring R", "ankle L", "ankle R"];
+    for c in 0..4 {
+        println!("{:14} de-lagged against recorded shifted {} samples: RMS {:.3} rad/s; unshifted: {:.3}", names[c], lag, (acc[c][0] / n as f64).sqrt(), (acc[c][1] / n as f64).sqrt());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
         Some("--check") => check(),
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
+        Some("--delag") => delag_check(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(9)),
+        Some("--vs2k") => vs2k(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0)),
+        Some("--correction") => correction(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(240.0)),
         Some("--floor") => floor(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0)),
         Some("--terms") => terms(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(240.0)),
         Some("--replay") => {

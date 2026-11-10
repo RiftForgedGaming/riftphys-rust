@@ -80,13 +80,17 @@ pub struct Params {
     pub toes: bool,
     /// Solver iterations (velocity, position); the World's default is (20, 20).
     pub iters: (u32, u32),
+    /// Apply the measured motor torques (false: none, a diagnostic).
+    pub inputs: bool,
+    /// The ankle springs' damping, N m s/rad, overriding the URDF's "made up" 10 (None: the URDF).
+    pub ankle_spring_c: Option<f64>,
 }
 
 impl Default for Params {
     fn default() -> Self {
         // Contact at Table VI's Drake values until fitted
         Self { knee_k: 1500.0, ankle_k: 1250.0, rod_compliance: 1.0e-6, rod_damping: 2.0e3, toe_r: 0.001,
-               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (20, 20) }
+               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (20, 20), inputs: true, ankle_spring_c: None }
     }
 }
 
@@ -143,6 +147,8 @@ pub fn load_traj(dir: &Path, index: usize) -> Result<Traj, String> {
 /// Cassie built in a World.
 pub struct Cassie {
     pub world: World,
+    /// Whether `apply_inputs` applies the measured torques.
+    pub inputs: bool,
     /// The static ground box.
     pub ground: BodyId,
     pub urdf: Urdf,
@@ -197,6 +203,8 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
     let model = urdf::build(urdf, &mut world, &state_config(row, p, pinned))?;
     if !p.joint_damping {
         for id in model.joints.values() { world.set_d6_damping(*id, true, 0, 0.0, 0.0); }
+    } else if let Some(c) = p.ankle_spring_c {
+        for name in ["ankle_spring_joint_left", "ankle_spring_joint_right"] { world.set_d6_damping(model.joints[name], true, 0, c as f32, 0.0); }
     }
     if p.armature {
         for (k, name) in ACTUATORS.iter().enumerate() {
@@ -221,7 +229,7 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
             toes.push((link, b, DVec3::from(pt)));
         }
     }
-    Ok(Cassie { world, ground, urdf: urdf.clone(), model, rods: [rods[0], rods[1]], toes })
+    Ok(Cassie { world, inputs: p.inputs, ground, urdf: urdf.clone(), model, rods: [rods[0], rods[1]], toes })
 }
 
 fn d(v: Vec3) -> DVec3 { DVec3::new(v.x as f64, v.y as f64, v.z as f64) }
@@ -442,6 +450,22 @@ pub enum Line {
     Sensitivity,
 }
 
+/// How the half-step start's correction is taken (PARITY_SPEC 3.4a).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Correction {
+    /// None: the start is the loop-consistent state itself.
+    Off,
+    /// From one trial step at the replay's own step h: v0 - (v1 - v0) / 2.
+    Trial,
+    /// From one trial step at a finer step h_f, scaled to h: v0 - (h / h_f) (v1 - v0) / 2.
+    Fine(f64),
+    /// The rule decided before the fit (PARITY_SPEC 3.4a): a coordinate takes its own trial
+    /// step's correction only if that step's change, over a 2 kHz trial step's, is within 25% of
+    /// the step ratio h / h_2k (smooth dynamics); the others take none. At 2 kHz every
+    /// coordinate passes, so it is the plain trial correction there.
+    Gated,
+}
+
 /// What a replay gives back.
 #[derive(Clone, Debug)]
 pub struct Replay {
@@ -476,6 +500,7 @@ impl Cassie {
     /// Applies each actuator's angular impulse over [a, b] as an equal and opposite pair on the
     /// joint's child and parent, about the joint's axis.
     pub fn apply_inputs(&mut self, t: &Traj, a: f64, b: f64) {
+        if !self.inputs { return; }
         for (k, name) in ACTUATORS.iter().enumerate() {
             let imp = input_impulse(t, k, a, b);
             let j = self.urdf.joint(name).unwrap().clone();
@@ -495,15 +520,42 @@ const VEL: std::ops::Range<usize> = 23..45;
 
 /// Replays trajectory `t` at `hz` from the start of `line`, recording at the data's sample times.
 pub fn replay(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line) -> Result<Replay, String> {
-    let h = 1.0 / hz;
-    let (lc, _) = start_row(urdf, t, p)?;
-    // The half-step correction from a trial step on the loop-consistent state, contact off
-    let mut trial = build(urdf, &lc, &Params { toes: false, ..*p }, false)?;
+    replay_with(urdf, t, p, hz, line, Correction::Gated)
+}
+
+/// One trial step of length `h` from `lc`, contact off: the state after it.
+pub fn trial_step(urdf: &Urdf, t: &Traj, p: &Params, lc: &[f64; 45], h: f64) -> Result<(Cassie, [f64; 45]), String> {
+    let mut trial = build(urdf, lc, &Params { toes: false, ..*p }, false)?;
     trial.apply_inputs(t, t.t[0], t.t[0] + h);
     trial.world.step(h as f32);
     let after = trial.state();
+    Ok((trial, after))
+}
+
+pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr: Correction) -> Result<Replay, String> {
+    let h = 1.0 / hz;
+    let (lc, _) = start_row(urdf, t, p)?;
+    // The half-step correction from a trial step on the loop-consistent state, contact off
+    let (trial, after) = trial_step(urdf, t, p, &lc, h)?;
     let mut start = lc;
-    for i in VEL { start[i] = lc[i] - 0.5 * (after[i] - lc[i]); }
+    match corr {
+        Correction::Off => {}
+        Correction::Trial => { for i in VEL { start[i] = lc[i] - 0.5 * (after[i] - lc[i]); } }
+        Correction::Fine(hf) => {
+            let (_, fine) = trial_step(urdf, t, p, &lc, hf)?;
+            for i in VEL { start[i] = lc[i] - 0.5 * (h / hf) * (fine[i] - lc[i]); }
+        }
+        Correction::Gated => {
+            let hf = 1.0 / 2000.0;
+            let (_, fine) = trial_step(urdf, t, p, &lc, hf)?;
+            let want = h / hf;
+            for i in VEL {
+                let (dc, df) = (after[i] - lc[i], fine[i] - lc[i]);
+                let smooth = df.abs() > 1e-12 && ((dc / df) / want - 1.0).abs() <= 0.25;
+                if smooth { start[i] = lc[i] - 0.5 * dc; }
+            }
+        }
+    }
     let d_ankle = (after[41] - lc[41]).abs().max((after[43] - lc[43]).abs());
     let d_other = (29..45).filter(|&i| i != 41 && i != 43).map(|i| (after[i] - lc[i]).abs()).fold(0.0, f64::max);
     let rods = trial.rod_rates();

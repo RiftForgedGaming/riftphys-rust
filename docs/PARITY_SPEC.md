@@ -918,6 +918,48 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     (4.17 ms) includes contact on those jumps, while the trial step runs without it; on the rest
     it is 5.0–11.5 ms.
 
+**The 240 Hz gap, diagnosed (2026-11-10, after the Reviewer's review of afd5499;
+`riftphys-cassie --correction | --vs2k | --delag`):**
+- **The half-step correction, restated before any fit.** Over the trial step, smooth dynamics
+  change each rate by a·h, 8.33 times more at 240 Hz than at 2 kHz. On trajectory 0 almost no
+  coordinate does: the knee and knee-spring rates change by about 2.8 times, the ankle springs'
+  by −0.43 and 2.0, the pelvis's by 2.0–12.2 times. The knee link and its rotor move about
+  10 rad/s against the knee spring within one 240 Hz step: a fast mode, not a·h. Trajectory 0 at
+  240 Hz scores 648 with the correction from its own trial step, 356 with none, and 1233 with a
+  2 kHz trial's correction scaled up (the scaling multiplies the fast transient). At 2 kHz the
+  correction is worth little (27.96 off, 26.37 on).
+  - **The rule (`Correction::Gated`, now the replay's):** a coordinate takes its own trial step's
+    correction only if that step's change over a 2 kHz trial step's is within 25% of the step
+    ratio h / h_2k; the others take none. At 2 kHz every coordinate passes. MuJoCo Euler's
+    correction follows the same rule on its own trial steps.
+- **Model mismatch taken out** (240 Hz scored against RiftPhys's own 2 kHz run, the same start
+  with no correction, the same parameters; trajectory 0):
+  - before contact the error grows to a per-sample loss of 15–70, the left knee's rate 3–6 rad/s
+    off: the leg's loop at 240 Hz;
+  - after contact (the toes touch at 6–8 ms) it jumps to 600–880 at 12.5–17.5 ms and decays
+    slowly, the left knee's rate about 12 rad/s off. Most of the gap is after contact;
+  - one ingredient at a time (240 Hz against 2 kHz; base 339): no torques 362; no rotors 719;
+    leaf springs ×100 stiffer 506; no joint damping 591; 80 iterations 303; **contact ×100
+    stiffer 271,260 (2 kHz against the data: 460)**. The torques aren't the cause.
+  - **So the main cause is the compliant contact.** Its Hunt–Crossley force is computed once per
+    step from the step-start penetration (explicit), acting on light toe links; ×100 stiffer it
+    diverges at 240 Hz. The leg's fast modes before contact are the smaller part. An implicit
+    compliant contact (the force solved with the step's end penetration, as XPBD does for joint
+    springs) is the engine change that would address it: to be drafted as its own item for
+    review.
+- **The iteration curve** (the paper's 22, main line, mean loss): at 240 Hz, 237.9 at the biped
+  workload's (8, 6), 227.0 at 8, 214.5 at 20, 227.7 at 80, 230.2 at 320; at 2 kHz, 28.70 at
+  (8, 6), 29.11 at 8, 30.21 at 20. Across the 22, iterations don't matter (trajectory 0 was the
+  exception); the pass's count is D9's question.
+- **The de-lagged line is sound:** the de-lagged rates match the recorded rates shifted back 9
+  samples to 0.38–0.77 rad/s RMS, against 2.3–2.6 unshifted. So its higher loss is real; the
+  whole rise is the velocity term (19.9 → 31.4 at 2 kHz, the positions, ω and orientation
+  unchanged). RiftPhys's ankle rates track the recorded (lagged) ones better than the true
+  ones: they are smoother than the robot's.
+- **The URDF's "made up" ankle-spring damping (report only, not fitted):** mean loss at 2 kHz
+  30.21 with its 10, 28.89 with 1, 28.87 with 0 (de-lagged 41.76, 40.42, 40.40). It carries
+  little, and it doesn't explain the de-lagged rise.
+
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
 Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4
@@ -1669,6 +1711,15 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     - (c) fails at both: model mismatch or the engine, investigated as usual.
   - **Decided 2026-11-10 (Designer: "Yes, accept"):** as proposed: the pass at 240 Hz, 2 kHz
     reported beside it, and outcomes (a)–(c) as written above, fixed before any fit.
+  - **Open, the iteration count for the pass (the Reviewer's question, 2026-11-10):** the biped
+    workload runs (8, 6) solver iterations; the replay ran the World's default (20, 20). Across
+    the 22 the count barely moves the loss (3.4a: 214–238 at 240 Hz, 28.7–30.2 at 2 kHz).
+    Proposed: the pass at the workload's (8, 6), with the curve (8, 20, 80, 320) reported; if
+    parity ever needs more, the URIEL report says the workload would have to adopt that count.
+  - **What the first measurements say about outcome (a)–(c):** unfitted, RiftPhys's 240 Hz loss
+    is about eight times its 2 kHz loss, mostly from the explicit compliant contact (3.4a). A
+    pass at 240 Hz likely needs an implicit compliant contact first. Not a result: the fit and
+    the MuJoCo pairing aren't run.
 - **D10:** downloads for W4.
   - **Needed:** Agility's MuJoCo model, as the paper used it: github.com/osudrl/cassie-mujoco-sim
     `model/cassie.xml` (22,344 bytes) and `model/cassie-stl-meshes/` (11 STL files, 2,049,524
