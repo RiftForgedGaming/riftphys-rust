@@ -716,6 +716,50 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     the spheres' height (within 1 mm), at 60 and 240 Hz. This replaces the drafted tilted-box
     test, which was the same check made indirect.
 
+**Review of the built W4c and W4d (RiftPhys Reviewer, 2026-11-10), and the fixes:**
+- **Blocker, fixed: box–sphere contact with the sphere's centre inside the box.** Measured from
+  the nearest face point as outside, the normal pointed into the box and the penetration shrank
+  with depth (at 1 mm, 2 mm and 5 mm under a floor with r = 1 mm: 3.0, 2.0 and no contact against
+  true 5.0, 6.0 and 9.0 mm), so a contact past r + contact_dist vanished and the sphere fell
+  through. Centred spheres were masked by the COM-direction normal flip, but lost the contact all
+  the same. Cassie's 1 mm toe spheres would sink about 24 mm at every landing (about 225 N each
+  at 9400 N/m).
+  - **The fix (narrowphase.rs, `collide_box_sphere`):** inside, the normal is the nearest face's
+    outward normal, the penetration r + contact_dist + the centre's depth below that face, at any
+    depth; the point is halfway between the face and the sphere's deepest point, as outside.
+    Box–capsule tests points with box–sphere, so it inherits the fix.
+  - **Tests:** `box_sphere_inside_test.rs` (centre at depths r/2, r, 2r and 20r under a turned
+    floor: outward normal, penetration r + d + contact_dist, both argument orders);
+    `collider_offset_test.rs`: a 10 kg body on one 1 mm sphere on compliant ground (9400 N/m)
+    rests at F / k = 10.4 mm within 2%; the lever scene with gravity, 2 s past impact, keeps its
+    offset sphere within 1 mm of the rigid contact's 5 mm position slop. Without the fix the
+    first sank 44 m and the second 20 m.
+  - **Sphere–triangle, checked and left for its own item:** a triangle has no inside, so past
+    its contact range there's nothing to keep. Within range, a centre behind the triangle's
+    plane gets a reversed normal, as box–sphere did, and its normal also points from the
+    triangle to the sphere, the opposite of box–triangle's A → B. Triangles are the terrain's
+    and the F1 seam's workpiece (golden seam SHA-256), and Cassie stands on a box, so this goes
+    to a separate review rather than into W4.
+- **Damping with no start poses, fixed:** under the PBD projection the step captured no start
+  poses, so a damped compliant row measured no change and wasn't damped at all (measured: 0.9997
+  per period against 0.5318). The step now captures them under either projection, and
+  `Joints::solve_step_with` takes SHAKE's poses and the step's start poses apart. Outside a step
+  (`World::solve_joints`) there is no start, and such rows act as springs only (documented).
+  Test: `damping_acts_under_the_pbd_projection_too`.
+- **A soft limit keeps its damper, fixed:** which rows move their damping into the position row
+  is one rule, `position_damped`: enabled, compliant, damped, no limit and no velocity drive.
+  Any other damped row keeps W3a's velocity damper (a limited row's position part acts only
+  outside its range, so moving its damper there left it undamped inside). Test:
+  `a_soft_limited_hinge_keeps_its_damper_inside_its_range` (spin within 2% of
+  (1 + c dt / I)^−n).
+- **The contact normal flip** (step.rs) compares the colliders' world positions, not the bodies'
+  COMs (the same for colliders with no offset).
+- Accepted as built: the ζ = 1 gate at 2%; the 60 Hz first-impact depth printed, not gated.
+- **Regression (2026-11-10, after all four fixes):** every suite passes (collision, world, URIEL,
+  reality). No golden moved: `joint_bits`, `w6_jointed_bits`, W6's scene hashes, the distance
+  goldens, the seam and the cube tosses are unchanged, so no golden scene had a sphere's centre
+  inside a box.
+
 **Order:** W4c, then W4d, then the W4 model.
 
 ### 3.5 W5: lever-arm conditioning (P5, only if shown)
@@ -1379,7 +1423,9 @@ trains on the default without anything changing, and can switch when it's ready.
 6. W5 only if triggered.
 
 W1, W2, W3a, W4b, W6, the D6 split and W3 are built. Arm and drone parity were reported on
-2026-11-10 (PHYSICS_FIDELITY.md section 4). Biped parity needs W4a and W4 (P4); P5's fixes
+2026-11-10 (PHYSICS_FIDELITY.md section 4). The Designer ruled on the argref bump the same day: "Wait for
+biped". The pin stays at 2b98bb3 and arm and drone training wait; the bump goes to the Designer
+with the full report once the biped reaches P4 and P5. Biped parity needs W4a and W4 (P4); P5's fixes
 (W1, W2) are built, and its lever-arm part waits on whether P4 shows it.
 
 **Each parity report:**
@@ -1418,6 +1464,8 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     The proposal is now: P4 passes when RiftPhys is no worse than MuJoCo rerun on the public
     windows, per jump under D2's rule, both fit on the same folds (needs D10). 38.0 and 30.0 are
     reported as context.
+  - **Decided 2026-11-10 (Designer: "Yes, accept"):** as reframed. P4's bar is MuJoCo rerun on
+    the public windows, paired per jump under D2, judged at 240 Hz (D9).
 - **D9:** the physics rate for P4.
   - **The options:** 240 Hz, the biped's workload rate (12 steps over the window; the 2 kHz
     samples are compared against states interpolated between steps), or 2 kHz, the data's rate.
@@ -1437,6 +1485,8 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
       (or their ω dt shown irrelevant) closes the gap. A follow-up item for a less dissipative
       compliant row is logged, and it isn't reported as parity;
     - (c) fails at both: model mismatch or the engine, investigated as usual.
+  - **Decided 2026-11-10 (Designer: "Yes, accept"):** as proposed: the pass at 240 Hz, 2 kHz
+    reported beside it, and outcomes (a)–(c) as written above, fixed before any fit.
 - **D10:** downloads for W4.
   - **Needed:** Agility's MuJoCo model, as the paper used it: github.com/osudrl/cassie-mujoco-sim
     `model/cassie.xml` (22,344 bytes) and `model/cassie-stl-meshes/` (11 STL files, 2,049,524
