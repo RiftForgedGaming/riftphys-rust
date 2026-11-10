@@ -1281,9 +1281,87 @@ its 240 Hz control (sub-steps), with P4 rerun at that rate under criteria set be
     480 / 960 Hz; a 12 N s push: 0.0041 / 0.0011 / 0.0006 rad, 2.9 / 0.6 / 0.3 mm. None fall.
   - a 20 N s push (falls at every rate) and no control (collapse) diverge by tens of mm to 0.3 m at
     every rate, 960 Hz no closer than 480 Hz: chaotic falls, not a step-size trend.
+- **The mechanism, shown (the Reviewer's check, 2026-11-10; `riftphys-cassie --position-pass hz
+  steps [links]`, which reads each step's poses after integration and before the position pass
+  through a read-only World record):** jump 0, flight, knee torques only, the left side. On the
+  first 240 Hz step the velocity pass turns the knee motor joint +0.038 rad and the position pass
+  turns it back **−0.052**, while the position pass releases the knee spring by +0.057; the step's
+  net spring change is +0.041 (−0.063 to −0.022). So the spring's position correction lands almost
+  wholly on the motor joint. 2 kHz shows the same split per step, at a tenth the size (over its
+  first 9 steps: motor −0.0156, spring +0.0159). With the rotors on the links (the diagnostic), the
+  first 240 Hz step's position pass turns the motor −0.016 and the spring +0.023.
 - **Cost per simulated second (item 3, release, one core):** the URIEL biped 21.2 / 38.5 / 78.0 /
   152.5 ms at 240 / 480 / 960 / 1920 Hz; the Cassie replay 66.7 / 118.1 / 204.3 / 369.3 ms at
   240 / 480 / 960 / 2000 Hz (including the start solve and trial steps).
+
+### 3.4h W4f design: the geared rotor in the position pass (drafted 2026-11-10, for review before building)
+
+From 3.4g: W4b's rotor exists only in the velocity solve, so every position correction across an
+armature joint (the leaf springs' XPBD rows, the loop's SHAKE rows, limits) moves the light
+motor-side link as if the rotor weren't there, and the next step's velocity row reconciles it
+inelastically. This adds the rotor's partner row in the position pass. Built only once the route
+is confirmed (the Designer) and this design is reviewed.
+
+- **The row:** the rotor as a virtual 1-DoF body geared rigidly to the axis. Per armature axis,
+  C = θ_rel − θ_r, where the rotor moves by −Δλ/J_a when the links take +Δλ. With θ_r =
+  θ_r* − λ_acc/J_a, each iteration solves Δλ = −(C0 + λ_acc/J_a)/(w_links + 1/J_a), where
+  C0 = θ_rel − θ_r* and w_links is the axis's generalised inverse inertia, as the other rotational
+  rows compute it (SHAKE's start directions and inertias, or PBD's current ones).
+  - **Units:** this is an XPBD row with α̃ = 1/J_a. Stored as a compliance, that is α = h²/J_a,
+    since `alpha_dt2` divides by dt². The row computes α̃ directly rather than going through a
+    stored compliance (a stored 1/J_a would be off by h², nearly rigid at 240 Hz), and a test
+    pins it (below).
+- **The rotor's predicted angle:** θ_r* = θ_rel at the step's start + h·ω_rotor, with ω_rotor as
+  the velocity solve stored it (its own balance, ω_rotor − λ_vel/J_a). The gear is rigid, so θ_r
+  equals θ_rel at each step start and no rotor angle is carried. C0 = θ_rel(predicted) − θ_r* is
+  then h·(ω_rel − ω_rotor) after the velocity solve and the shock and restitution passes, up to the
+  integrator's rotation-versus-angle difference. Any mismatch the contact-only passes left is
+  reconciled inside the step, with the impulse going to the rotor. The angle difference is wrapped
+  to (−π, π].
+- **The carried state:** after the position pass, ω_rotor ← ω_rotor − λ_pos/(J_a·h), with λ_pos the
+  row's accumulated λ over the pass. That equals (θ_r,final − θ_rel,start)/h, so the impulse the
+  position pass gave the rotor isn't handed back to the next step's velocity row to reconcile
+  inelastically. The stage-6 velocity update already gives the links their side, λ_pos/h.
+- **Where:** `D6Axis` gets two transient fields, not carried state and not hashed:
+  `rotor_target: Option<f32>` (θ_r*, set by the World before stage 5 for each armature axis of an
+  awake joint; None outside a step, so `solve`/`solve_joints` projections have no rotor row) and
+  `rotor_lambda` (reset in `begin_step`). `solve_d6` runs the rotor row after the three rotational
+  rows, for each axis with armature > 0 and a target, whether or not the axis row is enabled (a
+  hinge's free axis is disabled); on a hinge's own axis it measures the twist in radians, elsewhere
+  the small-angle measure, as `d6_row_angle`. The World reads `rotor_lambda` after stage 5 and
+  updates `rotor`.
+- **Limits and springs on the same axis:** the rows iterate together. A hard limit wins (α 0
+  against α̃ 1/J_a), so a joint driven into its stop stops its rotor in the same step. That is the
+  rigid gear's physics, and it's an impact that dissipates the rotor's ½J_a ω² as it does the links'.
+- **Unchanged:** the velocity row (W4b); rows without armature; the isotropic arm (armature in the
+  body inertia); the URIEL biped (armature on the links); `set_body_pose`/`set_body_vel` rotor rules.
+
+**Tests (criteria set before building):**
+- **(a) The split, analytic:** a fixed body, a motor link on a hinge with armature J_a, and a load
+  link on a sprung hinge (same axis) to it, no gravity. Start the spring deflected. After one step
+  with many position iterations, the position pass's turns satisfy Δθ_motor / Δθ_load =
+  −I_load / (I_motor + J_a) within 2%. Today the ratio is −I_load / I_motor.
+- **(b) The units:** the same rig at 60, 240 and 2000 Hz gives the same split (the α̃ = 1/J_a pin;
+  stored as 1/J_a, the 240 Hz split would be near-rigid).
+- **(c) No-op when nothing else corrects:** a free hinge with armature under a constant torque,
+  no other rows: |λ_pos| below 1e-6 N m s each step, and W4b's tests (τ/(I + J_a) within 1%,
+  the pendulum period, energy, rollback, the impact momentum balance) pass unchanged.
+- **(d) Energy:** the (a) rig without spring damping keeps its energy, ½J_a ω_rotor² counted, over
+  10 s at 240 Hz at least as well as with the rotors on the links.
+- **(e) Determinism:** a rollback across steps with the rotor row replays hash for hash, with
+  the rotor state as carried today.
+- **(f) The Cassie regression (from 3.4g):** jump 0, flight, knee torques only, 240 Hz. On the
+  first step the position pass turns the left knee motor joint by at most 0.026 rad in magnitude:
+  half of today's −0.052. The rotors-on-links diagnostic gives −0.016. Kept as a test.
+- **Bit-identical gates:** joint_bits, the W6 hashes, distance_bits, the URIEL biped's and the
+  isotropic arm's goldens. Nothing outside armature axes may move.
+- **What moves, named:** the arm's `ArmArmature::Axis` results (arm.rs's Axis tests, and
+  `sine_and_random` / `sine_top_rate` on Axis), seam.rs's `an_axis_armature_arm_tracks_a_seam`
+  and the `seam_*_axis` goldens, and the Cassie runs. Each is reported before and after, and the
+  D6 sine-contact probe on Axis is rerun and reported.
+- **Afterwards (report-only, then the rerun):** 3.4g's diagnosis table again. Then P4, exactly as
+  stated in 3.4a and 3.4e, with the D9 outcomes, and 7c1037c's result kept on record. Contact
+  stays a separate effect (3.4g): the flight fix isn't expected to close the gap alone.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 

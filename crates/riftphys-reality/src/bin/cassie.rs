@@ -2,7 +2,8 @@
 //!   riftphys-cassie --check     rod length and rate, toe heights, at each trajectory's first sample
 //!   riftphys-cassie --pluck     the leaf springs' frequencies on the built model, hung at 2 kHz
 use riftphys_articulation::bodies::{D6Joint, D6Limit};
-use riftphys_core::{Isometry, Quat, Vec3};
+use riftphys_core::{BodyId, Isometry, Quat, Vec3};
+use glam::{DQuat, DVec3};
 use riftphys_reality::cassie::{self, Params, ACHILLES_LENGTH, ACTUATORS, ALL_JUMPS, PAPER_JUMPS};
 
 fn check() -> Result<(), String> {
@@ -638,6 +639,47 @@ fn cost() -> Result<(), String> {
     Ok(())
 }
 
+/// The Reviewer's mechanism check (3.4g): jump 0, flight, knee torques only. Per step, how much
+/// the position pass alone turns the left knee motor joint and the left knee spring (final angle
+/// minus the angle at the predicted poses), against what the velocity pass did (predicted minus start).
+fn position_pass(hz: f64, steps: usize, on_links: bool) -> Result<(), String> {
+    use riftphys_reality::urdf::Frame;
+    let urdf = cassie::load_urdf()?;
+    let p = Params { toes: false, input_mask: 0xc0, armature_on_link: if on_links { 0x3ff } else { 0 }, ..Params::default() };
+    let t = cassie::load_traj(&cassie::data_dir(), 0)?;
+    let (lc, _) = cassie::start_row(&urdf, &t, &p)?;
+    let mut c = cassie::build(&urdf, &lc, &p, false)?;
+    c.world.set_record_predicted(true);
+    let angle_at = |c: &cassie::Cassie, poses: &dyn Fn(BodyId) -> Isometry, name: &str| -> f64 {
+        let j = c.urdf.joint(name).unwrap();
+        let frame = |link: &str| -> Frame {
+            let (b, f) = c.model.links[link];
+            let q = poses(c.model.bodies[b].id);
+            Frame::new(DVec3::new(q.pos.x as f64, q.pos.y as f64, q.pos.z as f64), DQuat::from_xyzw(q.rot.x as f64, q.rot.y as f64, q.rot.z as f64, q.rot.w as f64)).mul(&f)
+        };
+        let fp = frame(&j.parent).mul(&j.origin);
+        let r = fp.rot.conjugate() * frame(&j.child).rot;
+        let r = if r.w < 0.0 { -r } else { r };
+        2.0 * DVec3::new(r.x, r.y, r.z).dot(j.axis).atan2(r.w)
+    };
+    let h = 1.0 / hz;
+    println!("{} Hz, jump 0, flight, knee torques only (left side, rad): step | knee motor: velocity pass, position pass | knee spring: velocity pass, position pass", hz);
+    let (mut sum_mv, mut sum_mp, mut sum_sv, mut sum_sp) = (0.0, 0.0, 0.0, 0.0);
+    for k in 0..steps {
+        let now = |c: &cassie::Cassie, n: &str| angle_at(c, &|id| c.world.get_body_pose(id), n);
+        let (m0, s0) = (now(&c, "knee_left"), now(&c, "knee_joint_left"));
+        c.apply_inputs(&t, t.t[0] + k as f64 * h, t.t[0] + (k + 1) as f64 * h);
+        c.world.step(h as f32);
+        let pred = c.world.predicted_poses().unwrap().to_vec();
+        let (mp, sp) = (angle_at(&c, &|id| pred[id.0 as usize], "knee_left"), angle_at(&c, &|id| pred[id.0 as usize], "knee_joint_left"));
+        let (m1, s1) = (now(&c, "knee_left"), now(&c, "knee_joint_left"));
+        println!("{:4} | {:+.5} {:+.5} | {:+.5} {:+.5}", k + 1, mp - m0, m1 - mp, sp - s0, s1 - sp);
+        sum_mv += mp - m0; sum_mp += m1 - mp; sum_sv += sp - s0; sum_sp += s1 - sp;
+    }
+    println!("sum  | {:+.5} {:+.5} | {:+.5} {:+.5}", sum_mv, sum_mp, sum_sv, sum_sp);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -648,6 +690,7 @@ fn main() {
         Some("--diagnose") => diagnose(),
         Some("--diag-inputs") => diag_inputs(),
         Some("--cost") => cost(),
+        Some("--position-pass") => position_pass(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(4), args.get(4).map(String::as_str) == Some("links")),
         Some("--trace-knee") => trace_knee(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0)),
         Some("--rigid-check") => match (args.get(2), args.get(3)) { (Some(f), Some(o)) => rigid_check(f, o), _ => Err("usage: --rigid-check fits.json out.json".into()) },
         Some("--export-starts") => export_starts(&args.get(2).cloned().unwrap_or_else(|| "cassie_starts.json".to_string())),

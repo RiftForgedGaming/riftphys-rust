@@ -279,6 +279,8 @@ impl World {
             predicted_poses[i as usize] = self.bodies.pose(i);
         }
 
+        if let Some(rec) = &mut self.diag_predicted { rec.clone_from(&predicted_poses); }
+
         // --- STAGE 5: Solve Joints + Contacts (Position Level) ---
         // Interleaved so joint corrections cannot drive bodies (feet under a heavy load) into the
         // ground: each joint pass is followed by a contact projection.

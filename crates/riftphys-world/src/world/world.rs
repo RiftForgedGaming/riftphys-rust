@@ -288,6 +288,9 @@ pub struct World {
     /// and the pseudo solve's last residual (m/s).
     pub(super) contact_loaded: Vec<bool>,
     pub(super) bounce_pseudo: Vec<(Vec3, Vec3)>,
+    /// A diagnostic record (PARITY_SPEC 3.4g): when Some, each step stores every body's pose after
+    /// integration and before the position pass. Read-only; it never changes the step.
+    pub(super) diag_predicted: Option<Vec<Isometry>>,
     pub(super) last_bounce_residual: f32,
     pub(super) last_bounce_stats: BounceStats,
     /// The W6 bounce passes' direct-solve limit, in rows per component (`DIRECT_MAX`)
@@ -421,6 +424,7 @@ impl World {
             pre_step_vel: Vec::new(),
             contact_loaded: Vec::new(),
             bounce_pseudo: Vec::new(),
+            diag_predicted: None,
             last_bounce_residual: 0.0,
             last_bounce_stats: BounceStats::default(),
             bounce_direct_max: super::solver::DIRECT_MAX,
@@ -792,6 +796,10 @@ impl World {
     }
 
     pub fn set_tick(&mut self, tick: u64) { self.tick = tick; }
+    /// Turns the predicted-pose record on or off (a diagnostic; it doesn't change the step).
+    pub fn set_record_predicted(&mut self, on: bool) { self.diag_predicted = if on { Some(Vec::new()) } else { None }; }
+    /// Each body's pose after the last step's integration, before its position pass (if recorded).
+    pub fn predicted_poses(&self) -> Option<&[Isometry]> { self.diag_predicted.as_deref() }
     pub fn clear_solver_caches(&mut self) { self.clear_warm(); self.last_normal_impulse.fill(0.0); }
 
     pub(super) fn clear_warm(&mut self) { self.warm.clear(); self.warm_patches.clear(); self.warm_joints.clear(); }
