@@ -1796,6 +1796,18 @@ after parity, URIEL trains on parity physics, and RiftForged then "exacerbates r
   parity API alone.
 - SR&ED: matching RiftForged is engine parity, integration (project F, logged); real-world parity
   is B.
+- **What "RiftForged physics" is** (read 2026-11-10, `R:\RiftForged\RiftPhysics`): stock Bullet
+  (sequential impulse, 10 iterations, ERP 0.15, gravity 9.81, 120 Hz fixed sub-steps) under a thin
+  game layer of stated rules: character capsules that can't tip and whose velocity a movement intent
+  overwrites each tick (vertical only for a jump above 1 m/s), per-entity gravity shifts, a global
+  time scale, fixed material constants, teleports, ragdoll swing and twist limits, voxel
+  deformation. So the game API is the parity core plus those rules, not a second engine.
+- **The criteria's shape, agreed by the Designer 2026-11-10** ("it doesn't have to match bullet 1:1
+  since engine divergence is expected especially between two different programming languages"):
+  the game rules exactly (analytic checks: velocity intents, the tip lock, gravity shifts, time
+  scale); the dynamics within a tolerance over short horizons against RF's Bullet recordings, not
+  trace-identical; determinism bitwise within RiftPhys. The numbers go in the week-start update
+  before the work starts.
 
 **Each parity report:**
 - is a new section in `docs/PHYSICS_FIDELITY.md`;
