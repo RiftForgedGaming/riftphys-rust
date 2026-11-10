@@ -25,6 +25,10 @@ name = "riftphys-double-pendulum"
 path = "src/bin/double_pendulum.rs"
 
 [[bin]]
+name = "riftphys-cassie"
+path = "src/bin/cassie.rs"
+
+[[bin]]
 name = "riftphys-synth"
 path = "src/bin/synth.rs"
 

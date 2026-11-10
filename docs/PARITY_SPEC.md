@@ -767,6 +767,36 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
 
 **Order:** W4c, then W4d, then the W4 model.
 
+**Pre-fit checks (built 2026-11-10, `riftphys-reality/src/cassie.rs`, `riftphys-cassie --check | --pluck`):**
+- **The model:** `cassie_v2.urdf` through the W4a loader (17 bodies, 16 joints), with dairlib's
+  leaf springs (1500 and 1250 N m/rad), reflected inertia on the 10 actuated joints, the achilles
+  rods as anchored distance joints (W4c; 1e-6 m/N, 2e3 N s/m), four 1 mm toe spheres on
+  collider offsets (W4d), and a ground box, contact at Table VI's Drake values until fitted.
+- **The forward-kinematics round trip** (a test, all 29 trajectories at samples 0, 50 and 99):
+  orientation 7.3e-8 rad, pelvis origin 3.6e-8 m, joints 1.1e-7 rad, pelvis ω 2.1e-7 rad/s,
+  pelvis origin velocity 7.9e-8 m/s, joint rates 5.0e-7 rad/s, at worst. The column order, z-up
+  to y-up and origin against COM hold.
+- **Rod length at sample 0:** 0.5012 m on every trajectory, both sides, to under 0.01 mm (the
+  state estimator's inverse kinematics closes the loop). No first-step kick.
+- **Rod rate at sample 0, with the ankle springs' unmeasured rate as 0:** up to 0.51 m/s
+  (trajectory 1, left); 0.1–0.4 m/s is common. Not small, so the replay keeps 0 as the main line
+  (as Drake did) and adds a loop-consistent start (the ankle spring's rate solved so the rod's is
+  0) as a sensitivity line.
+- **Toe heights at sample 0:** 11–88 mm above the ground (sphere bottoms). The earliest ballistic
+  arrival of any toe is 4.8–11.6 ms on the paper's 22, consistent with "about 5 ms before
+  impact" and the public offsets already applied. So the half-step start's trial step (4.17 ms
+  at 240 Hz) ends before any contact on the 22; the replay asserts it. Trajectory 24 (Feb 26)
+  wouldn't arrive until 82.8 ms, outside its 50 ms window: it is in the 29-jump line only, and
+  flagged there.
+- **Leaf-spring frequencies, measured** (hung: pelvis welded, motors held by velocity drives at 0,
+  no joint or rod damping, 2 kHz, 1 s, a linear trend removed): 13.5–17.5 Hz on trajectories 0
+  and 10, 12–13.5 Hz on trajectory 20's left leg; each leg's knee and ankle springs share one
+  mode through the loop. One reading, trajectory 20's right leg at 3.5 Hz, is likely a slower
+  settling mode, not the spring's. So ω dt at 240 Hz is 0.31–0.46, not the 0.7 estimated, and
+  implicit Euler keeps 0.27–0.39 of the amplitude per period there; at 2 kHz ω dt is 0.04–0.06.
+  These are the swing leg's modes. In the window the springs carry the body, so a stance pluck
+  (standing on compliant ground) is the next measurement, before the fit.
+
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
 Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4
@@ -1497,9 +1527,10 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     samples are compared against states interpolated between steps), or 2 kHz, the data's rate.
     Drake ran at 12.5–20 kHz.
   - **The handicap, named:** compliant rows damp themselves (3.4b). Cassie's leaf springs (knee
-    k 1500, ankle 1250 N m/rad) are estimated at ω dt ≈ 0.7 at 240 Hz, where implicit Euler keeps
-    about (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.17 of the amplitude per period; at 2 kHz ω dt ≈ 0.08. The
-    spec carries the measured values once the model is built. MuJoCo's springs aren't damped
+    k 1500, ankle 1250 N m/rad) were estimated at ω dt ≈ 0.7 at 240 Hz. Measured on the built
+    model, hung (3.4a), they ring at 12–17.5 Hz: ω dt 0.31–0.46 at 240 Hz, where implicit Euler
+    keeps (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.27–0.39 of the amplitude per period; 0.04–0.06 at 2 kHz.
+    The stance frequencies are still to be measured. MuJoCo's springs aren't damped
     numerically there, so the paired 240 Hz comparison shows it directly. The URIEL biped has no
     compliant rows, dampers or armature, and 240 Hz is already its rate: the handicap comes
     from a feature the biped workload doesn't use today.

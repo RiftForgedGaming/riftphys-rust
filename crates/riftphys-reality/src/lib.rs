@@ -13,11 +13,13 @@
 //!   (`riftphys-cube-toss`).
 //! - [`double_pendulum`]: a real double pendulum (Myers et al.), PARITY_SPEC W3
 //!   (`riftphys-double-pendulum`).
+//! - [`cassie`]: Cassie jumping impacts (PARITY_SPEC W4): the data, the model, the pre-fit checks.
 //! - [`urdf`]: a minimal URDF loader that builds bodies and hinges in a World (PARITY_SPEC W4a).
 //!
 //! See docs/PHYSICS_FIDELITY.md.
 
 pub mod analytic;
+pub mod cassie;
 pub mod cmaes;
 pub mod cube_toss;
 pub mod double_pendulum;
