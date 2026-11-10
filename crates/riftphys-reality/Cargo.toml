@@ -21,6 +21,10 @@ name = "riftphys-cube-toss"
 path = "src/bin/cube_toss.rs"
 
 [[bin]]
+name = "riftphys-double-pendulum"
+path = "src/bin/double_pendulum.rs"
+
+[[bin]]
 name = "riftphys-synth"
 path = "src/bin/synth.rs"
 

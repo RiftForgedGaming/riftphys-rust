@@ -11,12 +11,15 @@
 //! - [`quadrotor`]: vehicles replayed from measured rotor speeds (Blackbird-style logs).
 //! - [`cube_toss`]: real cube tosses (ContactNets) scored as Drake, MuJoCo and Bullet were
 //!   (`riftphys-cube-toss`).
+//! - [`double_pendulum`]: a real double pendulum (Myers et al.), PARITY_SPEC W3
+//!   (`riftphys-double-pendulum`).
 //!
 //! See docs/PHYSICS_FIDELITY.md.
 
 pub mod analytic;
 pub mod cmaes;
 pub mod cube_toss;
+pub mod double_pendulum;
 pub mod fit;
 pub mod log;
 pub mod quadrotor;

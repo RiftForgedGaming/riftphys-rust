@@ -18,7 +18,7 @@ not been defined, so it couldn't be reported. This spec defines it and lists wha
 | Closed-form benchmarks, 240 Hz | 20/20 within tolerance (since c0ef751, SHAKE joints) |
 | Closed-form benchmarks, 60 Hz | 18/20. Restitution overshoots 13%. Large swing reads 0.975 at 10 s against ±0.02, bounded within 0.973–1.029 |
 | Real contact: 570 ContactNets cube tosses (Acosta, Yang & Posa, RA-L 2022) | Level with Drake and Bullet, ahead of MuJoCo (table below) |
-| Real jointed mechanism | **None yet** |
+| Real jointed mechanism | A real double pendulum (Myers et al.): held-out error no worse than MuJoCo RK4's at 0.1–1 s, with the half-step start (section 3.3, decision D8) |
 | Joint correctness | Three open issues (docs/JOINT_ENERGY_SPEC.md 5.4) |
 
 Cube tosses, held out:
@@ -65,8 +65,9 @@ The comparison rule, used wherever another engine is the reference:
 | P5 | Joint correctness: limits in radians, compliant rows reset per step, plus the lever-arm fix if P3 or P4 shows it | (lever arm only if shown) | ✓ | |
 
 Status against the definition:
-- **Arm:** P1 is met. **P3 is missing.**
-- **Biped:** P1 and P2 are met. **P3, P4 and P5 are missing.**
+- **Arm:** P1 and P3 are met (P3 under decision D8, 2026-11-09). This is arm parity for the
+  `Isotropic` default at (8, 6).
+- **Biped:** P1, P2 and P3 are met (P3 as for the arm). **P4 and P5 are missing.**
 - **Drone:** P1 for its cases is met. Free fall, rotation, collision and resting all pass at 60 Hz;
   restitution is excluded while drone scenes have no bouncing contacts (decision D3).
 
@@ -116,6 +117,20 @@ e00138.
   file sizes stated once the file list is read.
 - **To confirm on download:** the number of runs, the encoder sample rate, and the link masses
   and lengths.
+  - **Confirmed 2026-11-09** (the paper's open text, PMC9041261): three free-drop trials from
+    about [180°, 0, 180°, 0]; encoders at 500 Hz, video tracking at 1000 Hz (both downloaded).
+  - **Parameters without SolidWorks:** Table 6 lists every part (encoder, coupling, bearing
+    races and balls, shafts, arms, dowel pin, trackers, tape): mass (balance or calculation),
+    inertia about its centre (g·mm²) and pivot distances (ℓu 171.9 ± 0.3 mm, r̄5 86.0 ± 0.2,
+    r̄9 71.5 ± 0.4), with uncertainties. The arms dominate: upper 132 ± 2 g, 470,000 ± 9,000
+    g·mm²; lower 116 ± 2 g, 245,000 ± 5,000 g·mm². Table 4 gives the simplified two-link
+    values (m1 0.311 kg, m2 0.111 kg, d1 0.079 m, d2 0.071 m, ℓ1 0.172 m, ℓ2 0.143 m). The model
+    sums Table 6 per link; the CAD stays a cross-check, not an input.
+  - **The paper's damping fit** (Table 3; viscous, quadratic and Coulomb per joint, about 69% of
+    the loss Coulomb, mostly the encoder) is a second reference beside MuJoCo's for W3's fit.
+  - **Licence:** the paper gives the files as GNU GPL v3; Mendeley lists the dataset as CC BY
+    4.0. Using the measurements in tests is fine under either; nothing from the archives is
+    copied into this repository.
 - **Fallback:** the IBM "Double Pendulum Chaotic" set (Asseman et al. 2018; CDLA-Sharing 1.0,
   21 runs of marker positions). Its stated 400 Hz rate is reported to be really 500 Hz, its host
   needs re-finding, and it has no joint friction data.
@@ -151,6 +166,160 @@ e00138.
 
 **Pass (P3):** at each horizon, RiftPhys's held-out RMS error is no worse than MuJoCo's by more
 than 2 SE. Also report the energy decay rate per run against the measured one.
+
+**Built, first pass (2026-11-09), uncommitted:** `tools/double_pendulum_to_reality.py`,
+`riftphys-double-pendulum`, `tools/parity/mujoco_double_pendulum.py`. P3 isn't decided: see the
+open question at the end of this block.
+
+What the data turned out to be, and what changed from the plan above:
+- **Angles come from the video, not the encoders.** The encoder measures only the upper link. The
+  video tracks both (500 Hz, degrees, unwrapped). The encoder is a cross-check: the clocks agree
+  to 2 parts in 10⁴, offset equal to the encoder's trigger, and the two disagree by 1.3–1.7° RMS,
+  which is the measurement floor.
+- **The recordings start before the drop.** The pendulum hangs at 0; a hand lifts it to inverted
+  in about 2 s, holds it, and lets go at t ≈ 5 s. The converter finds the hold and starts where a
+  link has left it by 20°.
+- **Table 6's upper arm is per plate.** The rig has two upper plates. Measured small-swing modes
+  are 1.098 and 2.175 Hz; two plates (264 g) give 1.108 and 2.271 Hz, one plate 1.068 and 2.488.
+  The model uses two. Bearing balls: 7 assumed. Tracker and tape offsets aren't tabulated (under
+  1 g each; placed at the arm's centre).
+- **No JSON scene:** the converter writes the rig into the log (a `rig` event), so RiftPhys and
+  MuJoCo read the same numbers.
+- **Windows:** one per second from the release while the lower link still moves over 1 rad/s,
+  212 in all. With three trials, the fit uses trial 2 (70 windows) and trials 1 and 3 are held
+  out (142).
+
+Held-out error, degrees, mean ± SE over windows (fit on trial 2, 200 evaluations, 240 Hz):
+
+| | 0.1 s | 0.25 s | 0.5 s | 1 s |
+|---|---|---|---|---|
+| RiftPhys (8, 6 iterations) | 1.60 ± 0.10 | 4.95 ± 0.42 | 9.94 ± 1.31 | 23.40 ± 2.68 |
+| MuJoCo 3.17 Euler (default; implicitfast is identical) | 1.87 ± 0.14 | 5.90 ± 0.53 | 13.63 ± 1.63 | 30.26 ± 3.39 |
+| MuJoCo 3.17 RK4 | 1.25 ± 0.08 | 4.33 ± 0.35 | 9.47 ± 1.30 | 22.47 ± 2.75 |
+
+- Fitted damping: RiftPhys c [3.0e-6, 1.0e-5], τ_f [2.85e-3, 1e-5]; MuJoCo RK4 c [1.03e-4, 5.1e-6],
+  τ_f [2.98e-3, 1.05e-5]. The elbow's friction sits at the bottom of the search box in both.
+- RiftPhys's gap to RK4 at 0.1 s is step size, not the solver: 8, 64 and 512 velocity iterations
+  all give 1.58° over all windows at 240 Hz; 480 Hz gives 1.38, 960 Hz 1.30, 3840 Hz 1.26, with
+  the 240 Hz fit's damping (MuJoCo RK4, all windows: 1.22).
+- **The reference is MuJoCo RK4 (decision D7).** On this first pass RiftPhys passes against Euler
+  at every horizon; against RK4 at 240 Hz it misses at 0.1 s (0.35° worse, 2 SE = 0.20°) and
+  passes at 0.25, 0.5 and 1 s. The final numbers follow the method below.
+- **Not done:** the energy decay rate per run, a refit at higher rate.
+
+**Method for the final numbers (written 2026-11-09, before the runs below; from the Reviewer's W3
+review).** The table above is a first pass: its 2 SE is one engine's unpaired SE over windows that
+aren't independent, one seed, and a window gate that measured tracker noise.
+- **Windows:** gated on the ±10 ms smoothed rate of the lower link (peak over the window at least
+  1 rad/s), not the raw sample-to-sample difference.
+- **Fit:** each engine (RiftPhys; MuJoCo Euler; MuJoCo RK4), 240 Hz, trial 2 only, seeds 1–5 at 200
+  evaluations. The primary objective is the one already run, the error summed over all four
+  horizons. A second objective (0.1–0.5 s only) and 400 evaluations (seeds 1–3) are reported as
+  sensitivity. Each engine's headline parameters are its seed with the lowest *training* objective;
+  held-out spread over seeds is reported.
+- **Comparison:** per horizon, the mean paired difference RiftPhys − MuJoCo over the same held-out
+  windows, with a 95% block-bootstrap interval (blocks of 10 consecutive windows within a trial,
+  10,000 resamples, fixed seed), and trials 1 and 3 separately. RiftPhys is **no worse** at a
+  horizon when the interval's lower end is at or below 0 (the difference isn't shown to be
+  positive; this takes the place of section 2's 2 SE, with the block interval as the SE).
+- **Cross-scoring:** each engine with the other's parameters and with the paper's Table 3 (viscous
+  as printed, quadratic dropped; Coulomb as μc·N with N the static load on the joint, and as
+  μc·N·r with r = 8 mm, since the printed definition and the reported 69% share disagree).
+- **Energy decay per run:** from each trial's first window, run free for 60 s; energy above rest
+  at 5, 10, 20, 30, 45 and 60 s and the time to reach 50% and 10% of the start, each engine against
+  the measurement (1 s moving mean of the measured energy).
+- **The rig's residual:** the plate count was chosen using all three trials; it is one discrete
+  choice shared by both engines. Table 4's m1 of 0.311 kg sits nearer two plates (0.341) than one
+  (0.209). The upper mode measures 2.11 Hz at about 50° lower-link amplitude, 2.17 at 27° and 2.19
+  at 18° against the model's 2.271, so about 3% remains after amplitude (about 6% in
+  stiffness/inertia). Both engines share it; it probably sets part of the absolute error beyond
+  0.25 s.
+
+**Final numbers (2026-11-09, run by that method). P3 is not met at 240 Hz against RK4 (D7): RiftPhys
+is worse at 0.1 s and 0.25 s, and no worse at 0.5 s and 1 s.** 197 windows, 131 held out.
+
+Held-out mean error, degrees, each engine's lowest-training-objective seed; then RiftPhys minus
+MuJoCo, paired, with the 95% block-bootstrap interval:
+
+| | 0.1 s | 0.25 s | 0.5 s | 1 s |
+|---|---|---|---|---|
+| RiftPhys | 1.69 | 5.31 | 10.80 | 25.72 |
+| MuJoCo RK4 (the reference) | 1.31 | 4.64 | 10.24 | 24.33 |
+| MuJoCo Euler | 1.98 | 6.32 | 14.74 | 32.74 |
+| **minus RK4** | **+0.38 [+0.28, +0.48] worse** | **+0.67 [+0.26, +1.17] worse** | +0.56 [−0.51, +1.69] | +1.39 [−1.61, +4.54] |
+| minus RK4, trial 1 / 3 | +0.29 / +0.47 | +0.44 / +0.92 | −0.29 / +1.46 | +0.55 / +2.26 |
+| minus Euler | −0.29 [−0.50, −0.11] | −1.01 [−1.93, −0.27] | −3.93 [−7.23, −1.12] | −7.03 [−15.77, +0.14] |
+
+- **The gap is first order in the step, and the first order comes from the start.** RiftPhys
+  against RK4 at 240 Hz, fixed damping: at 480 Hz +0.17 and +0.34 (0.1 and 0.25 s); at 960 Hz +0.09
+  and +0.19. It halves with each halving of the step. The World's step is leapfrog (v += h a(x),
+  then x += h v), so its velocity sits half a step before its position; positions are otherwise
+  second order. A measured velocity handed in at the position's time starts it half a step late,
+  an error of (h/2) a that carries through the window (the Reviewer's finding, 2026-11-09).
+- **The fit doesn't explain it.** Held-out spread over 5 seeds: RiftPhys 1.69 / 5.28–5.31 /
+  10.65–10.80 / 25.16–25.72; RK4 1.31–1.32 / 4.63–4.66 / 10.24–10.30 / 24.17–24.36. 400 evaluations
+  and the 0.1–0.5 s objective give the same verdicts at every horizon, against both integrators.
+- **Cross-scoring: damping barely moves the windows.** Held-out error at each horizon changes by
+  under 0.1° at 0.1 s and under 0.25° at 0.25 s across all five parameter sets (each engine's fit,
+  and both readings of Table 3), for all engines. The shoulder's 34× viscous difference isn't
+  identified by 1 s windows, so it doesn't matter to this metric. RiftPhys's gap to RK4 persists
+  with RK4's own parameters (1.69 / 5.28 / 10.62 / 25.14).
+- **Energy decay per run** (mJ above rest, 5, 10, 20, 30, 45, 60 s; trial 1, the others alike):
+  measured 859, 645, 381, 215, 78, 12 (t50 13.8 s, t10 41.1 s); RiftPhys 913, 769, 583, 398, 195,
+  70 (21.8, 54.3); RK4 913, 773, 504, 310, 122, 23 (18.8, 46.7). Across the trials t50 is 12.9–13.8
+  measured, 20.9–21.8 RiftPhys, 18.8–19.2 RK4, each with its own fit (with shared damping they
+  agree: see the second method). The 0.1–0.5 s objective swings the other way (t50 about 4 s
+  RiftPhys, 5.5 s RK4). An energy term in the fit would be needed to match decay.
+- MuJoCo Euler at 240 Hz is fragile here: on some fits its 60 s run gains energy or goes unstable
+  (seen with 400-evaluation parameters).
+
+**Second method: the half-step start (written 2026-11-09, after the first result).** This was added
+*after* the table above, once the Reviewer traced the first-order error to the start. The table
+above stands as the result of the method written first. Whether the second method counts for P3 is
+the Designer's decision (D8). It changes the initial condition, with no free parameter, and no
+engine code:
+- RiftPhys and MuJoCo Euler (both semi-implicit) start from the measured rate less half of the
+  first step's change. MuJoCo RK4 takes the measured state as it is.
+- Everything else is the first method: same windows and split, 5 seeds refitted, 0.1–0.5 s and
+  400-evaluation sensitivity, the same paired bootstrap and verdict rule.
+- **Energy with shared damping:** both 60 s decays, RiftPhys and RK4, each run with RK4's parameters
+  and with Table 3's, to separate numerical dissipation from the fit.
+- **Anywhere a jointed scene starts from a measured velocity needs the same treatment:** W4's
+  Cassie replay is next. Free bodies already have the ballistic average. Any velocity set from
+  outside the World, or read out for a policy, is half a step offset (2 ms at 240 Hz); no API
+  change for now.
+
+Results of the second method, held out, degrees (131 windows; each engine's lowest-training-objective
+seed; RK4 as in the first table). **With the half-step start RiftPhys is no worse than RK4 at every
+horizon, and better than Euler at 0.1, 0.25 and 0.5 s (1 s not separated):**
+
+| | 0.1 s | 0.25 s | 0.5 s | 1 s |
+|---|---|---|---|---|
+| RiftPhys, half-step start | 1.23 | 4.49 | 10.64 | 26.61 |
+| MuJoCo RK4 (reference, measured state) | 1.31 | 4.64 | 10.24 | 24.33 |
+| MuJoCo Euler, half-step start | 1.46 | 5.62 | 13.84 | 31.80 |
+| **minus RK4** | −0.08 [−0.17, −0.00] | −0.15 [−0.38, +0.09] | +0.40 [−0.89, +2.45] | +2.28 [−1.85, +6.15] |
+| minus RK4, trial 1 / 3 | +0.00 / −0.17 | +0.02 / −0.33 | +1.29 / −0.53 | −0.29 / +4.96 |
+| minus Euler | −0.23 [−0.43, −0.07] | −1.13 [−2.13, −0.31] | −3.20 [−6.72, −0.06] | −5.20 [−13.72, +1.67] |
+
+- **Verdicts hold across the sensitivity runs:** the 0.1–0.5 s objective and 400 evaluations are no
+  worse than RK4 at every horizon as well.
+- **The fit has two basins with this start.** Seeds 1–2 land on shoulder Coulomb friction (τ_f 3.6e-3,
+  c 1.7–3.2e-6) and seeds 3–5 on viscous damping (c 1.1e-3, τ_f 1.6–5.7e-4), with near-equal window error:
+  held-out 1 s error is 23.6–23.7° in the first basin and 26.2–26.8° in the second. The rule picks the
+  lowest training objective, seed 4, in the second. RK4 (first method) stays in the first.
+  **Both basins are no worse than RK4 at every horizon, so the bimodality doesn't touch the
+  verdict.** RiftPhys − RK4 for the Coulomb basin's lowest-objective seed (2): −0.07 [−0.14, −0.01],
+  −0.06 [−0.20, +0.09], +0.43 [−0.76, +2.30], −0.63 [−3.28, +1.60] at 0.1, 0.25, 0.5, 1 s; trial
+  1 / 3: −0.02 / −0.13, +0.04 / −0.16, +1.04 / −0.20, −0.94 / −0.30. The viscous basin is the table.
+- **Energy with shared damping: no numerical dissipation shows.** With RK4's parameters, t50 and t10
+  are 18.1–19.8 and 43.1–48.8 s for RiftPhys, 18.8–19.2 and 45.6–47.5 s for RK4. So the first
+  table's bullet that RiftPhys loses energy more slowly was the fit, not the engine. Both engines
+  lose energy too slowly against the measured t50 of 12.9–13.8 s and t10 of 39.3–41.1 s with those
+  parameters. Table 3 (quadratic dropped, Coulomb as μc·N) is far too light in both: t50 43–49 s.
+- With the second method's own fit (viscous basin) RiftPhys decays too fast (t50 6.6–7.0 s): 1 s
+  windows don't identify damping. An energy term in the fit is the way to match decay; it wasn't in
+  the method.
 
 **Estimate:** 2–3 days, plus W3a (half a day).
 
@@ -732,8 +901,9 @@ included:
   needs W4's Cassie model, so it goes with W4.
 - The arm keeps its isotropic armature (decision D6).
 
-**What's left for parity:** W6 first (D3), then W3 (double pendulum) and W4 (Cassie), which wait
-on the downloads (D5); D4 is still open.
+**What's left for parity:** W6, the D6 split, the World fix and W3 are built; the arm's P1 and P3
+are met (D8). Next, the report to URIEL with the commits, then W4 (Cassie; its data and URDF are in
+hand, a URDF loader isn't built, and its replay needs the half-step start). D4 is still open.
 
 ### 3.9 D6 split: the arm's axis armature, as an option (drafted 2026-11-08)
 
@@ -898,7 +1068,7 @@ trains on the default without anything changing, and can switch when it's ready.
 1. W2.
 2. W1, then the biped re-check.
 3. W6 (required by D3, 2026-11-08), then the D6 split (section 3.9).
-4. W3a, then W3. This gives arm parity: report to URIEL with the commits.
+4. W3a, then W3. This gives arm parity: report to URIEL with the commits. (W3 built, 3.3; P3 met under D8.)
 5. W4b, W4a, W4. This gives biped parity: report to URIEL with the commits.
 6. W5 only if triggered.
 
@@ -945,6 +1115,18 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
       arrays, legends, a loader), not "under 1 MB" as section 3.4 says;
     - Cassie's model, `cassie_v2.urdf` from github.com/DAIRLab/dairlib (BSD-3): 24 KB. Its
       meshes (42 files, 3.1 MB) aren't needed: the feet are modelled as the paper's contacts.
+  - **Cassie downloaded 2026-11-09 (Designer: "Download Cassie"):** the dataset (main branch,
+    96 files, 1.3 MB) and `cassie_v2.urdf` (dairlib master, 24,071 bytes), in
+    `riftphys-parity-data/cassie/`, outside this repository.
+  - **Double pendulum downloaded 2026-11-09 (Designer: any download in the spec):**
+    `Encoder_Data.zip` (1,629,108 bytes) and `Double_Pendulum_CAD.zip` (23,404,393 bytes), both
+    matching Mendeley's SHA-256, extracted in `riftphys-parity-data/double_pendulum/`. Then
+    (Designer: "go ahead on video data and the 3.1 MB of meshes"): `Video_Tracking_Data.zip`
+    (7,362,421 bytes, SHA-256 matches) and Cassie's meshes from dairlib
+    `examples/Cassie/urdf/meshes/` into `riftphys-parity-data/cassie/meshes/`. The meshes came
+    to 92 files, 15.7 MB, not 3.1: the 3.1 MB counted only the top folder, and its `agility/`
+    subfolder (which `cassie_v2.urdf` references for ten links) holds the rest. The three
+    scripts aren't downloaded.
 - **D6:** the F1 arm's armature. Today it is added isotropically to each child link's inertia
   (`arm.rs:230`). Once W4b exists, should the arm use the axis-only row (the physical model)?
   That changes the arm's dynamics and the teacher's behaviour, so argref would re-record. Or
@@ -955,3 +1137,23 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
   - **Decided 2026-11-08: split.** Keep today's arm as the default and add the axis armature
     as an option, so URIEL can train on the current model without breaking what works now.
     Design in section 3.9.
+- **D7:** which MuJoCo is P3's reference? The plan extended the cube-toss script (MuJoCo's
+  default, Euler), while the comparison rule says "best published or reproduced engine's".
+  - **Decided 2026-11-09: RK4, the stricter.** P3's reference is MuJoCo RK4 at 240 Hz, the same
+    rate as RiftPhys. Euler is still reported beside it.
+- **D8:** does the half-step start count for P3 (section 3.3, second method)? It was added after the
+  first result, so the first table stands either way. With it, RiftPhys is no worse than RK4 at
+  every horizon, in both damping basins; without it, worse at 0.1 and 0.25 s. It corrects the
+  initial condition (no free parameter, no engine change); the same correction would apply to
+  every replay from measured velocities.
+  - **What a yes would mean:** trajectory error up to 1 s from a measured state, on two held-out
+    runs of one rig, is no worse than MuJoCo RK4's. The sign differs between the two runs at
+    0.5 s in both basins, and at 1 s in the viscous one.
+  - **What it wouldn't mean:** damping isn't identified by this benchmark. RiftPhys's own
+    second-method fit decays with t50 6.6–7.0 s against 12.9–13.8 measured, so these fitted values
+    shouldn't be reused elsewhere. Energy decay is reported and neither engine matches it.
+  - **Decided 2026-11-09: yes, count it.** P3 is met with the half-step start; the first table
+    stays beside it.
+  - **So:** section 4 makes this arm parity for the Isotropic default at (8, 6), the arm URIEL
+    trains on and the iteration count P3 used; `Axis` stays a separate option. The report to URIEL
+    carries these limits and the open debug/release hash item (section 3.9).
