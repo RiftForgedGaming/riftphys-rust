@@ -505,6 +505,30 @@ fn export_starts(out: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// D9 rule (b)'s check: the held-out 240 Hz replays with each fold's fitted parameters (from
+/// `fits`, the 240 Hz fit's JSON) and the leaf springs made rigid (k 1e9 N m/rad); written in the
+/// fit's JSON form to `out`, to pair against MuJoCo as the pass was.
+fn rigid_check(fits: &str, out: &str) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fits).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for f in doc["folds"].as_array().ok_or("no folds")? {
+        let p = Params { k: f["k"].as_f64().unwrap() as f32, d: f["d"].as_f64().unwrap() as f32, mu: f["mu"].as_f64().unwrap() as f32,
+                         knee_k: 1.0e9, ankle_k: 1.0e9, ..Params::default() };
+        for j in f["held_out"].as_array().unwrap() {
+            let j = j.as_u64().unwrap() as usize;
+            let t = cassie::load_traj(&cassie::data_dir(), j)?;
+            let main = cassie::replay(&urdf, &t, &p, 240.0, cassie::Line::Main)?;
+            let sens = cassie::replay(&urdf, &t, &p, 240.0, cassie::Line::Sensitivity)?;
+            rows.push(serde_json::json!({ "jump": j, "fold": f["fold"], "main": cassie::loss(&main.states, &t.x), "sensitivity": cassie::loss(&sens.states, &t.x) }));
+        }
+    }
+    let mean = rows.iter().map(|r| r["main"].as_f64().unwrap()).sum::<f64>() / rows.len() as f64;
+    println!("240 Hz, (8, 6), leaf springs rigid, the 240 Hz folds' parameters: held-out mean {:.2}", mean);
+    std::fs::write(out, serde_json::to_string_pretty(&serde_json::json!({ "hz": 240.0, "leaf_springs": "rigid (k 1e9)", "jumps": rows })).unwrap()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -512,6 +536,7 @@ fn main() {
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
         Some("--iters") => iters_check(),
+        Some("--rigid-check") => match (args.get(2), args.get(3)) { (Some(f), Some(o)) => rigid_check(f, o), _ => Err("usage: --rigid-check fits.json out.json".into()) },
         Some("--export-starts") => export_starts(&args.get(2).cloned().unwrap_or_else(|| "cassie_starts.json".to_string())),
         Some("--fit") => {
             let hz = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0);

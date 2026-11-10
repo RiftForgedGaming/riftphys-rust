@@ -67,7 +67,9 @@ The comparison rule, used wherever another engine is the reference:
 Status against the definition:
 - **Arm:** P1 and P3 are met (P3 under decision D8, 2026-11-09). This is arm parity for the
   `Isotropic` default at (8, 6).
-- **Biped:** P1, P2 and P3 are met (P3 as for the arm). **P4 and P5 are missing.**
+- **Biped:** P1, P2 and P3 are met (P3 as for the arm). **P4 is not met at the workload's 240 Hz**
+  (2026-11-10: +17.4 behind MuJoCo held out; at 2 kHz RiftPhys is ahead by 2.3; 3.4f). P5's
+  remaining condition waits on P4. Not at parity.
 - **Drone:** P1 is met, restitution included (W6, eee2e57; decision D3 made it required). Free
   fall, rotation, collision, resting and restitution all pass at 60 Hz (2026-11-10, on f2b2004).
   This is drone parity.
@@ -1178,6 +1180,53 @@ peaks (4.5, 4.5, 12.2, 12.2, 0.9 N m).
   world), interpolated to the sample times as RiftPhys's are;
 - **stricter:** the integrator with the lower held-out mean at 240 Hz is the reference for the pass;
   if an integrator isn't stable at 240 Hz, that is reported and it pairs at 2 kHz.
+
+### 3.4f The P4 result (2026-11-10)
+
+Run as stated in 3.4a and 3.4e, with every criterion committed before its run (D9's outcomes at
+e402873, the pairing's settings at 47b2e71, MuJoCo's fit at 3a6a35c). Per-jump results:
+`riftphys-parity-data/cassie_results/`; the pairing: `tools/parity/cassie_pair.py`. Benchmark:
+(b) the DAIR Lab cassie_impact_dataset (Acosta, Yang & Posa, RA-L 2022), the paper's 22 jumps,
+held out over the fixed folds; the bar: (c) MuJoCo 3.17.0 with Agility's MJCF, refit the same way.
+
+| | RiftPhys | MuJoCo (the stricter integrator) | RiftPhys − MuJoCo, mean (SE; 95%) | verdict (D2) |
+|---|---|---|---|---|
+| **240 Hz, (8, 6): the pass** | 65.53 | 48.14 (Euler; RK4 diverges at 240 Hz) | **+17.40 (3.74; [+9.92, +24.45])** | **worse: P4 not met** |
+| 240 Hz, sensitivity line | 65.56 | 48.14 | +17.42 (3.74) | worse |
+| 2 kHz, (8, 6), beside it | 29.52 | 31.86 (RK4; Euler 31.90) | −2.34 (1.13; [−4.64, −0.25]) | no worse, and better |
+| 2 kHz, sensitivity line | 29.51 | 31.86 | −2.34 (1.13) | better |
+
+- RiftPhys is lower on 5 of the 22 jumps at 240 Hz and on 12 of 22 at 2 kHz. By day, at 240 Hz:
+  Jan 27 +12.0, Feb 12 +20.5; at 2 kHz: Jan 27 −5.1, Feb 12 −0.8.
+- **MuJoCo RK4 isn't stable at 240 Hz** on Agility's model: it diverges at Table VI's values and
+  at both fitted sets (240 Hz Euler's in-sample and 2 kHz RK4's), so by the stated rule it pairs at
+  2 kHz only, and Euler is the 240 Hz reference.
+- **The fits:** MuJoCo Euler at 240 Hz, held out 48.14 (in-sample 46.33; the folds' stiffness spread
+  468–18,342 with damping 190–241: its loss is set mostly by damping, as the paper found); Euler at
+  2 kHz 31.90, RK4 at 2 kHz 31.86 (stiffness 11–17 kN/m, damping 260–288, μ 0.40–0.47 on both).
+  RiftPhys as in 3.4a.
+- **D9 outcome (b): a fail at the workload rate, a pass at 2 kHz.** Its attribution test, a 240 Hz
+  run with the leaf springs made rigid (k 1e9; the 240 Hz folds' parameters), **does not close the
+  gap**: held out 77.95, +29.81 (SE 4.87) behind MuJoCo, worse than with compliant springs. So the
+  failure is **not** attributed to the leaf springs' integrator damping. By the rule it is not
+  reported as parity, and a follow-up item is logged (3.4g).
+- **Report only, both engines unfitted at Table VI's values, the main line's mean over the 22:**
+  RiftPhys 65.0 / 50.1 / 35.6 / 29.2 at 240 / 480 / 960 / 2000 Hz; MuJoCo Euler 48.4 / 33.2 / 32.2
+  (2 kHz 31.9). MuJoCo has settled by 480 Hz; RiftPhys needs about 960 Hz to come within a few
+  points and is ahead by 2 kHz. RiftPhys's error converges more slowly with the step.
+- **Wording (the SR&ED Bookkeeper, agreed):** "real-world data, with MuJoCo setting the bar", not
+  plain real-world parity.
+
+### 3.4g The biped at 240 Hz (open; follow-up from P4; owner RiftPhys Orchestration)
+
+P4 fails at the biped workload's 240 Hz and passes at 2 kHz (3.4f). What's known: the gap isn't
+the leaf springs' integrator damping (rigid springs make it worse), the explicit contact is gone
+(W4e), the start correction is gated, and at 240 Hz the loss rises with solver iterations (3.4a).
+RiftPhys's error falls with the step more slowly than MuJoCo's. Candidates: the closed loops and the
+geared rotors at a 4.17 ms step, and the implicit contact's own dissipation. Two routes, the
+Designer's to choose: engine work at 240 Hz (diagnosis first, each candidate isolated against
+RiftPhys's own 2 kHz run, as in 3.4a), or the biped workload moving to a higher physics rate under
+its 240 Hz control (sub-steps), with P4 rerun at that rate under criteria set before the run.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
