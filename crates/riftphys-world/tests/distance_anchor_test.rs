@@ -3,7 +3,8 @@
 use riftphys_articulation::bodies::{D6Axis, D6Joint};
 use riftphys_core::{BodyId, Isometry, Quat, Vec3, Velocity};
 use riftphys_geom::MassProps;
-use riftphys_world::world::World;
+use riftphys_articulation::bodies::D6Limit;
+use riftphys_world::world::{JointProjection, World};
 
 fn iso(pos: Vec3, rot: Quat) -> Isometry { Isometry { pos, rot } }
 
@@ -268,4 +269,63 @@ fn drakes_achilles_spring_settles_at_2_khz() {
     let under = x.iter().cloned().fold(0.0f32, f32::min);
     println!("undamped at 2 kHz: undershoot {:.3} of the start", under / x0);
     assert!(under < -0.1 * x0, "undamped: undershoot only {:.2e} m", under);
+}
+
+/// Under the PBD projection (no SHAKE directions) a damped compliant rod still damps: its
+/// change is measured from the step's start poses, which the step passes either way.
+#[test]
+fn damping_acts_under_the_pbd_projection_too() {
+    let (hz, m) = (240.0f32, 1.0f32);
+    let omega = 0.02 * hz;
+    let k = m * omega * omega;
+    let run = |c_d: f32| {
+        let mut w = World::with_capacity(4, 4);
+        w.set_gravity(Vec3::ZERO);
+        w.set_joint_projection(JointProjection::Pbd);
+        let pivot = w.add_body(iso(Vec3::ZERO, Quat::IDENTITY), Velocity::default(), MassProps::infinite(), false);
+        let half = Vec3::splat(0.05);
+        let mp = MassProps::from_box_density(half, m / (8.0 * half.x * half.y * half.z));
+        let b = w.add_body(iso(Vec3::new(1.05 + 0.01, 0.0, 0.0), Quat::IDENTITY), Velocity::default(), mp, true);
+        w.set_body_sleep_allowed(b, false);
+        let j = w.add_distance_joint_at(pivot, Vec3::ZERO, b, Vec3::new(-0.05, 0.0, 0.0), 1.0, 1.0 / k);
+        w.set_distance_damping(j, c_d);
+        let x: Vec<f32> = (0..(4.0 * 2.0 * std::f32::consts::PI / omega * hz) as usize).map(|_| { w.step(1.0 / hz); w.get_body_pose(b).pos.x - 1.05 }).collect();
+        let p = peaks(&x);
+        p[2] / p[1]
+    };
+    let (undamped, damped) = (run(0.0), run(2.0 * 0.1 * m * omega));
+    let closed = (-0.1f32 * omega * 2.0 * std::f32::consts::PI / (omega * (1.0f32 - 0.01).sqrt())).exp();
+    let got = damped / undamped;
+    assert!((got / closed - 1.0).abs() < 0.05, "PBD: the damper's decay per period {:.4}, closed form {:.4}", got, closed);
+}
+
+/// A hinge with a compliant limit and damping keeps W3a's velocity damper inside its range: its
+/// limited row's position part acts only outside the range, so the damper stays a velocity row.
+/// A rod spinning freely inside a wide limit slows at the discrete damper's rate,
+/// (1 + c dt / I)^-n.
+#[test]
+fn a_soft_limited_hinge_keeps_its_damper_inside_its_range() {
+    let hz = 240.0f32;
+    let mut w = World::with_capacity(4, 4);
+    w.set_gravity(Vec3::ZERO);
+    let pin = w.add_body(iso(Vec3::ZERO, Quat::IDENTITY), Velocity::default(), MassProps::infinite(), false);
+    let half = Vec3::new(0.5, 0.025, 0.025);
+    let m = 2.5f32;
+    let mp = MassProps::from_box_density(half, m / (8.0 * half.x * half.y * half.z));
+    let w0 = 1.0f32;
+    let rod = w.add_body(iso(Vec3::new(0.5, 0.0, 0.0), Quat::IDENTITY), Velocity { lin: Vec3::new(0.0, 0.5 * w0, 0.0), ang: Vec3::new(0.0, 0.0, w0) }, mp, true);
+    w.set_body_sleep_allowed(rod, false);
+    // A hinge about z whose row is a soft limit: compliant, limited to +-3 rad
+    let c = 0.2f32;
+    let mut d = D6Joint { a: pin, b: rod, fa: iso(Vec3::ZERO, Quat::IDENTITY), fb: iso(Vec3::new(-0.5, 0.0, 0.0), Quat::IDENTITY), t: Default::default(), r: Default::default(), hinge_axis: Some(2) };
+    for i in 0..3 { d.t[i].enabled = true; d.r[i].enabled = true; }
+    d.r[2] = D6Axis { enabled: true, compliance: 1.0e-3, limit: Some(D6Limit { min: -3.0, max: 3.0 }), ..Default::default() };
+    let j = w.add_d6_joint(d);
+    w.set_d6_damping(j, true, 2, c, 0.0);
+    let i_pivot = mp.inertia.z_axis.z + m * 0.25;
+    let n = (0.5 * hz) as i32;
+    for _ in 0..n { w.step(1.0 / hz); }
+    let got = w.get_body_vel(rod).ang.z;
+    let want = w0 * (1.0 + c / hz / i_pivot).powi(-n);
+    assert!((got / want - 1.0).abs() < 0.02, "spin {:.5} rad/s after 0.5 s, the damper's {:.5}", got, want);
 }

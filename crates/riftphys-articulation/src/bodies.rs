@@ -52,6 +52,15 @@ impl DistanceJoint {
 
 /* ─────────────────────────  D6 types ──────────── */
 
+/// Whether a D6 row's damping is XPBD's damping term in its position row (PARITY_SPEC W4c): an
+/// enabled compliant row whose position part always acts (no limit, no velocity drive). Any
+/// other row with damping keeps W3a's velocity damper (a limited row's position part acts only
+/// outside its range, so moving its damper there left it undamped inside).
+#[inline]
+pub fn position_damped(a: &D6Axis) -> bool {
+    a.enabled && a.compliance > 0.0 && a.damping > 0.0 && a.limit.is_none() && a.drive.map_or(true, |d| !d.vel_mode)
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Drive {
     pub target: Scalar,
@@ -295,6 +304,15 @@ impl Joints {
     /// id; missing entries count as not frozen). A sleeping body gets no gravity, so a compliant
     /// row solved on it relaxed to zero sag while it slept.
     pub fn solve_step(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, start: Option<&[Isometry]>, frozen: &[bool]) {
+        self.solve_step_with(bodies, dt, iterations, start, start, frozen);
+    }
+
+    /// As `solve_step`, with SHAKE's directions from `shake` (None: PBD) kept apart from
+    /// `step_start`, the step's start poses that a damped compliant row measures its change
+    /// against (PARITY_SPEC W4c). With no `step_start` (a projection outside a step, as
+    /// `solve`), that change is taken as 0: such rows act as springs only.
+    pub fn solve_step_with(&mut self, bodies: &mut Bodies, dt: Scalar, iterations: u32, shake: Option<&[Isometry]>, step_start: Option<&[Isometry]>, frozen: &[bool]) {
+        let start = shake;
         if self.kinds.is_empty() { return; }
         let is_frozen = |id: u32| frozen.get(id as usize).copied().unwrap_or(false);
 
@@ -317,11 +335,13 @@ impl Joints {
                 match k {
                     JointKind::Distance(j) => {
                         let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
-                        if j.anchored() { solve_distance_anchored(bodies, j, dt, dt2, s) } else { solve_distance_row(bodies, j, dt, dt2, s) }
+                        let s0 = step_start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
+                        if j.anchored() { solve_distance_anchored(bodies, j, dt, dt2, s, s0) } else { solve_distance_row(bodies, j, dt, dt2, s) }
                     }
                     JointKind::D6(j) => {
                         let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
-                        solve_d6(bodies, j, dt, dt2, alpha_dt2, s)
+                        let s0 = step_start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
+                        solve_d6(bodies, j, dt, dt2, alpha_dt2, s, s0)
                     }
                 }
             }
@@ -412,7 +432,7 @@ fn solve_distance_row(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt
 /// so dlambda = -(C + alpha lambda) / (w_mix + alpha) is SHAKE's Newton step and the compliance
 /// stays exact. Current-iterate (PBD) directions when either body turned too far this step or
 /// w_mix falls below half the start-of-step generalised mass.
-fn solve_distance_anchored(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>) {
+fn solve_distance_anchored(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>, step_start: Option<(Isometry, Isometry)>) {
     let (ia, ib) = (j.a.0, j.b.0);
     let (wa, wb) = (fin(bodies.inv_mass_of(ia)), fin(bodies.inv_mass_of(ib)));
     if wa + wb <= 0.0 { return; }
@@ -453,7 +473,8 @@ fn solve_distance_anchored(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scala
     // Kelvin-Voigt row over the same generalised mass; dC the length's change since the step's
     // start (the Reviewer's design; a velocity row before the projection carried part of a static
     // load, c dt / (m + c dt) of it)
-    let damped = match (j.compliance > 0.0 && j.damping > 0.0, start) {
+    // No start of step (a projection outside one): no change to damp, a spring only
+    let damped = match (j.compliance > 0.0 && j.damping > 0.0, step_start) {
         (true, Some((sa, sb))) => {
             let len0 = ((sb.pos + sb.rot * j.lb) - (sa.pos + sa.rot * j.la)).length();
             let gamma = fin(j.compliance * j.damping / dt);
@@ -477,6 +498,7 @@ fn solve_d6(
     dt2: Scalar,
     alpha_dt2: fn(Scalar, Scalar) -> Scalar,
     start: Option<(Isometry, Isometry)>,
+    step_start: Option<(Isometry, Isometry)>,
 ) {
     let units = [Vec3::X, Vec3::Y, Vec3::Z];
     let wa = fin(bodies.inv_mass_of(j.a.0));
@@ -486,9 +508,9 @@ fn solve_d6(
     // The SHAKE fallback test (a body that turned too far this step uses PBD directions) runs
     // once per call, on the poses the call starts from: simpler, and deterministic.
     let (pa0, pb0) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
-    // The step's start poses, for a damped compliant row's change since the start (PARITY_SPEC
-    // W4c); SHAKE's directions use the filtered ones below
-    let step_start = start;
+    // `step_start`: the step's start poses, for a damped compliant row's change since the start
+    // (PARITY_SPEC W4c; None outside a step, where that change is 0). SHAKE's directions use
+    // `start`, filtered below.
     let start = start.filter(|(sa, sb)| turned(sa.rot, pa0.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb0.rot) < SHAKE_MAX_TURN);
     let shake: Option<([Vec3; 3], Vec3, Vec3, Mat3, Mat3)> = start.map(|(sa, sb)| {
         let ra0 = sa.rot * j.fa.rot;
@@ -569,8 +591,8 @@ fn solve_d6(
 
         c = fin(c + fin(bias_vel * dt));
         let lambda_old = fin(row.lambda_acc);
-        let (compliance, damping) = (row.compliance, row.damping);
-        let dl = match (compliance > 0.0 && damping > 0.0, step_start) {
+        let (compliance, damping, damped) = (row.compliance, row.damping, position_damped(row));
+        let dl = match (damped, step_start) {
             // Damped compliant row (PARITY_SPEC W4c): XPBD's damping term, the spring and damper
             // one implicit Kelvin-Voigt row; dC its change since the step's start
             (true, Some((sa, sb))) => {
@@ -668,8 +690,8 @@ fn solve_d6(
 
         c = fin(c + fin(bias_vel * dt));
         let lambda_old = fin(row.lambda_acc);
-        let (compliance, damping) = (row.compliance, row.damping);
-        let dl = match (compliance > 0.0 && damping > 0.0, step_start) {
+        let (compliance, damping, damped) = (row.compliance, row.damping, position_damped(row));
+        let dl = match (damped, step_start) {
             // Damped compliant row (PARITY_SPEC W4c), as the translational rows
             (true, Some((sa, sb))) => {
                 let (ra0, rb0) = (sa.rot * j.fa.rot, sb.rot * j.fb.rot);

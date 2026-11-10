@@ -361,7 +361,7 @@ fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulati
             // -c dt v_end, stable for any c (a rigid lock as c grows).
             // A compliant row's damping is in its position row (XPBD's damping term, PARITY_SPEC
             // W4c): a damper here, before the projection, carried part of a static load
-            let damp = if row.enabled && row.compliance > 0.0 { 0.0 } else { row.damping };
+            let damp = if riftphys_articulation::bodies::position_damped(row) { 0.0 } else { row.damping };
             if damp > 0.0 || row.friction > 0.0 {
                 let kk = k(u);
                 if kk > 1e-9 {

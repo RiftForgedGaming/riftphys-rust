@@ -996,8 +996,9 @@ impl World {
     /// The joint solve inside `step`: SHAKE directions from the start-of-step poses `start`
     /// (indexed by body), or PBD.
     pub(super) fn solve_joints_in_step(&mut self, dt: f32, start: &[Isometry], frozen: &[bool]) {
-        let start = (self.joint_projection == JointProjection::Shake).then_some(start);
-        self.joints.solve_step(&mut self.bodies, dt, 1, start, frozen);
+        // Damped compliant rows measure their change from the step's start under PBD too
+        let shake = (self.joint_projection == JointProjection::Shake).then_some(start);
+        self.joints.solve_step_with(&mut self.bodies, dt, 1, shake, Some(start), frozen);
     }
 
     /// Position-level joint solve from the current poses (PBD directions; used outside `step`,

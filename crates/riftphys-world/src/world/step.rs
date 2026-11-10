@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: RiftForged Proprietary License
 use rayon::prelude::*;
-use super::world::{Collider, Contact, JointProjection, World, CCD_MAX_MARGIN, TERRAIN_CI};
+use super::world::{Collider, Contact, World, CCD_MAX_MARGIN, TERRAIN_CI};
 use riftphys_core::{StepStage, StepStats, Scalar, Quat, Isometry, Vec3, BodyId};
 use riftphys_geom::{aabb_of, Shape, Aabb};
 use riftphys_collision::narrowphase::{collide_shapes, reduce_to_4};
@@ -287,8 +287,9 @@ impl World {
         // Displacement from contact projection per body (linear, angular): kept out of the
         // derived velocity (split impulse), so pushing a body out of penetration doesn't launch it.
         let mut split = vec![(Vec3::ZERO, Vec3::ZERO); count as usize];
-        // Start-of-step poses (what the velocity solve used), for SHAKE joint directions
-        let start_poses: Vec<Isometry> = if has_joints && self.joint_projection == JointProjection::Shake {
+        // Start-of-step poses (what the velocity solve used), for SHAKE joint directions and for
+        // damped compliant rows' change since the start (PARITY_SPEC W4c), under either projection
+        let start_poses: Vec<Isometry> = if has_joints {
             (0..count).map(|i| if self.bodies.is_dynamic(i) && self.sleep.is_awake(i as usize) { original_poses[i as usize] } else { self.bodies.pose(i) }).collect()
         } else { Vec::new() };
         if has_joints { self.joints.begin_step(); }
@@ -527,8 +528,11 @@ impl World {
 
         for c in &mut culled {
             if c.b_collider == TERRAIN_CI { continue; }
-            let pa = self.bodies.pose(self.colliders[c.a_collider].body.0).pos;
-            let pb = self.bodies.pose(self.colliders[c.b_collider].body.0).pos;
+            // The colliders' own positions (PARITY_SPEC W4d; the bodies' for colliders with no
+            // offset, bit for bit)
+            let (ca, cb) = (&self.colliders[c.a_collider], &self.colliders[c.b_collider]);
+            let pa = ca.world_pose(self.bodies.pose(ca.body.0)).pos;
+            let pb = cb.world_pose(self.bodies.pose(cb.body.0)).pos;
             if c.normal.dot(pb - pa) < 0.0 { c.normal = -c.normal; }
         }
         culled
