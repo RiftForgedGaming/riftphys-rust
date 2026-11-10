@@ -2590,6 +2590,7 @@ name = "riftphys-reality"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "riftphys-articulation",
  "riftphys-core",
  "riftphys-geom",
  "riftphys-materials",

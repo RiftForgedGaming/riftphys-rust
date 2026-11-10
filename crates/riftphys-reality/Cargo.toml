@@ -32,6 +32,7 @@ path = "src/bin/synth.rs"
 riftphys-core = { path = "../riftphys-core" }
 riftphys-geom = { path = "../riftphys-geom" }
 riftphys-world = { path = "../riftphys-world" }
+riftphys-articulation = { path = "../riftphys-articulation" }
 riftphys-materials = { path = "../riftphys-materials" }
 glam = { workspace = true }
 serde = { workspace = true }

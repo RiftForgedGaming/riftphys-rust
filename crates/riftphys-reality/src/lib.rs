@@ -13,6 +13,7 @@
 //!   (`riftphys-cube-toss`).
 //! - [`double_pendulum`]: a real double pendulum (Myers et al.), PARITY_SPEC W3
 //!   (`riftphys-double-pendulum`).
+//! - [`urdf`]: a minimal URDF loader that builds bodies and hinges in a World (PARITY_SPEC W4a).
 //!
 //! See docs/PHYSICS_FIDELITY.md.
 
@@ -25,3 +26,4 @@ pub mod log;
 pub mod quadrotor;
 pub mod scene;
 pub mod synth;
+pub mod urdf;
