@@ -16,7 +16,7 @@ not been defined, so it couldn't be reported. This spec defines it and lists wha
 | Evidence | Status |
 |---|---|
 | Closed-form benchmarks, 240 Hz | 20/20 within tolerance (since c0ef751, SHAKE joints) |
-| Closed-form benchmarks, 60 Hz | 18/20. Restitution overshoots 13%. Large swing reads 0.975 at 10 s against ±0.02, bounded within 0.973–1.029 |
+| Closed-form benchmarks, 60 Hz | 19/20 since W6 (restitution 0.15%, was 13%). Large swing reads 0.975 at 10 s against ±0.02, bounded within 0.973–1.029 |
 | Real contact: 570 ContactNets cube tosses (Acosta, Yang & Posa, RA-L 2022) | Level with Drake and Bullet, ahead of MuJoCo (table below) |
 | Real jointed mechanism | A real double pendulum (Myers et al.): held-out error no worse than MuJoCo RK4's at 0.1–1 s, with the half-step start (section 3.3, decision D8) |
 | Joint correctness | Three open issues (docs/JOINT_ENERGY_SPEC.md 5.4) |
@@ -68,8 +68,10 @@ Status against the definition:
 - **Arm:** P1 and P3 are met (P3 under decision D8, 2026-11-09). This is arm parity for the
   `Isotropic` default at (8, 6).
 - **Biped:** P1, P2 and P3 are met (P3 as for the arm). **P4 and P5 are missing.**
-- **Drone:** P1 for its cases is met. Free fall, rotation, collision and resting all pass at 60 Hz;
-  restitution is excluded while drone scenes have no bouncing contacts (decision D3).
+- **Drone:** P1 is met, restitution included (W6, eee2e57; decision D3 made it required). Free
+  fall, rotation, collision, resting and restitution all pass at 60 Hz (2026-11-10, on f2b2004).
+  This is drone parity.
+- **Reported 2026-11-10:** arm and drone parity, in PHYSICS_FIDELITY.md section 4 and to URIEL.
 
 **Per-workload parity** lets arm training resume once P3 holds, without waiting for the
 biped's larger P4 (decision D1).
@@ -167,9 +169,9 @@ e00138.
 **Pass (P3):** at each horizon, RiftPhys's held-out RMS error is no worse than MuJoCo's by more
 than 2 SE. Also report the energy decay rate per run against the measured one.
 
-**Built, first pass (2026-11-09), uncommitted:** `tools/double_pendulum_to_reality.py`,
-`riftphys-double-pendulum`, `tools/parity/mujoco_double_pendulum.py`. P3 isn't decided: see the
-open question at the end of this block.
+**Built (2026-11-09), committed as f2b2004:** `tools/double_pendulum_to_reality.py`,
+`riftphys-double-pendulum`, `tools/parity/mujoco_double_pendulum.py`. P3 is met with the
+half-step start (decision D8).
 
 What the data turned out to be, and what changed from the plan above:
 - **Angles come from the video, not the encoders.** The encoder measures only the upper link. The
@@ -902,8 +904,9 @@ included:
 - The arm keeps its isotropic armature (decision D6).
 
 **What's left for parity:** W6, the D6 split, the World fix and W3 are built; the arm's P1 and P3
-are met (D8). Next, the report to URIEL with the commits, then W4 (Cassie; its data and URDF are in
-hand, a URDF loader isn't built, and its replay needs the half-step start). D4 is still open.
+are met (D8), and the drone's P1 with restitution. Both were reported on 2026-11-10. Next, W4
+(Cassie; its data and URDF are in hand, a URDF loader isn't built, and its replay needs the
+half-step start). D4 is still open.
 
 ### 3.9 D6 split: the arm's axis armature, as an option (drafted 2026-11-08)
 
@@ -1072,7 +1075,9 @@ trains on the default without anything changing, and can switch when it's ready.
 5. W4b, W4a, W4. This gives biped parity: report to URIEL with the commits.
 6. W5 only if triggered.
 
-W1, W2, W3a and W4b are built. Drone parity needs W6 (P1 at 60 Hz, restitution included).
+W1, W2, W3a, W4b, W6, the D6 split and W3 are built. Arm and drone parity were reported on
+2026-11-10 (PHYSICS_FIDELITY.md section 4). Biped parity needs W4a and W4 (P4); P5's fixes
+(W1, W2) are built, and its lever-arm part waits on whether P4 shows it.
 
 **Each parity report:**
 - is a new section in `docs/PHYSICS_FIDELITY.md`;

@@ -300,3 +300,74 @@ Bullet's 16.5. Over all tosses it's 16.8.
 - Own captures once mocap is set up: drops, tosses, sliding blocks, pendulums, then a Crazyflie.
 - Joints: block-solve each joint's rows so limits feel the inertia about the pivot (small bobs
   on long arms), and measure hinge limits in radians (docs/JOINT_ENERGY_SPEC.md, 5.4).
+
+## 4. Parity reports
+
+Parity is defined in docs/PARITY_SPEC.md section 2: per workload (decision D1), each against
+the criteria P1–P5 that apply to it. Each report names every commit since argref's pin (2b98bb3)
+that the bump should include.
+
+### Arm (F1) and drone, 2026-11-10
+
+**F1 arm: at parity.** This is the `Isotropic` default at (8, 6), the arm URIEL trains on.
+- **P1:** the closed-form cases at 240 Hz, 20/20 (on f2b2004).
+- **P3:** a real double pendulum (Myers et al. 2020), against MuJoCo RK4 at 240 Hz (decision
+  D7). Fit on trial 2, held out on trials 1 and 3 (131 windows). The table gives RMS angle
+  error in degrees, with a paired block-bootstrap 95% interval for the difference:
+
+  | | 0.1 s | 0.25 s | 0.5 s | 1 s |
+  |---|---|---|---|---|
+  | RiftPhys, half-step start | 1.23 | 4.49 | 10.64 | 26.61 |
+  | MuJoCo RK4 | 1.31 | 4.64 | 10.24 | 24.33 |
+  | difference | −0.08 [−0.17, −0.00] | −0.15 [−0.38, +0.09] | +0.40 [−0.89, +2.45] | +2.28 [−1.85, +6.15] |
+
+  - **The verdict:** no worse at every horizon. RiftPhys beats RK4 at 0.1 s and ties at the
+    rest. The same holds in both damping basins of the fit.
+  - **Counted with the half-step start (decision D8).** It sets the start velocity half a step
+    behind the position, as the World's leapfrog expects. Without it, RiftPhys is worse at
+    0.1 and 0.25 s (+0.38 and +0.67°). That table is in PARITY_SPEC 3.3.
+  - **Limits:**
+    - trajectory error up to 1 s from a measured state, on two held-out runs of one rig;
+    - damping isn't identified, so the fitted values shouldn't be reused;
+    - neither engine matches the measured energy decay. With shared damping the two agree, so
+      no numerical dissipation shows.
+  - **Replays from measured velocities** (W4 included) need the half-step start.
+- **`Axis` armature:** an option at (96, 6) (decision D6). It isn't covered by this report:
+  P3 ran on `Isotropic` at 8 iterations, and `Axis` hasn't been compared with a real arm.
+
+**Drone: at parity.**
+- **P1:** the drone's cases at 60 Hz (on f2b2004): free fall 0.00%, torque-free rotation (L
+  0.00%, energy 0.03%, flips), collision exact, resting 0 mm, and restitution, which became
+  required under decision D3 ("if a drone falls it should bounce"). Restitution is now 0.15%
+  from 1 m at e 0.8, where it was 13%. That comes from W6, which handles a bounce at the time of
+  impact. The drone itself, dropped flat from 2 m, rebounds to e²h within 0.13% with no spin.
+  A drone dropped tilted gains no energy.
+- The 60 Hz suite is 19/20. The miss is the large swing (0.975 against ±0.02, bounded with no
+  trend), a jointed case that no drone scene has.
+
+**Commits since 2b98bb3 for the argref bump**, oldest first:
+- 57fe059: real cube tosses scored against Drake, Bullet and MuJoCo;
+- 22be79e: compliant (Hunt-Crossley) contact, opt in per pair;
+- 674ad19: patch friction, opt in per pair;
+- c0ef751: SHAKE joint projection;
+- 1aa0aeb: hinge limits in radians, compliant joints hold their stiffness (W1, W2);
+- f329733: joint rows re-measured before each solve;
+- 15c12cf: no 1e-6 grid on body state, joints or contacts;
+- d69f4e7: contact and joint warm starting;
+- b1ebad0: box faces clip, the hash covers carried state, joint damping, friction and armature
+  (W3a, W4b);
+- eee2e57: restitution at the time of impact (W6);
+- 9601157: the gyroscopic turn subdivides on thin bodies (the World fix);
+- 4db8875: the arm's per-axis armature, as an option (D6);
+- f2b2004: the real double pendulum (W3, P3);
+- and this report's commit.
+
+**Golden hashes (re-record at the bump):**
+- `w6_jointed_bits` moved with 9601157: 60 Hz eec23adca1f947fd, 240 Hz 5e213f5f9b6fe2c6.
+- These are unchanged: fbec063e / bb1b6c15, `joint_bits`, W6's six scene hashes, the seam
+  SHA-256 and the cube tosses.
+- Golden hashes are release-build values. The 240 Hz pile prints 1a15ce00411301fa in release
+  and d3bdc0fa3f0257cf in debug. This is open in PARITY_SPEC 3.9.
+
+**Not at parity yet:** the biped. It needs P4 (Cassie jumping impacts, W4a and W4) and P5. P5's
+fixes, W1 and W2, are built; its lever-arm part waits on whether P4 shows it.
