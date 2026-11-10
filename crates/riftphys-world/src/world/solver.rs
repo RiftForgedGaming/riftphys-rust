@@ -64,10 +64,15 @@ struct ContactConstraint {
     /// pair still `gap` apart approach by up to gap/dt (speculative contact)
     depth_bias: f32,
     restitution_bias: f32,
-    /// Compliant pair (`MatPairProps::stiffness` > 0): the normal impulse is the Hunt-Crossley
-    /// force over the step, `soft_jn`, applied once; no rigid normal row, shock or restitution
+    /// Compliant pair (`MatPairProps::stiffness` > 0): no rigid normal row, shock or restitution;
+    /// an implicit soft normal row (PARITY_SPEC W4e), Delta lam = soft_m (soft_bias - v_n -
+    /// soft_gamma lam), lam >= 0. (The explicit form, the Hunt-Crossley impulse computed once from
+    /// the step's start, diverged at 240 Hz on light links and was dropped by W4e's rule.)
     soft: bool,
-    soft_jn: f32,
+    soft_implicit: bool,
+    soft_gamma: f32,
+    soft_bias: f32,
+    soft_m: f32,
     /// Friction is solved by this point's patch (see `FrictionPatch`), not here
     patch: bool,
     /// Bounce at the time of impact (PARITY_SPEC W6), for a rigid bouncing contact between
@@ -521,7 +526,10 @@ impl World {
                 depth_bias: 0.0,
                 restitution_bias: 0.0,
                 soft: pair.stiffness > 0.0,
-                soft_jn: 0.0,
+                soft_implicit: false,
+                soft_gamma: 0.0,
+                soft_bias: 0.0,
+                soft_m: 0.0,
                 patch: false,
                 toi: false, approach: 0.0, toi_s0: 0.0, toi_e: 0.0, toi_va: (0.0, 0.0), toi_vb: (0.0, 0.0),
             };
@@ -535,12 +543,25 @@ impl World {
             let v_rel_n = 0.5 * (v_pre + contact_rel_vel(&self.bodies, &cs).dot(normal));
             cs.approach = v_rel_n;
             if cs.soft {
-                // Hunt-Crossley: f = k x (1 + d x'), x the true penetration, x' its rate (the
-                // mid-step approach speed); never pulls. No rigid row, so nothing to bias.
+                // Implicit Hunt-Crossley (PARITY_SPEC W4e): a soft normal row whose spring acts at
+                // the end-of-step penetration pen0 - h v_end, with HC's damping linearised as
+                // c = k d max(pen_mid, 0), pen_mid = pen0 - h v_n0 / 2 the predicted mid-step
+                // penetration (v_n0 after external forces, before the solve). In soft-step terms
+                // gamma = 1 / (h (c + h k)) and beta = h k / (c + h k): v_end + gamma lam =
+                // beta pen0 / h, lam >= 0; at rest lam = h k pen0. A speculative contact
+                // (pen0 < 0) engages only if it arrives within the step. No Baumgarte bias or slop
+                // (the spring is the correction); cold, as it converges in an iteration or two.
                 cs.depth_bias = 0.0;
-                if pen > 0.0 {
-                    let f = pair.stiffness * pen * (1.0 + pair.dissipation * (-v_rel_n));
-                    cs.soft_jn = f.max(0.0) * dt;
+                let k = pair.stiffness;
+                let v_n0 = contact_rel_vel(&self.bodies, &cs).dot(normal);
+                let pen_d = if self.compliant_damping_at_start { pen } else { pen - 0.5 * dt * v_n0 };
+                let c = k * pair.dissipation.max(0.0) * pen_d.max(0.0);
+                let denom = c + dt * k;
+                if cs.m_n > 0.0 && denom > 0.0 {
+                    cs.soft_implicit = true;
+                    cs.soft_gamma = 1.0 / (dt * denom);
+                    cs.soft_bias = (dt * k / denom) * pen / dt;
+                    cs.soft_m = 1.0 / (1.0 / cs.m_n + cs.soft_gamma);
                 }
                 return cs;
             }
@@ -674,13 +695,6 @@ impl World {
         let constraints_slice = constraints.as_slice();
         // Accumulated patch friction: [t1, t2, torsion] per patch
         let mut patch_acc = vec![0.0f32; patches.len() * 3];
-        // Compliant contacts: their whole normal impulse, once, before the iterations
-        for (c_idx, cs) in constraints.iter().enumerate() {
-            if cs.soft && cs.soft_jn > 0.0 {
-                acc_jn[c_idx] = cs.soft_jn;
-                apply_contact_impulse(&mut self.bodies, cs, cs.normal * cs.soft_jn);
-            }
-        }
 
         // Warm start, joints: each D6 row starts from last step's impulse if the joint still has
         // the same rows, clamped to the row's bounds. Serial, in joint order. Starting cold let
@@ -831,7 +845,15 @@ impl World {
                     let acc_jt_slice = unsafe { acc_jt_ptr.get_mut_slice(num_constraints * 2) };
 
                     // Normal: accumulated impulse clamped >= 0 (compliant: fixed, applied above)
-                    let new_jn = if cs.soft { acc_jn_slice[c_idx] } else {
+                    let new_jn = if cs.soft_implicit {
+                        // The implicit compliant row (PARITY_SPEC W4e)
+                        let v_n = contact_rel_vel(bodies, cs).dot(cs.normal);
+                        let old_jn = acc_jn_slice[c_idx];
+                        let new_jn = (old_jn + cs.soft_m * (cs.soft_bias - v_n - cs.soft_gamma * old_jn)).max(0.0);
+                        acc_jn_slice[c_idx] = new_jn;
+                        if new_jn != old_jn { apply_contact_impulse(bodies, cs, cs.normal * (new_jn - old_jn)); }
+                        new_jn
+                    } else if cs.soft { acc_jn_slice[c_idx] } else {
                         let v_rel_n = contact_rel_vel(bodies, cs).dot(cs.normal);
                         let jn_raw = (cs.depth_bias - v_rel_n) * cs.m_n;
                         let old_jn = acc_jn_slice[c_idx];
@@ -986,7 +1008,7 @@ impl World {
         }
         let loaded_at = |c_idx: usize, acc_jn: &[f32]| {
             let cs = &constraints[c_idx];
-            acc_jn[c_idx] > 0.0 || cs.soft_jn > 0.0 || acc_jt[2 * c_idx] != 0.0 || acc_jt[2 * c_idx + 1] != 0.0
+            acc_jn[c_idx] > 0.0 || acc_jt[2 * c_idx] != 0.0 || acc_jt[2 * c_idx + 1] != 0.0
         };
         // Support reaches down a whole pile: grow `involved` through rigid loaded contacts to a
         // fixed point, stopping at static, sleeping and jointed bodies (a box dropped on a
@@ -1226,7 +1248,7 @@ impl World {
         self.contact_loaded.clear();
         self.contact_loaded.resize(num_bodies, false);
         for (c_idx, cs) in constraints.iter().enumerate() {
-            let loaded = acc_jn[c_idx] > 0.0 || cs.soft_jn > 0.0 || acc_jt[2 * c_idx] != 0.0 || acc_jt[2 * c_idx + 1] != 0.0;
+            let loaded = acc_jn[c_idx] > 0.0 || acc_jt[2 * c_idx] != 0.0 || acc_jt[2 * c_idx + 1] != 0.0;
             if loaded {
                 self.contact_loaded[cs.ai as usize] = true;
                 if !cs.b_is_terrain { self.contact_loaded[cs.bi as usize] = true; }

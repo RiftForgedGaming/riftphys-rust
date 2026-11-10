@@ -186,8 +186,9 @@ on the same data.
 | Bullet (published, fitted) | 14.9 +- 8.9 | 16.5 +- 20.2 | 0.27 +- 0.57 |
 | MuJoCo (published, fitted) | 25.1 +- 10.8 | 21.7 +- 21.4 | 0.38 +- 0.63 |
 | MuJoCo 3.17.0, published fit, this harness, all | 26.9 +- 15.8 | 22.5 +- 19.9 | 0.42 +- 0.59 |
-| **RiftPhys, compliant contact, fitted on even tosses, held out** | **13.2 +- 9.0** | **17.1 +- 18.9** | **0.29 +- 0.55** |
-| RiftPhys, compliant contact, same fit, all tosses | 13.3 +- 8.5 | 16.8 +- 18.9 | 0.28 +- 0.55 |
+| **RiftPhys, compliant contact (implicit, W4e), fitted on even tosses, held out** | **14.0 +- 9.8** | **16.9 +- 18.6** | **0.28 +- 0.53** |
+| RiftPhys, compliant contact (implicit, W4e), same fit, all tosses | 13.9 +- 9.1 | 16.5 +- 18.7 | 0.28 +- 0.53 |
+| RiftPhys, compliant contact (explicit, before W4e), held out | 13.2 +- 9.0 | 17.1 +- 18.9 | 0.29 +- 0.55 |
 | RiftPhys, rigid contact, fitted on even tosses, held out | 17.7 +- 11.7 | 17.1 +- 19.3 | 0.30 +- 0.57 |
 | RiftPhys, rigid contact, same fit, all tosses | 17.4 +- 10.5 | 16.8 +- 19.5 | 0.29 +- 0.57 |
 | RiftPhys, rigid, the cube's measured values (e 0.125, mu 0.18), all | 25.7 +- 13.6 | 23.0 +- 23.7 | 0.48 +- 0.72 |
@@ -197,10 +198,16 @@ What the table shows:
   published row to within about 10%. The remaining difference is plausibly 570 tosses against the
   paper's 550, and this harness's table height (the median rest height less a half-width).
 - **With compliant contact, RiftPhys matches Drake and Bullet**, scored on held-out tosses where
-  they were scored on the tosses they were fitted to. Position: 13.2%, against Drake's 13.5% and
-  Bullet's 14.9%. Rotation is within 0.6 degrees and e_q within 0.02. It's well ahead of MuJoCo.
-- **The compliant fit:** k 13591 N/m per contact point, d 3.515 s/m, mu_s 0.220, mu_k 0.186
-  (`--fit --compliant --evals 350 --seed 2`, 92 s). k lands near Drake's 10800.
+  they were scored on the tosses they were fitted to. Position: 14.0%, against Drake's 13.5% and
+  Bullet's 14.9%; rotation 16.9 degrees against 16.5; e_q 0.28 against 0.27. Under D2's rule (2 SE
+  on the 285 held-out tosses: 1.16% position, 2.2 degrees, 0.063 e_q) each is no worse than the
+  best reference. It's well ahead of MuJoCo.
+- **Restated 2026-11-10 for the implicit compliant contact (PARITY_SPEC W4e).** The explicit form
+  scored 13.2% / 17.1 degrees / 0.29 held out; the implicit one 14.0% / 16.9 / 0.28. By W4e's rule,
+  stated before this refit, the explicit form was dropped.
+- **The compliant fit (implicit):** k 20068 N/m per contact point, d 2.976 s/m, mu_s 0.693, mu_k
+  0.185 (`--fit --compliant --evals 350 --seed 2`, 329 s). The explicit fit was k 13591, d 3.515,
+  mu_s 0.220, mu_k 0.186; both near Drake's 10800 in k.
 - **Fit sensitivity:** with seed 1 and 200 evaluations, CMA-ES stopped at a softer optimum (k 1080,
   d 2.72, mu_s 0.338, mu_k 0.172). It scores the same e_q (0.29 held out) but 15.7% position. The
   objective is flat in k, so check more than one seed.
@@ -229,7 +236,10 @@ continued tumbling.
 **Compliant contact (2026-11-06).** `MatPairProps::stiffness` and `dissipation` switch a material pair
 to Hunt-Crossley contact, as Drake's point contact uses:
 - Each contact point's normal force is k x (1 + d x'), for penetration x and penetration rate x'.
-  It is applied as one impulse per step and never pulls.
+  Since 2026-11-10 (PARITY_SPEC W4e) it is implicit: a soft normal row in the velocity solve, the
+  spring at the end-of-step penetration and the damping linearised at the predicted mid-step one,
+  never pulling. It was first applied as one impulse per step computed from the step's start
+  (explicit), which diverged at 240 Hz on light links (Cassie's toes).
 - Friction is the usual Coulomb disc, capped by that force (Stribeck curve as before).
 - The pair skips the rigid normal row, shock propagation, restitution, position-level projection and
   the terrain grounding guard.
@@ -240,7 +250,10 @@ to Hunt-Crossley contact, as Drake's point contact uses:
   - with no dissipation a bounce returns over 90% of its speed, and dissipation removes more the
     faster the impact;
   - sliding distance is Coulomb's v^2 / (2 mu g);
-  - steps replay bit-exactly.
+  - steps replay bit-exactly;
+  - (W4e) resting at F / k within 1% at 60 Hz, 240 Hz and 2 kHz; the bounce within 5% of
+    Hunt-Crossley's own ODE at 2 kHz; a light hinged toe landing at 2 m/s bounded at 240 Hz with k
+    at 9400 and ×100; a box holding on a 20 degree compliant slope.
 - On the cube tosses (diagnosis with the fitted values): travel after the first contact is 280 mm
   against the real 284 mm (rigid 255), the per-toss travel difference is 27 mm (rigid 36), and the
   final pose error is 27 mm (rigid 36).

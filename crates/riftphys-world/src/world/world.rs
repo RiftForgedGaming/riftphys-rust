@@ -273,6 +273,9 @@ pub struct World {
 
     pub(super) joints: Joints,
     /// (velocity, position) solver iterations per step; see `set_solver_iterations`
+    /// Diagnostic (PARITY_SPEC W4e): damp implicit compliant contacts at the step-start
+    /// penetration instead of the predicted mid-step one.
+    pub(super) compliant_damping_at_start: bool,
     pub(super) solver_iters: (u32, u32),
     /// How the position-level joint solve chooses its correction directions
     pub(super) joint_projection: JointProjection,
@@ -412,6 +415,7 @@ impl World {
             pending_gravity: None,
             gravity_proc: GravitySpec::Uniform { g: [g.x, g.y, g.z] },
             joints: Joints::new(),
+            compliant_damping_at_start: false,
             solver_iters: (20, 20),
             joint_projection: JointProjection::default(),
             pre_step_vel: Vec::new(),
@@ -953,6 +957,10 @@ impl World {
 
     /// Velocity-level (contacts, distance joints) and position-level (D6 joints + contact
     /// projection) iterations per step; default (20, 20). Scenes that substep can use fewer.
+    /// Diagnostic (PARITY_SPEC W4e): damp implicit compliant contacts at the step-start
+    /// penetration (true) instead of the predicted mid-step one (false, the default).
+    pub fn set_compliant_damping_at_start(&mut self, on: bool) { self.compliant_damping_at_start = on; }
+
     pub fn set_solver_iterations(&mut self, velocity: u32, position: u32) {
         self.solver_iters = (velocity.max(1), position.max(1));
     }
