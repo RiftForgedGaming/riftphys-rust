@@ -301,6 +301,31 @@ fn joint_row_apply(bodies: &mut riftphys_dynamics::dynamics::Bodies, r: &JointRo
     }
 }
 
+/// Velocity rows of an anchored distance joint (PARITY_SPEC W4c), along the current anchors'
+/// direction with the current lever arms and the generalised mass: an equality (target 0, as
+/// D6's locked rows; the position solve removes drift) for a rigid rod, or a damper
+/// v_rel + gamma lam = 0, gamma = 1 / (c dt), for a compliant one with damping. Never
+/// warm-started, so they add nothing to the carried state.
+fn distance_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulation::bodies::DistanceJoint, dt: f32, out: &mut Vec<JointRow>) {
+    let (a, b) = (j.a.0, j.b.0);
+    let (pa, pb) = (bodies.pose(a), bodies.pose(b));
+    let (wa, wb) = (bodies.inv_mass_of(a), bodies.inv_mass_of(b));
+    if wa == 0.0 && wb == 0.0 { return; }
+    let (ra, rb) = (pa.rot * j.la, pb.rot * j.lb);
+    let d = (pb.pos + rb) - (pa.pos + ra);
+    let len = d.length();
+    if !(len > 1e-6) { return; }
+    let u = d / len;
+    let (ia, ib) = (bodies.inv_inertia_world(a), bodies.inv_inertia_world(b));
+    let (ca, cb) = (ra.cross(u), rb.cross(u));
+    let k = wa + wb + ca.dot(ia.mul_vec3(ca)) + cb.dot(ib.mul_vec3(cb));
+    if !(k > 1e-9) { return; }
+    let base = JointRow { a, b, angular: false, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / k, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, gamma: 0.0, tag: 0 };
+    // Rigid rods only: a compliant rod's damping is in its position row (XPBD's damping term)
+    let _ = dt;
+    if j.compliance <= 0.0 { out.push(base); }
+}
+
 /// Velocity rows of a D6 joint: locked axes as equalities, limits as speculative inequalities.
 /// Drives and soft (compliant) rows stay at position level.
 fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulation::bodies::D6Joint, dt: f32, j_idx: u32, rotor: &BTreeMap<(u32, u8), f32>, out: &mut Vec<JointRow>) {
@@ -334,12 +359,15 @@ fn d6_rows(bodies: &riftphys_dynamics::dynamics::Bodies, j: &riftphys_articulati
             // Joint damping and Coulomb friction (PARITY_SPEC W3a), on any axis, free ones too.
             // The damper is implicit: v + gamma lam = 0 with gamma = 1 / (c dt) gives the impulse
             // -c dt v_end, stable for any c (a rigid lock as c grows).
-            if row.damping > 0.0 || row.friction > 0.0 {
+            // A compliant row's damping is in its position row (XPBD's damping term, PARITY_SPEC
+            // W4c): a damper here, before the projection, carried part of a static load
+            let damp = if row.enabled && row.compliance > 0.0 { 0.0 } else { row.damping };
+            if damp > 0.0 || row.friction > 0.0 {
                 let kk = k(u);
                 if kk > 1e-9 {
                     let base = JointRow { a, b, angular, u, ra, rb, wa, wb, ia, ib, m_eff: 1.0 / kk, target: 0.0, lam_min: f32::NEG_INFINITY, lam_max: f32::INFINITY, gamma: 0.0, tag };
-                    if row.damping > 0.0 {
-                        let gamma = 1.0 / (row.damping * dt);
+                    if damp > 0.0 {
+                        let gamma = 1.0 / (damp * dt);
                         out.push(JointRow { gamma, m_eff: 1.0 / (kk + gamma), tag: tag | 4, ..base });
                     }
                     if row.friction > 0.0 {
@@ -604,11 +632,13 @@ impl World {
         let mut joint_rows: Vec<JointRow> = Vec::new();
         let mut row_range = vec![(0usize, 0usize); self.joints.kinds().len()];
         for &j_idx in &active_joints {
-            if let riftphys_articulation::bodies::JointKind::D6(j) = &self.joints.kinds()[j_idx] {
-                let start = joint_rows.len();
-                d6_rows(&self.bodies, j, dt, j_idx as u32, &self.rotor, &mut joint_rows);
-                row_range[j_idx] = (start, joint_rows.len());
+            let start = joint_rows.len();
+            match &self.joints.kinds()[j_idx] {
+                riftphys_articulation::bodies::JointKind::D6(j) => d6_rows(&self.bodies, j, dt, j_idx as u32, &self.rotor, &mut joint_rows),
+                riftphys_articulation::bodies::JointKind::Distance(j) if j.anchored() => distance_rows(&self.bodies, j, dt, &mut joint_rows),
+                _ => {}
             }
+            row_range[j_idx] = (start, joint_rows.len());
         }
         let mut row_acc = vec![0.0f32; joint_rows.len()];
         let num_rows = joint_rows.len();
@@ -656,8 +686,10 @@ impl World {
         // the same rows, clamped to the row's bounds. Serial, in joint order. Starting cold let
         // gravity's load on a standing biped go unconverged every step, and the position solve
         // corrected the remainder by dragging its light feet along the ground.
+        let is_d6 = |j_idx: usize| matches!(self.joints.kinds()[j_idx], riftphys_articulation::bodies::JointKind::D6(_));
         for (j_idx, &(s, e)) in row_range.iter().enumerate() {
-            if e == s { continue; }
+            // Distance rows start cold (PARITY_SPEC W4c)
+            if e == s || !is_d6(j_idx) { continue; }
             let Some(prev) = self.warm_joints.get(&(j_idx as u32)) else { continue };
             if prev.len() != e - s || prev.iter().zip(&joint_rows[s..e]).any(|(p, r)| p.tag != r.tag) { continue; }
             for (k, p) in (s..e).zip(prev) {
@@ -744,7 +776,13 @@ impl World {
             for batch in &joint_batches {
                 run_batch(batch, |&j_idx| {
                     let bodies = unsafe { bodies_ptr.get_mut() };
-                    if let riftphys_articulation::bodies::JointKind::Distance(j) = &joints_ref.kinds()[j_idx] {
+                    // Distance joints without anchors or damping keep their original row, bit for
+                    // bit; anchored ones and D6 joints run their JointRows (PARITY_SPEC W4c)
+                    let legacy = match &joints_ref.kinds()[j_idx] {
+                        riftphys_articulation::bodies::JointKind::Distance(j) if !j.anchored() => Some(j),
+                        _ => None,
+                    };
+                    if let Some(j) = legacy {
                         // Compliant (spring) joints act at position level only, like compliant D6
                         // rows: a rigid velocity row here held them at their rest length.
                         if j.compliance > 0.0 { return; }
@@ -882,9 +920,10 @@ impl World {
         }
         self.warm = warm;
         self.warm_patches = warm_patches;
-        // Joints solved this step replace their rows; the rest (asleep) keep theirs
+        // Joints solved this step replace their rows; the rest (asleep) keep theirs. Distance rows
+        // aren't kept: they start cold (PARITY_SPEC W4c)
         for (j_idx, &(s, e)) in row_range.iter().enumerate() {
-            if e == s { continue; }
+            if e == s || !matches!(self.joints.kinds()[j_idx], riftphys_articulation::bodies::JointKind::D6(_)) { continue; }
             let rows = (s..e).map(|k| WarmRow { tag: joint_rows[k].tag, lam: row_acc[k] }).collect();
             self.warm_joints.insert(j_idx as u32, rows);
             // Armature rotors keep their own balance, w_rotor - lam / J_a: equal to the links'

@@ -36,6 +36,18 @@ pub struct DistanceJoint {
     pub compliance: Scalar,
     /// XPBD multiplier accumulated over the current step's iterations (zeroed by `begin_step`)
     pub lambda_acc: Scalar,
+    /// Anchors in each body's frame (PARITY_SPEC W4c). Both zero: the COMs, solved by the
+    /// original rows, bit for bit.
+    pub la: Vec3,
+    pub lb: Vec3,
+    /// Damping along the rod, N s/m, compliant rods only (a velocity row; 0 = none).
+    pub damping: Scalar,
+}
+
+impl DistanceJoint {
+    /// Solved by the anchored rows (anchors or damping set), not the original COM-to-COM ones.
+    #[inline]
+    pub fn anchored(&self) -> bool { self.la != Vec3::ZERO || self.lb != Vec3::ZERO || self.damping > 0.0 }
 }
 
 /* ─────────────────────────  D6 types ──────────── */
@@ -148,8 +160,31 @@ impl Joints {
             rest: fin(rest),
             compliance: fin(compliance).max(0.0),
             lambda_acc: 0.0,
+            la: Vec3::ZERO,
+            lb: Vec3::ZERO,
+            damping: 0.0,
         }));
         JointId((self.kinds.len() as u32) - 1)
+    }
+
+    /// A distance joint between anchor `la` on `a` and `lb` on `b` (each in its body's frame),
+    /// held at `rest` with `compliance` (m/N; 0 = rigid). Anchors give the rod a lever arm, so
+    /// it passes torque (PARITY_SPEC W4c).
+    pub fn add_distance_joint_at(&mut self, a: BodyId, la: Vec3, b: BodyId, lb: Vec3, rest: Scalar, compliance: Scalar) -> JointId {
+        let id = self.add_distance_joint(a, b, rest, compliance);
+        if let Some(JointKind::Distance(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
+            j.la = fin_v(la);
+            j.lb = fin_v(lb);
+        }
+        id
+    }
+
+    /// Damping along a compliant distance joint, N s/m (negative or non-finite: 0). It only acts
+    /// on compliant joints: a rigid one already holds the rod's rate at 0.
+    pub fn set_distance_damping(&mut self, id: JointId, damping: Scalar) {
+        if let Some(JointKind::Distance(ref mut j)) = self.kinds.get_mut(id.0 as usize) {
+            j.damping = fin(damping).max(0.0);
+        }
     }
 
     /// Starts a step's position solve: zeroes every XPBD multiplier. The multiplier belongs to
@@ -282,7 +317,7 @@ impl Joints {
                 match k {
                     JointKind::Distance(j) => {
                         let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
-                        solve_distance_row(bodies, j, dt, dt2, s)
+                        if j.anchored() { solve_distance_anchored(bodies, j, dt, dt2, s) } else { solve_distance_row(bodies, j, dt, dt2, s) }
                     }
                     JointKind::D6(j) => {
                         let s = start.map(|s| (frame(s, bodies, j.a.0), frame(s, bodies, j.b.0)));
@@ -370,6 +405,71 @@ fn solve_distance_row(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt
     let _ = dt;
 }
 
+/// The anchored distance row (PARITY_SPEC W4c): C = |x_b - x_a| - rest on the current anchors,
+/// corrected along the start-of-step direction n0 with start-of-step lever arms and inertias
+/// (SHAKE), over the mixed Jacobian product
+/// w_mix = (w_a + w_b)(n_cur . n0) + (r_a x n_cur) . I_a0^-1 (r_a0 x n0) + (r_b x n_cur) . I_b0^-1 (r_b0 x n0),
+/// so dlambda = -(C + alpha lambda) / (w_mix + alpha) is SHAKE's Newton step and the compliance
+/// stays exact. Current-iterate (PBD) directions when either body turned too far this step or
+/// w_mix falls below half the start-of-step generalised mass.
+fn solve_distance_anchored(bodies: &mut Bodies, j: &mut DistanceJoint, dt: Scalar, dt2: Scalar, start: Option<(Isometry, Isometry)>) {
+    let (ia, ib) = (j.a.0, j.b.0);
+    let (wa, wb) = (fin(bodies.inv_mass_of(ia)), fin(bodies.inv_mass_of(ib)));
+    if wa + wb <= 0.0 { return; }
+    let (pa, pb) = (bodies.pose(ia), bodies.pose(ib));
+    let (ra, rb) = (fin_v(pa.rot * j.la), fin_v(pb.rot * j.lb));
+    let d = fin_v((pb.pos + rb) - (pa.pos + ra));
+    let len = d.length();
+    if !len.is_finite() || len <= 1.0e-6 { return; }
+    let n_cur = normalize_fin(d / len);
+    if n_cur == Vec3::ZERO { return; }
+    let c_val = fin(len - fin(j.rest));
+    let alpha = if j.compliance <= 0.0 { 0.0 } else { fin(fin(j.compliance).max(0.0) / dt2) };
+
+    // Correction direction, lever arms and inverse inertias, and the denominator
+    let pbd = || {
+        let (iaw, ibw) = (bodies.inv_inertia_world(ia), bodies.inv_inertia_world(ib));
+        let (ca, cb) = (ra.cross(n_cur), rb.cross(n_cur));
+        let w = wa + wb + ca.dot(iaw * ca) + cb.dot(ibw * cb);
+        (n_cur, iaw * ca, ibw * cb, w)
+    };
+    let shake = start.and_then(|(sa, sb)| {
+        if turned(sa.rot, pa.rot) >= SHAKE_MAX_TURN || turned(sb.rot, pb.rot) >= SHAKE_MAX_TURN { return None; }
+        let (ra0, rb0) = (sa.rot * j.la, sb.rot * j.lb);
+        let n0 = normalize_fin((sb.pos + rb0) - (sa.pos + ra0));
+        if n0 == Vec3::ZERO { return None; }
+        let (ia0, ib0) = (inv_inertia_at(bodies, ia, sa.rot), inv_inertia_at(bodies, ib, sb.rot));
+        let (ga, gb) = (ia0 * ra0.cross(n0), ib0 * rb0.cross(n0));
+        let w_sym = wa + wb + ra0.cross(n0).dot(ga) + rb0.cross(n0).dot(gb);
+        let w_mix = (wa + wb) * n_cur.dot(n0) + ra.cross(n_cur).dot(ga) + rb.cross(n_cur).dot(gb);
+        (w_mix.is_finite() && w_mix >= 0.5 * w_sym).then_some((n0, ga, gb, w_mix))
+    });
+    let (n, ga, gb, w) = shake.unwrap_or_else(pbd);
+    let denom = fin(w + alpha);
+    if !(denom > 0.0) { return; }
+
+    let lambda_old = fin(j.lambda_acc);
+    // Damping (compliant rods): XPBD's damping term, the spring and damper one implicit
+    // Kelvin-Voigt row over the same generalised mass; dC the length's change since the step's
+    // start (the Reviewer's design; a velocity row before the projection carried part of a static
+    // load, c dt / (m + c dt) of it)
+    let damped = match (j.compliance > 0.0 && j.damping > 0.0, start) {
+        (true, Some((sa, sb))) => {
+            let len0 = ((sb.pos + sb.rot * j.lb) - (sa.pos + sa.rot * j.la)).length();
+            let gamma = fin(j.compliance * j.damping / dt);
+            Some(fin(-(c_val + fin(alpha * lambda_old) + fin(gamma * fin(len - len0))) / fin((1.0 + gamma) * w + alpha)))
+        }
+        _ => None,
+    };
+    let dl = damped.unwrap_or_else(|| fin(-(c_val + fin(alpha * lambda_old)) / denom));
+    if dl.abs() <= 1.0e-12 { return; }
+    j.lambda_acc = fin(lambda_old + dl);
+    bodies.apply_position_delta(ia, fin_v(-n * fin(dl * wa)));
+    bodies.apply_position_delta(ib, fin_v(n * fin(dl * wb)));
+    bodies.apply_orientation_delta(ia, fin_v(-ga * dl));
+    bodies.apply_orientation_delta(ib, fin_v(gb * dl));
+}
+
 fn solve_d6(
     bodies: &mut Bodies,
     j: &mut Generic6Dof,
@@ -386,6 +486,9 @@ fn solve_d6(
     // The SHAKE fallback test (a body that turned too far this step uses PBD directions) runs
     // once per call, on the poses the call starts from: simpler, and deterministic.
     let (pa0, pb0) = (bodies.pose(j.a.0), bodies.pose(j.b.0));
+    // The step's start poses, for a damped compliant row's change since the start (PARITY_SPEC
+    // W4c); SHAKE's directions use the filtered ones below
+    let step_start = start;
     let start = start.filter(|(sa, sb)| turned(sa.rot, pa0.rot) < SHAKE_MAX_TURN && turned(sb.rot, pb0.rot) < SHAKE_MAX_TURN);
     let shake: Option<([Vec3; 3], Vec3, Vec3, Mat3, Mat3)> = start.map(|(sa, sb)| {
         let ra0 = sa.rot * j.fa.rot;
@@ -466,7 +569,20 @@ fn solve_d6(
 
         c = fin(c + fin(bias_vel * dt));
         let lambda_old = fin(row.lambda_acc);
-        let dl = fin(-(c + fin(alpha * lambda_old)) / denom);
+        let (compliance, damping) = (row.compliance, row.damping);
+        let dl = match (compliance > 0.0 && damping > 0.0, step_start) {
+            // Damped compliant row (PARITY_SPEC W4c): XPBD's damping term, the spring and damper
+            // one implicit Kelvin-Voigt row; dC its change since the step's start
+            (true, Some((sa, sb))) => {
+                let u0 = normalize_fin((sa.rot * j.fa.rot) * units[i]);
+                let d0 = fin_v((sb.pos + sb.rot * j.fb.pos) - (sa.pos + sa.rot * j.fa.pos));
+                let gamma = fin(compliance * damping / dt);
+                let dc = fin(coord - d0.dot(u0));
+                fin(-(c + fin(alpha * lambda_old) + fin(gamma * dc)) / fin((1.0 + gamma) * w + alpha))
+            }
+            _ => fin(-(c + fin(alpha * lambda_old)) / denom),
+        };
+        let row = &mut j.t[i];
         row.lambda_acc = fin(lambda_old + dl);
 
         bodies.apply_position_delta(j.a.0, fin_v(-un * fin(dl * wa)));
@@ -552,7 +668,27 @@ fn solve_d6(
 
         c = fin(c + fin(bias_vel * dt));
         let lambda_old = fin(row.lambda_acc);
-        let dl = fin(-(c + fin(alpha * lambda_old)) / denom);
+        let (compliance, damping) = (row.compliance, row.damping);
+        let dl = match (compliance > 0.0 && damping > 0.0, step_start) {
+            // Damped compliant row (PARITY_SPEC W4c), as the translational rows
+            (true, Some((sa, sb))) => {
+                let (ra0, rb0) = (sa.rot * j.fa.rot, sb.rot * j.fb.rot);
+                let mut q0 = ra0.conjugate() * rb0;
+                if q0.w < 0.0 { q0 = -q0; }
+                let v0 = Vec3::new(q0.x, q0.y, q0.z);
+                let u0 = normalize_fin(ra0 * units[i]);
+                let angle0 = match hinge {
+                    Some(f) if f == i => fin(2.0 * v0[f].atan2(q0.w)),
+                    Some(f) => fin(fin_v(normalize_fin(ra0 * units[f]).cross(normalize_fin(rb0 * units[f]))).dot(u0)),
+                    None => fin(fin_v(ra0 * fin_v(2.0 * v0)).dot(u0)),
+                };
+                let gamma = fin(compliance * damping / dt);
+                let dc = fin(angle - angle0);
+                fin(-(c + fin(alpha * lambda_old) + fin(gamma * dc)) / fin((1.0 + gamma) * w + alpha))
+            }
+            _ => fin(-(c + fin(alpha * lambda_old)) / denom),
+        };
+        let row = &mut j.r[i];
         row.lambda_acc = fin(lambda_old + dl);
 
         bodies.apply_orientation_delta(j.a.0, fin_v(-(iaw * un) * dl));

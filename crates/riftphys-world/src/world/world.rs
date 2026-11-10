@@ -504,6 +504,19 @@ impl World {
         self.joints.add_distance_joint(a, b, rest, compliance)
     }
 
+    /// A distance joint between anchor `la` on `a` and `lb` on `b`, each in its body's frame
+    /// (PARITY_SPEC W4c): the rod passes torque through its lever arms. `compliance` in m/N,
+    /// 0 for rigid.
+    pub fn add_distance_joint_at(&mut self, a: BodyId, la: Vec3, b: BodyId, lb: Vec3, rest: Scalar, compliance: Scalar) -> JointId {
+        self.joints.add_distance_joint_at(a, la, b, lb, rest, compliance)
+    }
+
+    /// Damping along a compliant distance joint, N s/m: an implicit velocity row, stable for
+    /// any value. A rigid joint ignores it (it already holds the rod's rate at 0).
+    pub fn set_distance_damping(&mut self, id: JointId, damping: Scalar) {
+        self.joints.set_distance_damping(id, damping);
+    }
+
     pub fn set_gravity(&mut self, g: Vec3) {
         self.gravity = g;
         self.gravity_proc = GravitySpec::Uniform { g: [g.x, g.y, g.z] };
