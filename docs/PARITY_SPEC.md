@@ -549,7 +549,8 @@ to 0.7234 m at 60 Hz against e² h = 0.640 (+13.0%), and 0.6626 m at 240 Hz (+3.
     the large swing (energy 0.9748 after 10 s, tolerance 0.02), owned by JOINT_CONDITIONING R5;
   - seams (line, ring), biped push sweep, cube tosses (measured params 26.4, fitted held out
     15.8): identical to suites_w6; 570 tosses in 1.0 s;
-  - jointed scenes bit-identical to b1ebad0: 60 Hz d60114b0bb454180, 240 Hz a9ae3e4bacb3c45d;
+  - jointed scenes bit-identical to b1ebad0: 60 Hz d60114b0bb454180, 240 Hz a9ae3e4bacb3c45d
+    (until the World fix, section 3.9: now eec23adca1f947fd and 5e213f5f9b6fe2c6);
   - **golden hashes** (`w6_scene_hashes`, the step hash's first 8 bytes):
 
     | scene | 60 Hz | 240 Hz |
@@ -768,6 +769,128 @@ trains on the default without anything changing, and can switch when it's ready.
     default's;
   - a rollback in `Axis` mode replays hash for hash (the rotors are carried state).
 - **Order:** after W6.
+
+**Built (2026-11-09), `arm.rs`, `seam.rs`, `riftphys-uriel-seam --armature isotropic|axis`:**
+
+> **`Axis` is usable at its own iterations, (96, 6) (`ArmConfig::for_armature(Axis)`); the Reviewer
+> approved D6 on 2026-11-09.** At 8 iterations it is still wrong by 18–30% on the teacher replay, and
+> it hasn't been compared with a real arm.
+
+- `ArmArmature::{Isotropic (default), Axis}` in `ArmConfig`. `Axis` adds `ARMATURE[j] (I − u uᵀ)` to
+  the child and `set_d6_armature(joint, 0, ARMATURE[j])` on the hinge's free axis (the rotor row
+  is built before the hinge's enabled check, so it acts there). Axis-mode seam scenarios end in
+  `_axis`; the default's names, lines and hashes are unchanged.
+- **Default unchanged:** the arm's step hashes over 2 s of a scripted torque profile
+  (gravity compensation plus a sine per joint) are fbec063efe6f8343 at 1 s and bb1b6c157c0bb23d
+  at 2 s, recorded by a probe before the change, debug and release alike; asserted after.
+- **Inertia about each axis, two tests in place of the drafted "same rate in both modes":**
+  - every other joint held (velocity motors), a torque on joint j for one substep: the rate
+    matches each mode's own model (the links beyond moving as one; `Axis` adds the rotor of j
+    only) within 0.03% for all six joints in both modes (gate 1%). The modes agree only where no
+    joint beyond j turns about an axis along j's: Axis/Isotropic is 1.0000 at the wrist pitch
+    and tool roll, 1.048 at the base yaw, 1.115 at the shoulder (the elbow, about z like the
+    shoulder, and in part the wrist pitch (rolled 0.4 rad off z) add their armature about
+    the shoulder's axis in `Isotropic`, nothing in `Axis`: a held rotor turns with its housing). So the draft's "within 1% in both modes" holds only for the last joints. This is physics, not
+    error: a policy trained on `Isotropic` finds the shoulder 11.5% quicker to a torque in `Axis`
+    (about 10% less inertia) and the base yaw 4.8% quicker;
+  - the Reviewer's coupling test, as a model check: zero gravity, shoulder driven, elbow free,
+    the rest held; one substep from rest; both joints within 0.05% of each model's 2×2 mass
+    matrix (gate 1%). The elbow's lag per unit of shoulder motion orders as the Reviewer said:
+    `Axis` 0.125, no armature 0.145, `Isotropic` 0.302;
+  - the free arm, nothing held, a torque on each joint in turn: every rate within 0.07% of the
+    model's 6×6 mass matrix (gate 1%) at 512 velocity iterations.
+- **Convergence at 8 velocity iterations (before `Axis` got its own):** one substep from rest (joint rows cold),
+  `Isotropic` lands within 1–4% of the model (18.5% for a torque on the base yaw) and `Axis`
+  22–112% off: a soft rotor row beside the stiff hinge rows converges slowly. Held for 0.1 s
+  (warm-started rows), both are within 1.3% (`a_held_torque_moves_the_free_arm_as_its_mass_matrix_says`,
+  gate 2%). A cold start under a sudden large torque is the case to watch in `Axis` mode.
+- **Seam rollout:** `an_axis_armature_arm_tracks_a_seam` (0.15 m of line, with DART noise): at 8
+  iterations, default lateral mean 0.955 mm, p95 2.48; `Axis` 1.072, p95 2.66. It now asserts
+  each run completes with lateral and height p95 under 4 mm (noise-free eval: 0.25).
+- **The Reviewer's cold-substep check** (`d6_iteration_error_probe`, `d6_teacher_replay_probe`,
+  `d6_sine_contact_probe`, all ignored): open loop, the arm at its own iterations against the
+  same arm at 512, worst joint-rate error over 1 s as a share of the largest rate.
+
+  | input | `Isotropic` at 8 | `Axis` at 8 | at 32 | at 64 | at 96 |
+  |---|---|---|---|---|---|
+  | (b) random torque each tick, ±0.2 limit | 6.06% | 10.10% | 4.18% | 1.50% | 0.52% |
+  | (c) seam teacher's first second, 3 episodes | 0.87–1.80% | 18.6–30.1% | 2.4–3.5% | 1.6–3.8% | 0.53–0.87% |
+  | (a) sine profile, before the first self-contact (22 ticks) | 0.01% | | | | 0.27% |
+  | (a) sine profile, the full 1 s, before the World fix | 55.73% | diverges | diverges | diverges | diverges |
+  | (a) sine profile, the full 1 s, with the World fix | 55.73% | 78.34% | 77.22% | 71.07% | 57.12% |
+
+  - **Ordering didn't help** (rotor rows after the hinge rows: the same as built; before them:
+    worse, 100–146% on (c)), so `Axis` gets more iterations, per the Reviewer's rule:
+    `ArmConfig::for_armature(Axis)` is (96, 6). The default stays (8, 6) and its hashes hold.
+    Error roughly halves per doubling up to 96, then flattens at about 1–2% (128: 1.0–1.7%), the
+    open-loop measure's own floor.
+  - **`Axis` fails on (a): it diverges.** The sine profile drives the arm into a self-contact
+    (wrist_1 on the tool) at tick 23. Within 10 ticks the tool roll rate is about 1e25 rad/s, at
+    96 and at 512 iterations alike, so it isn't convergence. `Isotropic` passes through the same
+    contact and stays at 93 rad/s, though its trajectory then departs from the 512-iteration one
+    (hence 55.73%). The tool link's own inertia about its axis is 1.9e-5 kg m² against 0.01
+    crosswise, a 500:1 needle.
+  - Gated: `a_teacher_replay_converges_at_the_arms_own_iterations` (input (c), 2%, both modes).
+  - **Cause, found by the Reviewer (2026-11-09):** the World's gyroscopic turn on a thin link
+    (`step.rs:229-239`), not `Axis`, the rotor, the contact or convergence. The turn conserves
+    world L and reads w = I(q)⁻¹L, so a turn error projects crosswise L onto the 1.9e-5 axis,
+    about 500× amplified, and the joint rows feed it back every substep. Largest joint rate over
+    1 s, in the Reviewer's scratch copy:
+
+    | variant | `Axis` at 96 | `Axis` at 512 | first contact |
+    |---|---|---|---|
+    | as built | 2.8e25 | 1.5e31 | tick 23 |
+    | gyroscopic turn off | 86 | 86 | tick 23 |
+    | turn subdivided | 84.6 | 85.8 | tick 23 |
+    | rotors zeroed, as built | 1.7e29 | 5.9e27 | none (blew up by substep 30) |
+    | rotors zeroed, turn off | 3,092 | 3,497 | tick 14 / 11 |
+    | rotors zeroed, subdivided | 3.8e30 | 10,681 | tick 19 / 17 |
+
+  - **World fix (built 2026-11-09, `step.rs`, its own change):** the turn subdivides into n pieces,
+    n = ceil(gain / 0.5), at most 256, each the existing midpoint at dt / n. The gain is
+    dt |dev(I⁻¹)| |L|, with dev the deviator of I⁻¹, so it's zero on an isotropic body. A spin
+    principal to roundoff (|L × ω| below 1e-5 |L||ω|, as a rod swinging flat) keeps n = 1, which is
+    the old midpoint bit for bit. Tests: `a_free_needle_keeps_its_momentum_energy_and_roll`
+    (undivided, roll moves by 66 rad/s and energy rises 8.6%; subdivided, 0.53 rad/s and 0.02%, and
+    0.009 rad/s from a nearly clean spin of 0.001 rad/s of roll),
+    `an_axis_arm_stays_bounded_through_a_self_contact` (`Axis`: 84.6 rad/s at 96 iterations, 85.8
+    at 512; gate 200; 0.34% before the contact, gate 2%).
+  - **What moved:** identical before and after: the default arm's hashes (fbec063e / bb1b6c15),
+    `joint_bits`, W6's six scene hashes, seam JSONL (line and ring, SHA-256), the 570 cube tosses.
+    `w6_jointed_bits` moved (60 Hz d60114b0bb454180 → eec23adca1f947fd; 240 Hz a9ae3e4bacb3c45d →
+    5e213f5f9b6fe2c6). That scene is 1 m rods (156:1) rattling on a floor in 3D, where the undivided
+    turn had left its contraction range (its gyroscopic-torque gain reached 10.6, above 1 on 22
+    steps), so the old bits weren't converged. argref re-records at the bump.
+  - **Golden hashes are release-build values.** The 240 Hz pile hash in the W6 table (1a15ce00411301fa)
+    is what release builds print; debug prints d3bdc0fa3f0257cf, at 1 and 4 threads, on eee2e57 and
+    with the World fix alike (the Reviewer's check). The other five agree. **Open, separate:** the
+    same source giving different bits by profile needs explaining. Look first at anything gated on
+    `debug_assertions` and the unsafe shared-mutable access in `solver.rs`; find the first step
+    whose hash differs and which body it is. Owner: RiftPhys Orchestration.
+  - **Re-measured on the fixed build:** (b) and (c) don't change (table above). (a), the full 1 s:
+    `Axis` no longer diverges; it reads 57–79%, like `Isotropic`'s 55.73%, because the motion after
+    the contact is chaotic; before the contact, 0.34% at 96 iterations. **(96, 6) stands:** 64
+    misses 2% on (c) (up to 3.78%), 96 gives 0.53–0.87%, 128 no better.
+  - **Open, separate from D6:** the rotors-zeroed arm (a chain of thin links with no armature)
+    diverges with the fix too: 5.5e22 rad/s at 8 iterations, 7.7e28 at 96, 2.0e30 at 512
+    (`d6_rotors_zeroed_probe`). Any imported model could be that. No root cause yet. Owner:
+    RiftPhys Orchestration.
+- **Seam eval at 96 iterations** (`riftphys-uriel-seam --eval --seam line|ring --armature
+  isotropic|axis`, 10 held-out episodes per joint type, seed 1000): every `_axis` scenario is
+  within 0.007 mm of the default's on lateral and height, mean and p95, teacher and floor alike;
+  all teachers complete 10/10, the floors 6/10 (line) and 8/10 (ring) in both modes. Feedback
+  hides plant error, so this shows the teacher's gains carry over, not that the plant is right.
+
+  | scenario | teacher lateral mean / p95, default | `_axis` |
+  |---|---|---|
+  | line butt | 0.108 / 0.263 mm | 0.108 / 0.256 mm |
+  | line v | 0.050 / 0.084 | 0.051 / 0.085 |
+  | line fillet | 0.054 / 0.199 | 0.054 / 0.199 |
+  | ring butt | 0.102 / 0.239 | 0.101 / 0.238 |
+  | ring v | 0.032 / 0.053 | 0.032 / 0.052 |
+  | ring fillet | 0.033 / 0.058 | 0.033 / 0.058 |
+
+- **Rollback:** `an_axis_arm_rolls_back_hash_for_hash` (30 ticks, 120 step hashes).
 
 ## 4. Order and reporting
 

@@ -111,7 +111,11 @@ impl Default for SeamConfig {
 }
 
 impl SeamConfig {
-    pub fn scenario(&self) -> String { format!("seam_{}_{}", self.shape.name(), self.joint.name()) }
+    /// `seam_<shape>_<joint>`, with `_axis` for the axis-armature arm (PARITY_SPEC 3.9)
+    pub fn scenario(&self) -> String {
+        let arm = if self.arm.armature == crate::arm::ArmArmature::Axis { "_axis" } else { "" };
+        format!("seam_{}_{}{}", self.shape.name(), self.joint.name(), arm)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -926,6 +930,73 @@ mod tests {
         c.ring_arc = 0.3;
         c.speed = (0.03, 0.04);
         c
+    }
+
+    /// PARITY_SPEC 3.9: a 10 s seam rollout (0.15 m of line at 20 mm/s after the 2.5 s approach
+    /// and settle) completes with the arm's axis armature, its tracking within a loose bound and
+    /// reported beside the default arm's.
+    #[test]
+    fn an_axis_armature_arm_tracks_a_seam() {
+        for armature in [crate::arm::ArmArmature::Isotropic, crate::arm::ArmArmature::Axis] {
+            let mut c = SeamConfig { arm: ArmConfig::for_armature(armature), ..Default::default() };
+            c.line_len = 0.15;
+            c.speed = (0.02, 0.02);
+            let (lines, st) = SeamRollout::new(c).run_episode(0, 7);
+            println!("{:?}: {} | lateral mean {:.3} mm, p95 {:.3} mm | height mean {:.3} mm, p95 {:.3} mm | {} lines",
+                armature, st.result, st.lat_mean_mm, st.lat_p95_mm, st.h_mean_mm, st.h_p95_mm, lines.len());
+            // The rollout carries DART exploration noise (5% of each joint's limit), so its p95
+            // runs near 2.5 mm, not the noiseless eval's 0.25: the bound catches an abort or a
+            // drift, not a tuning change
+            assert_eq!(st.result, "completed", "{:?}", armature);
+            assert!(st.lat_p95_mm < 4.0 && st.h_p95_mm < 4.0, "{:?}: lateral p95 {:.3} mm, height p95 {:.3} mm", armature, st.lat_p95_mm, st.h_p95_mm);
+        }
+    }
+
+    /// A seam teacher's torques, recorded on the arm at its own iterations over its first second
+    /// (episode `ep`, seed 1000, a v-groove line), replayed open loop on that arm and on the same
+    /// arm at 512 iterations: `arm::iteration_rate_error`'s (first tick, over 1 s, joint).
+    fn teacher_replay_error(armature: crate::arm::ArmArmature, iters: u32, ep: u64) -> (f32, f32, usize) {
+        let cfg = SeamConfig { joint: JointType::V, arm: ArmConfig::for_armature(armature), ..Default::default() };
+        let mut env = SeamEnv::new(&cfg, ep, 1000);
+        let mut ctl = SeamTracker::teacher(&env);
+        let mut rec: Vec<[f32; JOINTS]> = Vec::new();
+        for _ in 0..CONTROL_HZ {
+            let scan = env.scan.clone();
+            ctl.observe(&env, &scan);
+            env.step(|w, a, k, dt| { let t = ctl.torques(w, a, k, dt); rec.push(t); t });
+        }
+        let mut lo = SeamEnv::new(&SeamConfig { arm: ArmConfig { solver_iters: (iters, 6), ..cfg.arm }, ..cfg }, ep, 1000);
+        let mut hi = SeamEnv::new(&SeamConfig { arm: ArmConfig { solver_iters: (512, 6), ..cfg.arm }, ..cfg }, ep, 1000);
+        crate::arm::iteration_rate_error((&mut lo.world, &mut lo.arm), (&mut hi.world, &mut hi.arm), CONTROL_HZ,
+            |tick, k, _, _| rec[(tick * SUBSTEPS + k) as usize])
+    }
+
+    /// PARITY_SPEC 3.9, the Reviewer's cold-substep check: a seam teacher's first second, replayed
+    /// open loop from rest, moves the arm at its own iterations (8; 96 in `Axis`) within 2% of the
+    /// largest joint rate of the same arm at 512, in both modes.
+    #[test]
+    fn a_teacher_replay_converges_at_the_arms_own_iterations() {
+        for armature in [crate::arm::ArmArmature::Isotropic, crate::arm::ArmArmature::Axis] {
+            let iters = ArmConfig::for_armature(armature).solver_iters.0;
+            let (_, all, j) = teacher_replay_error(armature, iters, 0);
+            println!("{:?} at {} iterations: {:.2}% over 1 s (worst on {})", armature, iters, 100.0 * all, crate::arm::JOINT_NAMES[j]);
+            assert!(all <= 0.02, "{:?}: {:.2}% on {}", armature, 100.0 * all, crate::arm::JOINT_NAMES[j]);
+        }
+    }
+
+    /// Probe (PARITY_SPEC 3.9, the Reviewer's cold-substep check, input (c)). Run with
+    /// --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn d6_teacher_replay_probe() {
+        use crate::arm::ArmArmature::{Axis, Isotropic};
+        for (armature, iters) in [(Isotropic, 8), (Axis, 8), (Axis, 16), (Axis, 32), (Axis, 64), (Axis, 96), (Axis, 128)] {
+            for ep in 0..3 {
+                let (first, all, j) = teacher_replay_error(armature, iters, ep);
+                println!("{:?} at {:2} iterations, teacher replay ep {}: first tick {:6.2}%, over 1 s {:6.2}% (worst on {})",
+                    armature, iters, ep, 100.0 * first, 100.0 * all, crate::arm::JOINT_NAMES[j]);
+            }
+        }
     }
 
     #[test]

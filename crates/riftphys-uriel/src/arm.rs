@@ -30,7 +30,8 @@ pub const JOINT_NAMES: [&str; JOINTS] = ["base_yaw", "shoulder", "elbow", "forea
 pub const LINK_NAMES: [&str; LINKS] = ["base", "turret", "upper_arm", "forearm", "wrist_1", "wrist_2", "tool"];
 /// Torque limits (N m), joint order.
 pub const MAX_TORQUE: [f32; JOINTS] = [120.0, 150.0, 80.0, 20.0, 20.0, 10.0];
-/// Reflected actuator inertia about each joint axis (kg m^2), added to the child link.
+/// Reflected actuator inertia about each joint axis (kg m^2): added to the child link
+/// (`ArmArmature::Isotropic`), or carried by the joint's rotor row (`ArmArmature::Axis`).
 pub const ARMATURE: [f32; JOINTS] = [0.10, 0.10, 0.05, 0.02, 0.02, 0.01];
 pub const CONTROL_HZ: u32 = 60;
 pub const SUBSTEPS: u32 = 4;
@@ -193,14 +194,44 @@ pub struct ArmContacts {
     pub env_link: Option<usize>,
 }
 
+/// How the drives' reflected inertia (`ARMATURE`) enters the arm (PARITY_SPEC 3.9, decision D6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArmArmature {
+    /// Added to each child link's inertia about every axis (the arm URIEL trains on; default).
+    /// About the joint axis it resists the child's absolute rotation, so a parent joint's motion
+    /// drags it.
+    #[default]
+    Isotropic,
+    /// The geared-motor model: about the joint axis, the joint's rotor row (PARITY_SPEC W4b)
+    /// resists the joint's relative rotation; crosswise, the child keeps the same added inertia
+    /// as `Isotropic`, so the light wrist links stay conditioned. The total about the axis is
+    /// unchanged.
+    Axis,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ArmConfig {
     /// World solver iterations (velocity, position) per substep, as the biped.
     pub solver_iters: (u32, u32),
+    pub armature: ArmArmature,
 }
 
 impl Default for ArmConfig {
-    fn default() -> Self { Self { solver_iters: (8, 6) } }
+    fn default() -> Self { Self { solver_iters: (8, 6), armature: ArmArmature::Isotropic } }
+}
+
+impl ArmConfig {
+    /// Each armature mode's own config. `Axis` solves 96 velocity iterations, not 8: a soft
+    /// rotor row beside the stiff hinge rows converges slowly. At 8, a seam teacher's first
+    /// second replayed open loop strayed 25-30% from the converged motion; at 96, 0.6-1.1%
+    /// (`Isotropic` at 8: 0.9-1.8%; PARITY_SPEC 3.9). Ordering the rotor rows first or last
+    /// didn't help.
+    pub fn for_armature(armature: ArmArmature) -> Self {
+        match armature {
+            ArmArmature::Isotropic => Self::default(),
+            ArmArmature::Axis => Self { solver_iters: (96, 6), armature },
+        }
+    }
 }
 
 pub struct Arm {
@@ -230,8 +261,16 @@ impl Arm {
                 // Armature: the drive's reflected inertia about the joint axis plus the housing's
                 // inertia about the others, added isotropically. Armature about the joint axis
                 // alone left the light wrist links nearly massless crosswise, and the chain
-                // ill-conditioned: wrist torques leaked into the neighbouring joints.
-                mp.inertia += Mat3::IDENTITY * ARMATURE[i - 1];
+                // ill-conditioned: wrist torques leaked into the neighbouring joints. `Axis`
+                // keeps the crosswise part, A (I - u u^T) with u the joint axis in the child's
+                // frame, and moves the part about the axis to the joint's rotor row below.
+                mp.inertia += match cfg.armature {
+                    ArmArmature::Isotropic => Mat3::IDENTITY * ARMATURE[i - 1],
+                    ArmArmature::Axis => {
+                        let u = zero[i].rot.conjugate() * Vec3::from_array(JOINT_AXIS[i - 1]);
+                        (Mat3::IDENTITY - Mat3::from_cols((u * u.x).into(), (u * u.y).into(), (u * u.z).into())) * ARMATURE[i - 1]
+                    }
+                };
             }
             let id = world.add_body(pose, Velocity::default(), mp, i > 0);
             world.add_collider(id, def.shape, material(MaterialId::Aluminum));
@@ -248,6 +287,11 @@ impl Arm {
             let id = world.add_hinge_joint(links[j], links[j + 1], fa, fb, 0);
             Joint { id, parent: links[j], child: links[j + 1], frame: fa }
         });
+        if cfg.armature == ArmArmature::Axis {
+            // The rotor about each hinge's free axis (joint-frame x); it starts at the links'
+            // relative velocity (zero: the arm is built at rest)
+            for (j, joint) in joints.iter().enumerate() { world.set_d6_armature(joint.id, 0, ARMATURE[j]); }
+        }
         Arm { base, links, masses, joints, last_act: [0.0; JOINTS], last_demo: None }
     }
 
@@ -457,6 +501,39 @@ impl CartesianServo {
     }
 }
 
+/// How far an arm at its own velocity iterations (`lo`) strays from the same arm at many
+/// (`hi`), open loop: both get torques from `torques(tick, substep, world, arm)` for `ticks`
+/// control ticks. Returns the worst joint-rate difference as a share of the largest rate on the
+/// `hi` arm, over the first tick (a cold start) and over the whole run, and the joint it was on.
+#[cfg(test)]
+pub(crate) fn iteration_rate_error(
+    lo: (&mut World, &mut Arm), hi: (&mut World, &mut Arm), ticks: u32,
+    mut torques: impl FnMut(u32, u32, &World, &Arm) -> [f32; JOINTS],
+) -> (f32, f32, usize) {
+    let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+    let (lw, la) = lo;
+    let (hw, ha) = hi;
+    let (mut scale, mut first, mut worst, mut at) = (0.0f32, 0.0f32, 0.0f32, 0usize);
+    for tick in 0..ticks {
+        for k in 0..SUBSTEPS {
+            let t = torques(tick, k, lw, la);
+            la.apply(lw, t, dt);
+            lw.step(dt);
+            let t = torques(tick, k, hw, ha);
+            ha.apply(hw, t, dt);
+            hw.step(dt);
+            let (rl, rh) = (la.rates(lw), ha.rates(hw));
+            for j in 0..JOINTS {
+                scale = scale.max(rh[j].abs());
+                let d = (rl[j] - rh[j]).abs();
+                if d > worst { worst = d; at = j; }
+            }
+        }
+        if tick == 0 { first = worst / scale.max(1e-9); }
+    }
+    (first, worst / scale.max(1e-9), at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +568,339 @@ mod tests {
         let got = fk_tcp(&q);
         assert!((got.pos - target.pos).length() < 1e-4, "pos {:?}", got.pos);
         assert!(rot_error(target.rot, got.rot).length() < 1e-3);
+    }
+
+    /// A scripted torque profile: gravity compensation plus a sine per joint, 2 s at 60 Hz
+    /// control. Returns the step hash (first 8 bytes, hex) after 1 s and after 2 s.
+    fn torque_profile_hashes(cfg: &ArmConfig) -> (String, String) {
+        let hex = |h: [u8; 32]| h.iter().take(8).map(|b| format!("{:02x}", b)).collect::<String>();
+        let mut world = World::with_capacity(16, 16);
+        let mut arm = Arm::build(&mut world, cfg, Vec3::ZERO, [0.3, -0.5, -0.8, 0.4, -0.9, 0.2]);
+        let mut t = 0.0f32;
+        let mut at_1s = String::new();
+        for tick in 0..2 * CONTROL_HZ {
+            arm.tick(&mut world, |w, a, dt| {
+                t += dt;
+                let g = a.gravity_torques(w);
+                std::array::from_fn(|j| g[j] + 0.2 * MAX_TORQUE[j] * (t * (1.0 + 0.7 * j as f32)).sin())
+            });
+            if tick + 1 == CONTROL_HZ { at_1s = hex(world.step_hash()); }
+        }
+        (at_1s, hex(world.step_hash()))
+    }
+
+    /// PARITY_SPEC 3.9: the default arm is bit-identical across the D6 split (hashes recorded
+    /// by a probe on the build before it, debug and release alike).
+    #[test]
+    fn the_default_arm_is_unchanged_by_the_axis_option() {
+        let (a, b) = torque_profile_hashes(&ArmConfig::default());
+        assert_eq!((a.as_str(), b.as_str()), ("fbec063efe6f8343", "bb1b6c157c0bb23d"));
+    }
+
+    fn axis_cfg() -> ArmConfig { ArmConfig::for_armature(ArmArmature::Axis) }
+
+    /// Holds joint `k` still with a velocity motor (strong enough for any test torque here).
+    fn lock(world: &mut World, arm: &Arm, k: usize) {
+        use riftphys_articulation::bodies::D6Drive;
+        world.set_d6_drive_r(arm.joints[k].id, 0, Some(D6Drive { target: 0.0, kp: 0.0, kd: 0.0, max_impulse: 1.0e6, vel_mode: true }));
+    }
+
+    /// Link i's inertia in its own frame, with the armature of the joint before it added as
+    /// `inertia` says (the arm's build).
+    fn local_inertia(i: usize, inertia: ArmArmature) -> Mat3 {
+        let def = &LINK_DEFS[i];
+        let u = fk(&[0.0; JOINTS])[i].rot.conjugate() * Vec3::from_array(JOINT_AXIS[i - 1]);
+        link_mass(&def.shape, def.mass).inertia + match inertia {
+            ArmArmature::Isotropic => Mat3::IDENTITY * ARMATURE[i - 1],
+            ArmArmature::Axis => (Mat3::IDENTITY - Mat3::from_cols((u * u.x).into(), (u * u.y).into(), (u * u.z).into())) * ARMATURE[i - 1],
+        }
+    }
+
+    /// The model's mass matrix over joints `js` (every other joint held), at the world's pose:
+    /// link inertias as `inertia` builds them, plus each joint's rotor (its armature, on relative
+    /// rotation) if `rotors`.
+    fn mass_matrix(world: &World, arm: &Arm, js: &[usize], inertia: ArmArmature, rotors: bool) -> Vec<Vec<f32>> {
+        let n = js.len();
+        let mut m = vec![vec![0.0f32; n]; n];
+        for i in 1..LINKS {
+            let pose = world.get_body_pose(arm.links[i]);
+            let local = local_inertia(i, inertia);
+            // Link i's velocity per unit rate of each joint before it: (linear, angular in its frame)
+            let col: Vec<Option<(Vec3, Vec3)>> = js.iter().map(|&j| (i > j).then(|| {
+                let (a, p) = (arm.axis(world, j), arm.anchor(world, j));
+                (a.cross(pose.pos - p), pose.rot.conjugate() * a)
+            })).collect();
+            for r in 0..n {
+                for c in 0..n {
+                    if let (Some((vr, wr)), Some((vc, wc))) = (col[r], col[c]) {
+                        m[r][c] += LINK_DEFS[i].mass * vr.dot(vc) + wr.dot(local.mul_vec3(wc));
+                    }
+                }
+            }
+        }
+        if rotors { for (r, &j) in js.iter().enumerate() { m[r][r] += ARMATURE[j]; } }
+        m
+    }
+
+    /// One substep of torque `tau` on joint `driven`, joints `free` free and the rest held, zero
+    /// gravity, from rest at pose `q`: the free joints' rates. `zero_rotors` builds `Axis` and
+    /// then takes the rotors off (no armature about the axes).
+    fn one_step_rates(q: [f32; JOINTS], mode: ArmArmature, zero_rotors: bool, iters: (u32, u32), driven: usize, tau: f32, free: &[usize]) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let mut world = World::with_capacity(16, 16);
+        let mut arm = Arm::build(&mut world, &ArmConfig { armature: mode, solver_iters: iters }, Vec3::ZERO, q);
+        world.set_gravity(Vec3::ZERO);
+        if zero_rotors { for joint in &arm.joints { world.set_d6_armature(joint.id, 0, 0.0); } }
+        for k in (0..JOINTS).filter(|k| !free.contains(k)) { lock(&mut world, &arm, k); }
+        let m = mass_matrix(&world, &arm, free, mode, mode == ArmArmature::Axis && !zero_rotors);
+        let mut t = [0.0; JOINTS];
+        t[driven] = tau;
+        arm.apply(&mut world, t, dt);
+        world.step(dt);
+        (free.iter().map(|&j| arm.rate(&world, j)).collect(), m)
+    }
+
+    /// PARITY_SPEC 3.9: with every other joint held (the parent fixed, the links beyond moving as
+    /// one), a torque on joint j accelerates it as each mode's model predicts, within 1%. The two
+    /// modes agree only where no joint beyond j turns about an axis along j's: a held rotor beyond
+    /// adds nothing about j's axis in `Axis` (it turns with its housing), its armature in
+    /// `Isotropic`. Run at 512 velocity iterations: the model is the subject; what the arm's own
+    /// iterations give (8; 96 in `Axis`) is printed (a soft rotor row beside stiff held rows converges slowly).
+    #[test]
+    fn a_torque_turns_each_joint_as_its_model_predicts() {
+        let q = [0.3, -0.5, -0.8, 0.4, -0.9, 0.2];
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        for j in 0..JOINTS {
+            let mut rate = [0.0f32; 2];
+            for (k, mode) in [ArmArmature::Isotropic, ArmArmature::Axis].into_iter().enumerate() {
+                let tau = 0.2 * MAX_TORQUE[j];
+                let (got, m) = one_step_rates(q, mode, false, (512, 6), j, tau, &[j]);
+                let (at8, _) = one_step_rates(q, mode, false, ArmConfig::for_armature(mode).solver_iters, j, tau, &[j]);
+                let want = tau * dt / m[0][0];
+                rate[k] = got[0];
+                println!("{} {:?}: rate {:.5} rad/s, model {:.5} (I {:.4} kg m^2); at the arm's iterations {:+.2}%",
+                    JOINT_NAMES[j], mode, got[0], want, m[0][0], 100.0 * (at8[0] / want - 1.0));
+                assert!((got[0] - want).abs() <= 0.01 * want.abs(), "{} {:?}: {} vs {}", JOINT_NAMES[j], mode, got[0], want);
+            }
+            println!("{}: Axis / Isotropic {:.4}", JOINT_NAMES[j], rate[1] / rate[0]);
+        }
+    }
+
+    /// PARITY_SPEC 3.9, the Reviewer's coupling test: zero gravity, the shoulder driven, the elbow
+    /// free (both about z), the rest held. Over one substep from rest both joints move as each
+    /// model's 2x2 mass matrix says, within 1%: `Axis` (the elbow's rotor resists only relative
+    /// rotation), no armature, `Isotropic` (armature on the links' absolute rotation). The elbow's
+    /// lag per unit of shoulder motion, -M21/M22, is printed for the three.
+    #[test]
+    fn a_free_elbow_follows_a_driven_shoulder_as_each_model_predicts() {
+        let q = [0.0, -0.5, -0.8, 0.0, -0.9, 0.0];
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let tau = 30.0;
+        for (name, mode, zero) in [("Axis", ArmArmature::Axis, false), ("no armature", ArmArmature::Axis, true), ("Isotropic", ArmArmature::Isotropic, false)] {
+            let (got, m) = one_step_rates(q, mode, zero, (512, 6), 1, tau, &[1, 2]);
+            let (at8, _) = one_step_rates(q, mode, zero, ArmConfig::for_armature(mode).solver_iters, 1, tau, &[1, 2]);
+            let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+            let want = [m[1][1] * tau * dt / det, -m[1][0] * tau * dt / det];
+            println!("{}: shoulder {:.5} (model {:.5}), elbow {:.5} (model {:.5}) rad/s; elbow/shoulder {:.4}, model {:.4}; at the arm's iterations {:.4}",
+                name, got[0], want[0], got[1], want[1], got[1] / got[0], -m[1][0] / m[1][1], at8[1] / at8[0]);
+            for k in 0..2 {
+                assert!((got[k] - want[k]).abs() <= 0.01 * want[k].abs(), "{} joint {}: {} vs {}", name, k + 1, got[k], want[k]);
+            }
+        }
+    }
+
+    /// Solves m x = b (Gaussian elimination, partial pivoting).
+    fn solve_dense(mut m: Vec<Vec<f32>>, mut b: Vec<f32>) -> Vec<f32> {
+        let n = b.len();
+        for c in 0..n {
+            let p = (c..n).fold(c, |best, r| if m[r][c].abs() > m[best][c].abs() { r } else { best });
+            m.swap(c, p);
+            b.swap(c, p);
+            for r in c + 1..n {
+                let f = m[r][c] / m[c][c];
+                for k in c..n { m[r][k] -= f * m[c][k]; }
+                b[r] -= f * b[c];
+            }
+        }
+        let mut x = vec![0.0f32; n];
+        for r in (0..n).rev() { x[r] = (b[r] - (r + 1..n).map(|k| m[r][k] * x[k]).sum::<f32>()) / m[r][r]; }
+        x
+    }
+
+    /// PARITY_SPEC 3.9: the free arm (nothing held, zero gravity, from rest), a torque on each joint
+    /// in turn for one substep: every joint's rate against the model's 6x6 mass matrix, in both
+    /// modes. At 512 velocity iterations within 1% of the largest rate; the error at the arm's own
+    /// iterations is printed (how much of the armature the default solve realises).
+    #[test]
+    fn the_free_arm_moves_as_its_mass_matrix_says() {
+        let q = [0.3, -0.5, -0.8, 0.4, -0.9, 0.2];
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let all: Vec<usize> = (0..JOINTS).collect();
+        for mode in [ArmArmature::Isotropic, ArmArmature::Axis] {
+            for j in 0..JOINTS {
+                let tau = 0.2 * MAX_TORQUE[j];
+                let (got, m) = one_step_rates(q, mode, false, (512, 6), j, tau, &all);
+                let (at8, _) = one_step_rates(q, mode, false, ArmConfig::for_armature(mode).solver_iters, j, tau, &all);
+                let mut b = vec![0.0f32; JOINTS];
+                b[j] = tau * dt;
+                let want = solve_dense(m, b);
+                let scale = want.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+                let err = |r: &[f32]| r.iter().zip(&want).fold(0.0f32, |a, (x, y)| a.max((x - y).abs())) / scale;
+                println!("{:?}, torque on {}: worst joint error {:.4}% of the largest rate; at the arm's iterations {:.2}%",
+                    mode, JOINT_NAMES[j], 100.0 * err(&got), 100.0 * err(&at8));
+                assert!(err(&got) <= 0.01, "{:?} {}: {:?} vs {:?}", mode, JOINT_NAMES[j], got, want);
+            }
+        }
+    }
+
+    /// PARITY_SPEC 3.9: a small torque held on one joint of the free arm (zero gravity, from rest)
+    /// for 0.1 s: every joint's rate against the model's 6x6 mass matrix, within 2% of the largest
+    /// at the arm's own iterations. Warm-started joint rows converge across substeps what a cold
+    /// first substep doesn't (`the_free_arm_moves_as_its_mass_matrix_says` prints that); the
+    /// remainder at 512 iterations is the motion's own nonlinearity.
+    #[test]
+    fn a_held_torque_moves_the_free_arm_as_its_mass_matrix_says() {
+        let q = [0.3, -0.5, -0.8, 0.4, -0.9, 0.2];
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let steps = 24;
+        for mode in [ArmArmature::Isotropic, ArmArmature::Axis] {
+            for j in 0..JOINTS {
+                let tau = 0.01 * MAX_TORQUE[j];
+                let mut line = format!("{:?}, torque on {:12}:", mode, JOINT_NAMES[j]);
+                for iters in [ArmConfig::for_armature(mode).solver_iters, (512, 6)] {
+                    let mut world = World::with_capacity(16, 16);
+                    let mut arm = Arm::build(&mut world, &ArmConfig { armature: mode, solver_iters: iters }, Vec3::ZERO, q);
+                    world.set_gravity(Vec3::ZERO);
+                    let all: Vec<usize> = (0..JOINTS).collect();
+                    let m = mass_matrix(&world, &arm, &all, mode, mode == ArmArmature::Axis);
+                    let mut b = vec![0.0f32; JOINTS];
+                    b[j] = tau * dt * steps as f32;
+                    let want = solve_dense(m, b);
+                    let mut t = [0.0; JOINTS];
+                    t[j] = tau;
+                    for _ in 0..steps { arm.apply(&mut world, t, dt); world.step(dt); }
+                    let got = arm.rates(&world);
+                    let scale = want.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+                    let err = got.iter().zip(&want).fold(0.0f32, |a, (x, y)| a.max((x - y).abs())) / scale;
+                    line += &format!("  {:?} iters {:6.2}%", iters.0, 100.0 * err);
+                    assert!(err <= 0.02, "{:?} {} at {:?} iterations: {:?} vs {:?}", mode, JOINT_NAMES[j], iters, got, want);
+                }
+                println!("{}", line);
+            }
+        }
+    }
+
+    fn profile(t: f32, w: &World, a: &Arm) -> [f32; JOINTS] {
+        let g = a.gravity_torques(w);
+        std::array::from_fn(|j| g[j] + 0.2 * MAX_TORQUE[j] * (t * (1.0 + 0.7 * j as f32)).sin())
+    }
+
+    /// The arm at its own iterations against 512, built from rest in `mode`, 1 s open loop.
+    fn iteration_error(mode: ArmArmature, iters: u32, torques: impl FnMut(u32, u32, &World, &Arm) -> [f32; JOINTS]) -> (f32, f32, usize) {
+        let q = [0.3, -0.5, -0.8, 0.4, -0.9, 0.2];
+        let (mut lw, mut hw) = (World::with_capacity(16, 16), World::with_capacity(16, 16));
+        let mut la = Arm::build(&mut lw, &ArmConfig { armature: mode, solver_iters: (iters, 6) }, Vec3::ZERO, q);
+        let mut ha = Arm::build(&mut hw, &ArmConfig { armature: mode, solver_iters: (512, 6) }, Vec3::ZERO, q);
+        iteration_rate_error((&mut lw, &mut la), (&mut hw, &mut ha), CONTROL_HZ, torques)
+    }
+
+    /// The scripted sine profile (`torque_profile_hashes`'s) and a fresh random torque each
+    /// control tick (uniform within ±0.2 of each joint's limit, gravity compensated, seeded).
+    fn sine_and_random(mode: ArmArmature, iters: u32) -> [(f32, f32, usize); 2] {
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let sine = iteration_error(mode, iters, |tick, k, w, a| profile((tick * SUBSTEPS + k + 1) as f32 * dt, w, a));
+        let mut rng = crate::rng::Rng::new(0xD6);
+        let kicks: Vec<[f32; JOINTS]> = (0..CONTROL_HZ).map(|_| std::array::from_fn(|j| rng.range(-0.2, 0.2) * MAX_TORQUE[j])).collect();
+        let random = iteration_error(mode, iters, |tick, _, w, a| {
+            let g = a.gravity_torques(w);
+            std::array::from_fn(|j| g[j] + kicks[tick as usize][j])
+        });
+        [sine, random]
+    }
+
+    /// Largest joint rate over 1 s of the sine profile (finite or not), at `iters`.
+    fn sine_top_rate(mode: ArmArmature, iters: u32, zero_rotors: bool) -> f32 {
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let mut w = World::with_capacity(16, 16);
+        let mut a = Arm::build(&mut w, &ArmConfig { armature: mode, solver_iters: (iters, 6) }, Vec3::ZERO, [0.3, -0.5, -0.8, 0.4, -0.9, 0.2]);
+        if zero_rotors { for joint in &a.joints { w.set_d6_armature(joint.id, 0, 0.0); } }
+        let mut top = 0.0f32;
+        for n in 0..CONTROL_HZ * SUBSTEPS {
+            let t = profile((n + 1) as f32 * dt, &w, &a);
+            a.apply(&mut w, t, dt);
+            w.step(dt);
+            for r in a.rates(&w) { top = if r.is_finite() { top.max(r.abs()) } else { f32::INFINITY }; }
+        }
+        top
+    }
+
+    /// PARITY_SPEC 3.9: the sine profile drives wrist_1 into the tool at tick 23. `Axis` stays
+    /// finite and bounded through it at its own iterations and at 512 (it measured 85 rad/s; the
+    /// World's undivided gyroscopic turn took the thin tool link to 1e25), and before the contact
+    /// it follows the 512-iteration arm within 2%.
+    #[test]
+    fn an_axis_arm_stays_bounded_through_a_self_contact() {
+        let own = ArmConfig::for_armature(ArmArmature::Axis).solver_iters.0;
+        for iters in [own, 512] {
+            let top = sine_top_rate(ArmArmature::Axis, iters, false);
+            println!("Axis at {} iterations: largest joint rate {:.2} rad/s", iters, top);
+            assert!(top.is_finite() && top < 200.0, "at {} iterations: {}", iters, top);
+        }
+        let dt = 1.0 / (CONTROL_HZ * SUBSTEPS) as f32;
+        let q = [0.3, -0.5, -0.8, 0.4, -0.9, 0.2];
+        let (mut lw, mut hw) = (World::with_capacity(16, 16), World::with_capacity(16, 16));
+        let mut la = Arm::build(&mut lw, &ArmConfig::for_armature(ArmArmature::Axis), Vec3::ZERO, q);
+        let mut ha = Arm::build(&mut hw, &ArmConfig { armature: ArmArmature::Axis, solver_iters: (512, 6) }, Vec3::ZERO, q);
+        let (_, before, j) = iteration_rate_error((&mut lw, &mut la), (&mut hw, &mut ha), 22, |tick, k, w, a| profile((tick * SUBSTEPS + k + 1) as f32 * dt, w, a));
+        println!("before the first contact: {:.2}% (worst on {})", 100.0 * before, JOINT_NAMES[j]);
+        assert!(before <= 0.02, "{:.2}% on {}", 100.0 * before, JOINT_NAMES[j]);
+    }
+
+    /// Probe (PARITY_SPEC 3.9, open item): a chain of thin links with no armature, the sine
+    /// profile, largest joint rate. Run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn d6_rotors_zeroed_probe() {
+        for iters in [8, 96, 512] {
+            println!("rotors zeroed, {} iterations: largest joint rate {:e} rad/s", iters, sine_top_rate(ArmArmature::Axis, iters, true));
+        }
+    }
+
+    /// Probe (PARITY_SPEC 3.9, the Reviewer's cold-substep check). Run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn d6_iteration_error_probe() {
+        for (mode, iters) in [(ArmArmature::Isotropic, 8), (ArmArmature::Axis, 8), (ArmArmature::Axis, 16), (ArmArmature::Axis, 32), (ArmArmature::Axis, 64), (ArmArmature::Axis, 96)] {
+            for (name, (first, all, j)) in ["sine", "random"].iter().zip(sine_and_random(mode, iters)) {
+                println!("{:?} at {:2} iterations {:6}: first tick {:6.2}%, over 1 s {:6.2}% (worst on {})", mode, iters, name, 100.0 * first, 100.0 * all, JOINT_NAMES[j]);
+            }
+        }
+    }
+
+    /// PARITY_SPEC 3.9: a rollback in `Axis` mode replays hash for hash (the rotors are carried
+    /// state, restored with the rest).
+    #[test]
+    fn an_axis_arm_rolls_back_hash_for_hash() {
+        let mut world = World::with_capacity(16, 16);
+        let mut arm = Arm::build(&mut world, &axis_cfg(), Vec3::ZERO, [0.3, -0.5, -0.8, 0.4, -0.9, 0.2]);
+        let mut t = 0.0f32;
+        for _ in 0..30 { arm.tick(&mut world, |w, a, dt| { t += dt; profile(t, w, a) }); }
+        let saved: Vec<(Isometry, Velocity)> = arm.links.iter().map(|&b| (world.get_body_pose(b), world.get_body_vel(b))).collect();
+        let carried = world.carried_state();
+        let run = |world: &mut World, arm: &mut Arm, t0: f32| -> Vec<[u8; 32]> {
+            let mut tt = t0;
+            (0..30).map(|_| {
+                arm.tick(world, |w, a, dt| { tt += dt; profile(tt, w, a) });
+                world.step_hash()
+            }).collect()
+        };
+        let first = run(&mut world, &mut arm, t);
+        for (&b, &(pose, vel)) in arm.links.iter().zip(&saved) {
+            world.set_body_pose(b, pose);
+            world.set_body_vel(b, vel);
+        }
+        world.restore_carried_state(&carried);
+        assert_eq!(first, run(&mut world, &mut arm, t), "Axis-mode replay diverged");
     }
 
     fn hold(q: [f32; JOINTS], ticks: u32, servo: bool, gravity: bool) -> f32 {

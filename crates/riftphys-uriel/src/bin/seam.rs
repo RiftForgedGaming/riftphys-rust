@@ -5,6 +5,10 @@
 //!                         [--joint butt|v|fillet] [--noise 0.05] [--sample-every 3] [--arc-deg 360]
 //!                         [--operator "pause@6,resume@8,override@10:2:5,resume@12,stop@20"]
 //!     riftphys-uriel-seam --eval [--episodes 10] [--seed 1000] [--seam line|ring] [--joint all]
+//!
+//! Both take `--armature isotropic|axis` (PARITY_SPEC 3.9): `isotropic`, the default, is the arm
+//! URIEL trains on; `axis` carries the drives' reflected inertia on the joints' rotor rows (the
+//! geared-motor model, at 96 velocity iterations), and its scenarios end in `_axis`.
 
 use riftphys_uriel::protocol::Line;
 use riftphys_uriel::seam::{parse_operator, track, JointType, SeamConfig, SeamRollout, SeamShape, TrackStats};
@@ -28,7 +32,7 @@ fn main() {
     let eval = args.iter().any(|a| a == "--eval");
     let out: String = arg(&args, "--out", String::new());
     if out.is_empty() && !eval {
-        eprintln!("usage: riftphys-uriel-seam --out FILE.jsonl [--episodes N] [--seed S] [--seam line|ring] [--joint butt|v|fillet] [--noise X] [--sample-every K] [--arc-deg D] [--operator SCRIPT]\n       riftphys-uriel-seam --eval [--episodes N] [--seed S] [--seam line|ring] [--joint butt|v|fillet|all]");
+        eprintln!("usage: riftphys-uriel-seam --out FILE.jsonl [--episodes N] [--seed S] [--seam line|ring] [--joint butt|v|fillet] [--noise X] [--sample-every K] [--arc-deg D] [--operator SCRIPT] [--armature isotropic|axis]\n       riftphys-uriel-seam --eval [--episodes N] [--seed S] [--seam line|ring] [--joint butt|v|fillet|all] [--armature isotropic|axis]");
         std::process::exit(1);
     }
     let shape = SeamShape::parse(&arg(&args, "--seam", "line".to_string())).expect("--seam line|ring");
@@ -36,6 +40,11 @@ fn main() {
     let joints: Vec<JointType> = if joint_arg == "all" { vec![JointType::Butt, JointType::V, JointType::Fillet] }
         else { vec![JointType::parse(&joint_arg).expect("--joint butt|v|fillet|all")] };
     let mut base = SeamConfig { shape, ..Default::default() };
+    base.arm = riftphys_uriel::arm::ArmConfig::for_armature(match arg(&args, "--armature", "isotropic".to_string()).as_str() {
+        "isotropic" => riftphys_uriel::arm::ArmArmature::Isotropic,
+        "axis" => riftphys_uriel::arm::ArmArmature::Axis,
+        other => panic!("--armature isotropic|axis, not {}", other),
+    });
     base.ring_arc = arg(&args, "--arc-deg", 360.0f32).to_radians();
 
     if eval {
