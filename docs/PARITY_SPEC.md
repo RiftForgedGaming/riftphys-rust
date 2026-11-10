@@ -932,6 +932,10 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     correction only if that step's change over a 2 kHz trial step's is within 25% of the step
     ratio h / h_2k; the others take none. At 2 kHz every coordinate passes. MuJoCo Euler's
     correction follows the same rule on its own trial steps.
+  - **How it was chosen:** the gate is the Reviewer's, proposed before any result. Giving the
+    failing coordinates no correction, rather than the 2 kHz trial's scaled up, was chosen after
+    seeing trajectory 0 unfitted (356 with none against 1233 scaled): before any fit, but on that
+    evidence.
 - **Model mismatch taken out** (240 Hz scored against RiftPhys's own 2 kHz run, the same start
   with no correction, the same parameters; trajectory 0):
   - before contact the error grows to a per-sample loss of 15–70, the left knee's rate 3–6 rad/s
@@ -959,6 +963,62 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
 - **The URDF's "made up" ankle-spring damping (report only, not fitted):** mean loss at 2 kHz
   30.21 with its 10, 28.89 with 1, 28.87 with 0 (de-lagged 41.76, 40.42, 40.40). It carries
   little, and it doesn't explain the de-lagged rise.
+- **Still open: why RiftPhys's ankle rates are smoother than the robot's.** After the contact
+  item (3.4d), since contact dominates everything after the touch, report-only: (a) the same
+  de-lagged comparison for MuJoCo (if it also reads higher, it's the shared model); (b) the rod's
+  damping at 2e3, 2e2 and 0, and the rod rigid (Drake's 2e3 overdamps the loop, about ζ 1.4);
+  (c) the rotors on and off (the knee's 0.093 kg m² reflected smooths exactly these rates).
+
+### 3.4d W4e: implicit compliant contact (drafted 2026-11-10, for review before building)
+
+**Why:** compliant (Hunt–Crossley) contact is explicit today. Its impulse is computed once per
+step from the step-start penetration and the mid-step approach speed, f = k pen (1 + d (−v_n)),
+applied before the iterations, with no normal row (`soft_jn`, solver.rs). At 240 Hz on Cassie's
+light toe links it is the main part of the gap (3.4a): ×100 stiffer it diverges at 240 Hz (a loss
+of 271,260) and not at 2 kHz (460). The Reviewer chose the form (2026-11-10).
+
+**The form: a soft normal row in the velocity solve** (Catto's soft step), not XPBD in the position
+solve: contacts already live in the velocity solve with friction, warm starting, the shock pass
+and W6's bounce, and a soft row keeps the friction cone reading its normal impulse in the same
+iteration; an XPBD contact would bring position-level friction and a second contact path, for
+the same implicit-Euler accuracy.
+- Per compliant contact, with pen0 the step-start penetration (negative when apart, the narrowphase
+  depth less the margin) and v_n the relative normal velocity (B − A, along n, positive
+  separating):
+  - the spring acts at the end-of-step penetration, pen0 − h v_n;
+  - Hunt–Crossley's damping linearised, c = k d max(pen0, 0), so the linear part is unconditionally
+    stable;
+  - in soft-step terms γ = 1 / (h (c + h k)) and β = h k / (c + h k): the row targets
+    v_n,end = β pen0 / h − γ λ, so each iteration takes Δλ = m_soft (β pen0 / h − v_n − γ λ_acc),
+    m_soft = 1 / (1 / m_eff + γ), with the accumulated λ clamped ≥ 0. At rest (v_n = 0) it gives
+    λ = h k pen0: the spring's force over the step;
+  - a speculative contact (pen0 < 0) has c = 0 and engages only if its end-of-step penetration is
+    positive (it arrives within the step): the arrival case.
+- **Must-haves:** no Baumgarte bias and no slop on compliant contacts (the spring is the
+  correction; otherwise it is corrected twice), and no position-level or pseudo-velocity
+  correction for them; compliant contacts stay out of W6's bounce pass and the shock pass (as now);
+  friction reads the soft row's accumulated λ; the row starts cold (no warm start, so no new
+  carried state); rigid contacts untouched, bit for bit (the existing goldens).
+- **The explicit form kept as an option** (`MatPairProps::compliant_explicit`), off by default,
+  only if the cube tosses' compliant result can't be restated (below).
+
+**Tests:**
+- static rest at F / k within 1% at 60 Hz, 240 Hz and 2 kHz;
+- a drop at 2 kHz matching Hunt–Crossley's restitution for d (e from d ≈ 3(1 − e) / (2 v_in))
+  within a few %, reported at 240 Hz;
+- a 0.15 kg toe link on a hinge landing at 2 m/s, with k at ×1 and ×100: bounded at 240 Hz (the
+  explicit form explodes);
+- Cassie's trajectory 0 at 240 Hz scored against its own 2 kHz run, before and after;
+- the existing compliant tests (`compliant_contact_test.rs`) and the goldens.
+
+**What moves:**
+- everything fitted with compliant contact: the cube tosses' compliant fit (22be79e,
+  `riftphys_cube_fit_compliant.json`) used the explicit form, and 22be79e is in the URIEL bump
+  list. The item reruns that fit and restates P2's compliant line (held out, D2's rule against
+  Drake and Bullet). If the implicit form can't hold that result, the explicit one stays as the
+  option above for the cubes and the implicit one is Cassie's, and the spec says so;
+- no URIEL workload uses compliant contact (none sets a pair's stiffness);
+- the reality crate's scene replays (`scene.rs`) where a log sets stiffness.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
