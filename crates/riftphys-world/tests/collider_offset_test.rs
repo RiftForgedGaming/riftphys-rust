@@ -154,3 +154,53 @@ fn a_bar_rests_level_on_two_offset_spheres() {
     }
 }
 
+
+/// A 10 kg body on one 1 mm sphere at its COM, on compliant ground (Drake's Cassie stiffness,
+/// 9400 N/m): it rests at F / k = 10.4 mm deep, ten radii, with the sphere's centre well inside
+/// the floor box. Before the inside-box fix the contact lost force past the surface and then
+/// vanished.
+#[test]
+fn a_small_sphere_rests_at_force_over_stiffness_far_below_its_radius() {
+    let (k, m, g, r) = (9400.0f32, 10.0f32, 9.81f32, 0.001f32);
+    let mut w = World::with_capacity(4, 4);
+    w.set_gravity(Vec3::new(0.0, -g, 0.0));
+    floor(&mut w, MaterialId::Concrete);
+    let mut p = w.pair_props(MaterialId::Rubber, MaterialId::Concrete);
+    p.stiffness = k;
+    p.dissipation = 3.0;
+    w.set_pair_props(MaterialId::Rubber, MaterialId::Concrete, p);
+    let (b, _) = body(&mut w, iso(Vec3::new(0.0, r, 0.0), Quat::IDENTITY), Velocity::default(), Vec3::splat(0.05), m);
+    w.add_collider(b, Shape::Sphere { r }, material(MaterialId::Rubber));
+    let hz = 1000.0f32;
+    let mut lowest = 0.0f32;
+    for _ in 0..(3.0 * hz) as usize {
+        w.step(1.0 / hz);
+        lowest = lowest.min(w.get_body_pose(b).pos.y - r);
+    }
+    let sink = r - w.get_body_pose(b).pos.y;
+    let want = m * g / k;
+    assert!((sink / want - 1.0).abs() < 0.02, "sank {:.5} m, F / k = {:.5} m", sink, want);
+    assert!(lowest > -2.0 * want, "went {:.4} m deep on the way", -lowest);
+}
+
+/// The lever scene with gravity, run 2 s past the impact: the offset sphere (rigid contact)
+/// never goes more than 1 mm beyond the rigid contact's 5 mm position slop into the floor. Before the inside-box fix it sank under the
+/// slop until its centre crossed the face, then fell through.
+#[test]
+fn an_offset_sphere_stays_on_the_floor_after_its_impact() {
+    for hz in [60.0f32, 240.0] {
+        let mut w = World::with_capacity(4, 4);
+        w.set_gravity(Vec3::new(0.0, -9.81, 0.0));
+        floor(&mut w, MaterialId::Concrete);
+        let (rx, sr) = (0.3f32, 0.001f32);
+        let (b, _) = body(&mut w, iso(Vec3::new(0.0, sr + 0.002, 0.0), Quat::IDENTITY), Velocity { lin: Vec3::new(0.0, -1.0, 0.0), ang: Vec3::ZERO }, Vec3::new(0.35, 0.02, 0.02), 1.0);
+        w.add_collider_at(b, iso(Vec3::new(rx, 0.0, 0.0), Quat::IDENTITY), Shape::Sphere { r: sr }, material(MaterialId::Rubber));
+        let mut lowest = 0.0f32;
+        for _ in 0..(2.0 * hz) as usize + 4 {
+            w.step(1.0 / hz);
+            let p = w.get_body_pose(b);
+            lowest = lowest.min((p.pos + p.rot * Vec3::new(rx, 0.0, 0.0)).y - sr);
+        }
+        assert!(lowest > -0.006, "{} Hz: the sphere went {:.2} mm into the floor", hz, -lowest * 1e3);
+    }
+}

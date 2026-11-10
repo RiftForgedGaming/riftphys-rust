@@ -545,30 +545,38 @@ fn collide_box_sphere(
     contact_dist: f32,
 ) -> Option<ContactManifold> {
     let p_local = fin_v(box_xf.rot.conjugate() * (sphere_center - box_xf.pos));
-    let mut closest_local = p_local.clamp(-box_extents, box_extents);
-    let mut inside = false;
+    let closest_local = p_local.clamp(-box_extents, box_extents);
+    let r = fin(sphere_r.max(0.0));
+    let allowed = fin(r + contact_dist);
 
     if closest_local == p_local {
-        inside = true;
-        let abs_p = p_local.abs();
-        let dist_to_face = box_extents - abs_p;
-
-        if dist_to_face.x < dist_to_face.y && dist_to_face.x < dist_to_face.z {
-            closest_local.x = if p_local.x > 0.0 { box_extents.x } else { -box_extents.x };
+        // The centre is inside the box: push it out through the nearest face, at any depth.
+        // Measured from the face point, as outside, the normal pointed into the box and the
+        // penetration shrank with depth until the contact vanished past r + contact_dist, so a
+        // compliant contact sinking a small sphere's centre under the surface lost its force and
+        // then the contact (the RiftPhys Reviewer's finding, PARITY_SPEC W4).
+        let dist_to_face = box_extents - p_local.abs();
+        let (axis, depth) = if dist_to_face.x < dist_to_face.y && dist_to_face.x < dist_to_face.z {
+            (Vec3::X * if p_local.x > 0.0 { 1.0 } else { -1.0 }, dist_to_face.x)
         } else if dist_to_face.y < dist_to_face.z {
-            closest_local.y = if p_local.y > 0.0 { box_extents.y } else { -box_extents.y };
+            (Vec3::Y * if p_local.y > 0.0 { 1.0 } else { -1.0 }, dist_to_face.y)
         } else {
-            closest_local.z = if p_local.z > 0.0 { box_extents.z } else { -box_extents.z };
-        }
+            (Vec3::Z * if p_local.z > 0.0 { 1.0 } else { -1.0 }, dist_to_face.z)
+        };
+        let normal = norm_or(box_xf.rot * axis, box_xf.rot * Vec3::Y);
+        let face_world = fin_v(sphere_center + normal * depth);
+        let penetration = fin(allowed + depth.max(0.0));
+        // Halfway between the face and the sphere's deepest point, as outside
+        let position = fin_v((face_world + (sphere_center - normal * r)) * 0.5);
+        let mut manifold = ContactManifold { normal, ..Default::default() };
+        manifold.push(ContactPoint { position, normal, penetration });
+        return Some(manifold);
     }
 
     let closest_world = fin_v(box_xf.pos + box_xf.rot * closest_local);
     let delta = sphere_center - closest_world;
     let dist2 = delta.length_squared();
     let dist = dist2.sqrt();
-
-    let r = fin(sphere_r.max(0.0));
-    let allowed = fin(r + contact_dist);
 
     if dist > allowed {
         return None;
@@ -577,12 +585,7 @@ fn collide_box_sphere(
     let raw_n = if dist > 1.0e-6 { delta / dist } else { box_xf.rot * Vec3::Y };
     let normal = norm_or(raw_n, box_xf.rot * Vec3::Y);
     let penetration = fin(allowed - dist);
-
-    let position = if inside {
-        fin_v(closest_world)
-    } else {
-        fin_v((closest_world + (sphere_center - normal * r)) * 0.5)
-    };
+    let position = fin_v((closest_world + (sphere_center - normal * r)) * 0.5);
 
     let mut manifold = ContactManifold { normal, ..Default::default() };
     manifold.push(ContactPoint { position, normal, penetration });
