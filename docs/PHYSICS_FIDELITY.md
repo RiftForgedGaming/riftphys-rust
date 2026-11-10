@@ -382,5 +382,78 @@ that the bump should include.
 - Golden hashes are release-build values. The 240 Hz pile prints 1a15ce00411301fa in release
   and d3bdc0fa3f0257cf in debug. This is open in PARITY_SPEC 3.9.
 
-**Not at parity yet:** the biped. It needs P4 (Cassie jumping impacts, W4a and W4) and P5. P5's
-fixes, W1 and W2, are built; its lever-arm part waits on whether P4 shows it.
+### Biped, 2026-11-10
+
+**Biped: at parity,** on real-world data, with MuJoCo setting the bar. The workload is URIEL's
+biped at its 240 Hz and (8, 6) iterations. All five criteria apply to it.
+- **P1, P3:** met, as for the arm.
+- **P2, restated:** the cube tosses' compliant fit, with contact now implicit (W4e, 9f60083),
+  holds out at 14.0% / 16.9° / e_q 0.28. That's no worse than Drake (13.5%); the explicit form
+  scored 13.2% / 17.1° / 0.29 and is dropped. The rigid cube tosses are unchanged.
+- **P4:** Cassie jumping (Acosta et al.), 22 jumps, held out on fixed folds, against MuJoCo rerun on
+  Agility's model (decision D4). This was failed at 7c1037c: +17.40 behind MuJoCo at 240 Hz. The
+  rerun on 61a5db0 follows W4f–W4h (PARITY_SPEC 3.4m):
+
+  | | RiftPhys | MuJoCo | difference (SE) | verdict |
+  |---|---|---|---|---|
+  | 240 Hz, (8, 6): the pass | 28.90 | 48.14 (Euler) | −19.24 (3.95) | better; lower on 20 of 22 |
+  | 2 kHz, beside it | 27.49 | 31.86 (RK4) | −4.37 (0.78) | better |
+
+  - The pass doesn't depend on an unconverged solver: with the fitted parameters fixed, 29.54 at
+    320 iterations.
+  - It doesn't depend on the rate-specific fit either. At 240 Hz with the 2 kHz parameters it's
+    −2.62 (SE 1.45): level, no worse. Fitting at 240 Hz adds 16.6. The 240 Hz fit puts damping at
+    zero and lets the implicit contact's step supply it.
+  - **For URIEL: contact parameters are fitted at the workload's rate.** The 240 Hz parameters
+    don't carry to 2 kHz (+8.73 there).
+- **P5:** W1 and W2 built. Its lever-arm condition, stated before any MuJoCo run, isn't shown on
+  the 22 runs at 240 Hz and (8, 6): no hinge past its URDF limit, joint anchor gaps at most
+  0.80 mm, the achilles rods' row residual at most 0.0013 mm. So the W5 lever-arm fix isn't needed.
+- **The engine changes behind P4:**
+  - **W4f:** the geared rotor in the position pass;
+  - **W4g:** the armature block solve;
+  - **W4h:** closed loops join the block.
+
+  Unfitted at (8, 6) against the data they went 65.0 → 102.2 → 123.1 → 53.66, with 49.3
+  converged and MuJoCo Euler 48.4. They change only joints with per-axis armature
+  (`set_d6_armature`): Cassie, and the arm's `Axis` option, which is now close to converged at 8
+  iterations (teacher replay 18.6–30.1% → 0.19–0.81%). No URIEL workload uses per-axis armature.
+- **Cost:** Cassie at 240 Hz runs at 2.84× its cost before W4f, against the 2× budget, a missed
+  gate. Follow-up PARITY_SPEC 3.4l. It's required before any URIEL workload adopts per-axis
+  armature.
+
+**Commits since 2b98bb3 for the argref bump:** the arm and drone report's (above, through
+1f57654), then, oldest first:
+- 6e06b96: a minimal URDF loader (W4a);
+- b471f09: anchored, damped distance joints, the achilles rod (W4c);
+- d6a1fa1: colliders offset from the body's COM (W4d);
+- b4c3c52: a sphere sunk into a box is pushed out (the review's fix);
+- ebf6667: damped springs under PBD, soft limits keep their damper, normals flip on collider
+  positions (the review's fixes);
+- 9f60083: implicit compliant contact (W4e);
+- d21ba36: the geared rotor in the position pass (W4f);
+- 3f23a8e: the armature block solve (W4g);
+- 61a5db0: closed loops join the armature block (W4h);
+- and this report's commit;
+- also the Cassie replay, fit and MuJoCo-reference tooling, and PARITY_SPEC records: f781e2a,
+  5306e90, e402873, acefb0c, 10af5a4, 8d6165c, e50459e, 39f094d, ab09bdf, afd5499, 06cdd3f,
+  85870a5, 79affba, 7056c43, 47b2e71, 0aab9c7, 18a5c2b, d8465cb, 3a6a35c, 3768f43, 7c1037c,
+  902340a, e3de763.
+
+**Golden hashes:**
+- None moved from W4c through W4h: `joint_bits`, W6's hashes, `distance_bits`, the seam SHA-256
+  and the rigid cube tosses are bit-identical, and the URIEL library passes 31 of 31.
+- New goldens: `distance_bits_test` (b471f09).
+- The compliant cube-toss refit (P2, restated) is a fit, not a golden.
+- `w6_jointed_bits` still has 9601157's values.
+
+**Open items carried (owner: RiftPhys Orchestration unless named):**
+- the debug/release hash difference on the 240 Hz pile (PARITY_SPEC 3.9);
+- sphere–triangle contact behind the plane (3.4c);
+- the armature block's cost (3.4l);
+- W6b, the main solve on impact steps (3.6b);
+- W6c, the bounce passes under 2 ms on the 20-box pile;
+- AT_REST R5, rest depth after a hard landing;
+- the rotors-zeroed divergence of the thin-link arm (3.9);
+- report-only leftovers from P4: the component runs with fitted parameters, and (8, 6) against
+  320 for the rod's stretch and the joint residuals.

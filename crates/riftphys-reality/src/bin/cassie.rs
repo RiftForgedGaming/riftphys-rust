@@ -819,6 +819,60 @@ fn rod_stretch() -> Result<(), String> {
     Ok(())
 }
 
+/// P5's remaining condition (PARITY_SPEC 3.4a, set before the MuJoCo runs): the 22 main-line runs
+/// at 240 Hz, (8, 6), each with its fold's fitted contact (from the P4 fit file). Shown if any has a
+/// hinge past its URDF limit by more than 0.01 rad, or a joint row's position error above 1 mm.
+fn p5(fits: &str) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fits).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let (mut lim, mut drop, mut gap) = ((0.0f64, String::new(), 0usize), (0.0f64, String::new(), 0usize), (0.0f64, String::new(), 0usize));
+    let (mut rres, mut rlit) = ((0.0f64, String::new(), 0usize), (0.0f64, String::new(), 0usize));
+    for f in doc["folds"].as_array().ok_or("no folds")? {
+        let p = Params { k: f["k"].as_f64().unwrap() as f32, d: f["d"].as_f64().unwrap() as f32, mu: f["mu"].as_f64().unwrap() as f32, ..Params::default() };
+        for j in f["held_out"].as_array().unwrap() {
+            let j = j.as_u64().unwrap() as usize;
+            let t = cassie::load_traj(&cassie::data_dir(), j)?;
+            let r = cassie::replay(&urdf, &t, &p, 240.0, cassie::Line::Main)?.p5;
+            println!("jump {:2}: limit excess {:.4} rad ({}), dropped-limit excess {:.4} rad ({}), joint gap {:.4} mm ({}), rod residual {:.5} mm, rod literal {:.5} mm ({})",
+                     j, r.limit.0, r.limit.1, r.dropped_limit.0, r.dropped_limit.1, r.gap.0 * 1e3, r.gap.1, r.rod_residual.0 * 1e3, r.rod_literal.0 * 1e3, r.rod_literal.1);
+            if r.rod_residual.0 > rres.0 { rres = (r.rod_residual.0, r.rod_residual.1.clone(), j); }
+            if r.rod_literal.0 > rlit.0 { rlit = (r.rod_literal.0, r.rod_literal.1.clone(), j); }
+            if r.limit.0 > lim.0 { lim = (r.limit.0, r.limit.1, j); }
+            if r.dropped_limit.0 > drop.0 { drop = (r.dropped_limit.0, r.dropped_limit.1, j); }
+            if r.gap.0 > gap.0 { gap = (r.gap.0, r.gap.1, j); }
+        }
+    }
+    println!("worst over the 22: limit excess {:.4} rad ({}, jump {}); joint gap {:.4} mm ({}, jump {}); report-only, dropped (sprung) limits {:.4} rad ({}, jump {})",
+             lim.0, lim.1, lim.2, gap.0 * 1e3, gap.1, gap.2, drop.0, drop.1, drop.2);
+    println!("rods: row residual worst {:.5} mm ({}, jump {}); literal |stretch - compliance F| worst {:.5} mm ({}, jump {})",
+             rres.0 * 1e3, rres.1, rres.2, rlit.0 * 1e3, rlit.1, rlit.2);
+    let rod_err = rres.0.max(rlit.0);
+    println!("P5's lever-arm condition: {}", if lim.0 > 0.01 || gap.0 > 1e-3 || rod_err > 1e-3 { "SHOWN" } else { "not shown (P5 met)" });
+    Ok(())
+}
+
+/// The Reviewer's cross-rate check for 3.4m: each fold's parameters from `fits` (fitted at one
+/// rate), replayed held out at `hz` (main and sensitivity lines), written as a pairing file.
+fn cross(fits: &str, hz: f64, out: &str) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fits).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for f in doc["folds"].as_array().ok_or("no folds")? {
+        let p = Params { k: f["k"].as_f64().unwrap() as f32, d: f["d"].as_f64().unwrap() as f32, mu: f["mu"].as_f64().unwrap() as f32, ..Params::default() };
+        for j in f["held_out"].as_array().unwrap() {
+            let j = j.as_u64().unwrap() as usize;
+            let t = cassie::load_traj(&cassie::data_dir(), j)?;
+            let main = cassie::replay(&urdf, &t, &p, hz, cassie::Line::Main)?;
+            let sens = cassie::replay(&urdf, &t, &p, hz, cassie::Line::Sensitivity)?;
+            rows.push(serde_json::json!({ "jump": j, "fold": f["fold"], "main": cassie::loss(&main.states, &t.x), "sensitivity": cassie::loss(&sens.states, &t.x) }));
+        }
+    }
+    let mean = rows.iter().map(|r| r["main"].as_f64().unwrap()).sum::<f64>() / rows.len() as f64;
+    println!("{} Hz with the parameters fitted in {}: held-out main mean {:.2}", hz, fits, mean);
+    std::fs::write(out, serde_json::to_string_pretty(&serde_json::json!({ "hz": hz, "params_from": fits, "jumps": rows })).unwrap()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -829,6 +883,8 @@ fn main() {
         Some("--diagnose") => diagnose(),
         Some("--diag-inputs") => diag_inputs(),
         Some("--cost") => cost(),
+        Some("--cross") => match (args.get(2), args.get(3).and_then(|a| a.parse().ok()), args.get(4)) { (Some(f), Some(hz), Some(o)) => cross(f, hz, o), _ => Err("usage: --cross fits.json hz out.json".into()) },
+        Some("--p5") => p5(&args.get(2).cloned().unwrap_or_default()),
         Some("--rod-stretch") => rod_stretch(),
         Some("--split") => split(),
         Some("--position-pass") => position_pass(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(4), args.get(4).map(String::as_str) == Some("links")),

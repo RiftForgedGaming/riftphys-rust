@@ -604,6 +604,42 @@ pub struct Replay {
     pub trial: (f64, f64, f64),
     /// Total mechanical energy at the start and after 10, 25 and 50 ms (J; `Cassie::energy`).
     pub energy: [f64; 4],
+    /// P5's check (PARITY_SPEC 3.4a, set before the MuJoCo runs), over every step: the largest
+    /// excess of a hinge past its URDF limit among the limits the model holds (rad, joint), the same
+    /// for the sprung joints whose limits the model dropped (rad, joint), and the largest joint
+    /// anchor gap between a hinge's parent and child frames (m, joint).
+    pub p5: P5Check,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct P5Check {
+    pub limit: (f64, String),
+    pub dropped_limit: (f64, String),
+    pub gap: (f64, String),
+    /// The achilles rods (the Reviewer, 2026-11-10: a rod is a joint row too): the row's own
+    /// residual per step, |C + alpha~ lambda + gamma~ dC| (m; C = length - rest, alpha~ =
+    /// compliance / h^2, gamma~ = compliance damping / h, dC the length's change over the step),
+    /// and the literal |stretch - compliance F| with F = -lambda / h^2 the row's whole force
+    /// (spring and damper; it differs from the residual by compliance x the damper's force).
+    pub rod_residual: (f64, String),
+    pub rod_literal: (f64, String),
+}
+
+impl Cassie {
+    /// Updates `chk` with this pose's hinge-limit excesses and joint anchor gaps.
+    pub fn p5_check(&self, chk: &mut P5Check) {
+        for j in &self.urdf.joints {
+            if j.kind == urdf::JointType::Fixed { continue; }
+            let (Some(fp), Some(fc)) = (self.model.link_frame(&self.world, &j.parent), self.model.link_frame(&self.world, &j.child)) else { continue; };
+            let gap = (fp.mul(&j.origin).pos - fc.pos).length();
+            if gap > chk.gap.0 { chk.gap = (gap, j.name.clone()); }
+            if let (Some((lo, hi)), Some(q)) = (j.limit, urdf::joint_angle(&self.world, &self.model, &self.urdf, &j.name)) {
+                let ex = (lo - q).max(q - hi).max(0.0);
+                let slot = if self.model.dropped_limits.contains(&j.name) { &mut chk.dropped_limit } else { &mut chk.limit };
+                if ex > slot.0 { *slot = (ex, j.name.clone()); }
+            }
+        }
+    }
 }
 
 /// The angular impulse (N m s) of the inputs' first-order hold over [a, b] for actuator `j`, on
@@ -700,12 +736,27 @@ pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr:
     let mut first_contact = None;
     let mut energy = [c.energy(p), f64::NAN, f64::NAN, f64::NAN];
     let marks = [0.010, 0.025, 0.050];
+    let mut p5 = P5Check::default();
     for k in 0..steps {
         let (a, b) = (t0 + k as f64 * h, t0 + (k + 1) as f64 * h);
+        let len0 = c.rod_lengths();
         c.apply_inputs(t, a, b);
         c.world.step(h as f32);
         times.push(b - t0);
         states.push(c.state());
+        c.p5_check(&mut p5);
+        let len1 = c.rod_lengths();
+        let (h32, cmp, dmp) = (h as f32 as f64, p.rod_compliance as f64, p.rod_damping as f64);
+        for side in 0..2 {
+            let lam = c.world.distance_joint_lambda(c.rods[side]) as f64;
+            let cc = len1[side] - ACHILLES_LENGTH as f32 as f64;
+            let (alpha, gamma) = (cmp / (h32 * h32), cmp * dmp / h32);
+            let residual = (cc + alpha * lam + gamma * (len1[side] - len0[side])).abs();
+            let literal = (cc + alpha * lam).abs();
+            let name = if side == 0 { "rod_left" } else { "rod_right" };
+            if residual > p5.rod_residual.0 { p5.rod_residual = (residual, name.to_string()); }
+            if literal > p5.rod_literal.0 { p5.rod_literal = (literal, name.to_string()); }
+        }
         if first_contact.is_none() && c.toe_heights().iter().any(|&z| z <= p.toe_r as f64) { first_contact = Some(b - t0); }
         for (m, at) in marks.iter().enumerate() {
             if energy[m + 1].is_nan() && b - t0 >= at - 1e-9 { energy[m + 1] = c.energy(p); }
@@ -724,7 +775,7 @@ pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr:
         for j in 0..4 { r[j] /= n; }
         r
     }).collect();
-    Ok(Replay { states: out, first_contact, trial: trial_info, energy })
+    Ok(Replay { states: out, first_contact, trial: trial_info, energy, p5 })
 }
 
 #[cfg(test)]

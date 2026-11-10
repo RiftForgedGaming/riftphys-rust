@@ -551,6 +551,12 @@ impl World {
         self.joints.set_distance_damping(id, damping);
     }
 
+    /// A distance joint's position-level multiplier accumulated over the last step's position
+    /// pass (N s^2; the row's force is -lambda / dt^2). Read-only, for checks.
+    pub fn distance_joint_lambda(&self, id: JointId) -> f32 {
+        match self.joints.kinds().get(id.0 as usize) { Some(JointKind::Distance(j)) => j.lambda_acc, _ => 0.0 }
+    }
+
     pub fn set_gravity(&mut self, g: Vec3) {
         self.gravity = g;
         self.gravity_proc = GravitySpec::Uniform { g: [g.x, g.y, g.z] };

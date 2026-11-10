@@ -67,9 +67,12 @@ The comparison rule, used wherever another engine is the reference:
 Status against the definition:
 - **Arm:** P1 and P3 are met (P3 under decision D8, 2026-11-09). This is arm parity for the
   `Isotropic` default at (8, 6).
-- **Biped:** P1, P2 and P3 are met (P3 as for the arm). **P4 is not met at the workload's 240 Hz**
-  (2026-11-10: +17.4 behind MuJoCo held out; at 2 kHz RiftPhys is ahead by 2.3; 3.4f). P5's
-  remaining condition waits on P4. Not at parity.
+- **Biped:** P1, P2 and P3 are met (P3 as for the arm). P4 failed at the workload's 240 Hz at
+  7c1037c (+17.4 behind MuJoCo held out; 3.4f). **After W4f–W4h, the rerun on 61a5db0 meets it:**
+  −19.2 (SE 4.0) ahead of MuJoCo Euler held out at 240 Hz and (8, 6), and −4.4 (SE 0.8) ahead of
+  RK4 at 2 kHz (3.4m). P5's remaining condition, checked on the same runs, isn't shown, so P5 is
+  met. **Biped parity, pending the Reviewer's review of 3.4m** (real-world data, with MuJoCo
+  setting the bar).
 - **Drone:** P1 is met, restitution included (W6, eee2e57; decision D3 made it required). Free
   fall, rotation, collision, resting and restitution all pass at 60 Hz (2026-11-10, on f2b2004).
   This is drone parity.
@@ -1693,6 +1696,99 @@ Target: at most 2× on Cassie. It's required before any URIEL workload adopts ax
   hashes.
 - **(b) Sparse assembly by shared body.** Its float summation order may differ, so it's gated at
   1e-6 against (a), not on bits.
+
+### 3.4m The P4 rerun (2026-11-10, on 61a5db0)
+
+**P4 failed at the biped workload's 240 Hz at 7c1037c** (3.4f: RiftPhys 65.53 against MuJoCo
+Euler 48.14 held out, +17.40, SE 3.74; D9 outcome (b)). This rerun follows three engine changes,
+under unchanged criteria (3.4a, 3.4e, D2, D9: the same folds, fit, pairing and outcomes):
+- **W4f (d21ba36):** the geared rotor in the position pass;
+- **W4g (3f23a8e):** the armature block solve;
+- **W4h (61a5db0):** closed loops join the block.
+
+Cassie at 240 Hz, (8, 6), unfitted at Table VI's values, against the data:
+
+| through the changes | before W4f | W4f | W4g | W4h | converged (W4f–W4h) | MuJoCo Euler |
+|---|---|---|---|---|---|---|
+| 240 Hz, (8, 6) | 65.0 | 102.2 | 123.1 | **53.66** | 49.3 | 48.4 |
+
+Each change made the engine more correct and needed more convergence, until W4h supplied it.
+
+**The gate history:**
+- W4f: the criteria in 3.4h, with test (g) restated at review (240 Hz against 8 kHz was infeasible
+  for any first-order integrator).
+- W4g: 3.4j's gates. Its "within 2× of the converged figure" gates on Cassie were too loose for
+  P4 (the Reviewer's own correction): (8, 24) met both and still sat at 64.4 against the data.
+- W4h: 3.4k's single deciding gate replaced them, set before the build: within 10% of converged
+  against the data, ≤ 54.2. It got 53.66.
+- 3.4j's cost gate (2×) was missed by W4h (2.84× on Cassie). It's recorded as missed, not waived,
+  with follow-up 3.4l.
+
+**The run:**
+- **RiftPhys:** `riftphys-cassie --fit 240 200` and `--fit 2000 200` on 61a5db0, the stated folds,
+  seed 1. Per-jump results are in `riftphys-parity-data/cassie_results/riftphys_{240,2000}hz.json`,
+  logs in `p4_61a5db0_fit_*.log`. 7c1037c's files are kept in `cassie_results/p4_7c1037c/`.
+- **MuJoCo:** reused unchanged from 7c1037c (`mujoco_euler_240hz.json`, `mujoco_euler_2000hz.json`,
+  `mujoco_rk4_2000hz.json`). Its fits don't depend on RiftPhys.
+- **The pairing:** `tools/parity/cassie_pair.py`, under D2: per jump, the bootstrap over the 22
+  (10,000 resamples, seed 1), no worse when the mean difference ≤ 2 SE.
+
+| | RiftPhys, held out | MuJoCo, held out | difference (SE; 95%) | verdict |
+|---|---|---|---|---|
+| **240 Hz, (8, 6): the pass** | **28.90** | 48.14 (Euler; RK4 diverges at 240 Hz) | **−19.24 (3.95; [−27.48, −12.06])** | **no worse, and better: P4 met** |
+| 240 Hz, sensitivity line | 28.89 | 48.14 | −19.25 (3.95) | better |
+| 2 kHz, (8, 6), beside it | 27.49 | 31.86 (RK4; Euler 31.90) | −4.37 (0.78; [−5.88, −2.85]) | better |
+| 2 kHz, sensitivity line | 27.48 | 31.86 | −4.38 (0.77) | better |
+
+- RiftPhys is lower on 20 of the 22 jumps at both rates. By day at 240 Hz: Jan 27 −31.3, Feb 12 −12.3;
+  at 2 kHz: −3.1 and −5.1.
+- **D9 outcome (a): a pass at 240 Hz.** 2 kHz passes too.
+- **The pass doesn't depend on an unconverged solver.** With the 240 Hz folds' parameters fixed,
+  the held-out mean is 28.90 / 29.39 / 29.53 / 29.54 at (8, 6) / (20, 20) / (80, 80) /
+  (320, 320).
+- **The fits (an observation):**
+  - At 240 Hz every fold's damping landed on the lower bound (d = 0), with k 140–328 kN/m and μ
+    0.32–0.42; in-sample k 357 kN/m, μ 0.37, loss 28.54.
+  - At 2 kHz: k 26–33 kN/m, d 1.10–1.33 s/m, μ 0.37–0.45; in-sample k 28 kN/m, d 1.08, μ 0.40,
+    loss 27.16.
+  - At 240 Hz the fit stiffens the contact and takes its dissipation from the implicit contact's
+    own step (W4e), not from the model's damping. So the parameters are rate-specific, as
+    MuJoCo's are: its 240 Hz Euler fit spread 468–18,342 in stiffness.
+  - For URIEL: contact parameters are fitted at the rate the workload runs.
+  - **How much the pass leans on the rate-specific fit (the Reviewer's check, report-only;
+    `riftphys-cassie --cross`):** each fold's parameters, fitted at one rate, held out at the
+    other, paired the same way.
+    - (a) 240 Hz with the 2 kHz folds' parameters (k 26–33 kN/m, d 1.10–1.33): 45.52 against
+      MuJoCo Euler's 48.14, **−2.62 (SE 1.45; 95% [−5.38, +0.34]): no worse**, level, lower on 17 of
+      22 (the sensitivity line the same).
+    - (b) 2 kHz with the 240 Hz folds' parameters: 40.59 against MuJoCo RK4's 31.86, +8.73 (SE
+      1.96): worse.
+    - **(a) holds, so the 240 Hz pass doesn't depend on the rate-specific fit.** With contact
+      fitted at 2 kHz, physically damped, RiftPhys at 240 Hz is still no worse than MuJoCo fitted
+      at its own 240 Hz. Fitting at 240 Hz adds a further 16.6 (45.52 → 28.90) by letting implicit
+      Euler supply the contact's dissipation. The 240 Hz parameters don't carry to 2 kHz, which is
+      (b). The verdict stands either way: both engines were fitted at their own rate.
+- **Velocity iterations with contact (an observation, from the review):** against its own 2 kHz
+  run, unfitted, Cassie gives 15.49 at (8, 6) and 12.13 at (80, 6), 28% apart. Flight is 2%. If a
+  later run fails narrowly, this is the first place to look.
+- **Cost:** W4h runs Cassie at 166.5 ms per simulated second at 240 Hz (2.84× its cost before
+  W4f; 3.4l). Against option (2), W4h reaches 53.7 unfitted at (8, 6) for 166 ms, where
+  Gauss–Seidel sweeps under W4g reached 55.9 at (8, 48) for 588 ms. No URIEL workload uses axis
+  armature, so none pays it.
+- **P5's remaining condition** (3.4a, set before the MuJoCo runs; `riftphys-cassie --p5`): the
+  22 main-line runs at 240 Hz and (8, 6), each with its fold's fitted contact, checked at every
+  step. No hinge goes past its URDF limit (largest excess 0.0000 rad; the sprung joints' dropped
+  limits also 0.0000, report-only). The largest joint anchor gap is 0.80 mm (ankle_joint_right,
+  jump 12), under 1 mm. **The achilles rods** are joint rows too (the Reviewer):
+  - the row's own residual |C + α̃λ + γ̃ΔC| is at most 0.0013 mm (rod_left, jump 3);
+  - the literal |stretch − compliance·F|, with F = −λ/h² the row's whole force, is at most 0.151 mm
+    (rod_right, jump 10). It differs from the residual by compliance × the damper's force.
+  Both are under 1 mm. Not shown, so **P5 is met**, and the lever-arm fix (3.5, W5) isn't
+  needed for parity.
+- **Wording (the SR&ED Bookkeeper, agreed):** "real-world data, with MuJoCo setting the bar", not
+  plain real-world parity.
+- **Leftovers (report-only, after this):** the fitted-parameter component runs, and (8, 6)
+  against 320 for the rod's stretch and the joint residuals.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
