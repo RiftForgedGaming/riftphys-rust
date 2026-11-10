@@ -694,6 +694,19 @@ pub fn replay_with(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line, corr:
 mod tests {
     use super::*;
 
+    /// The folds the fit used (PARITY_SPEC 3.4a) are what the procedure stated in f781e2a gives:
+    /// seed 1, stratified by day, every one of the 22 jumps once.
+    #[test]
+    fn the_folds_are_the_stated_procedures() {
+        let f = folds(1);
+        assert_eq!(f, [vec![3, 6, 14, 20, 22], vec![2, 8, 15, 16, 21], vec![1, 7, 10, 13], vec![9, 17, 19, 23], vec![0, 11, 12, 18]]);
+        let mut all: Vec<usize> = f.iter().flatten().cloned().collect();
+        all.sort();
+        assert_eq!(all, PAPER_JUMPS.to_vec());
+        let jan: Vec<usize> = f.iter().map(|g| g.iter().filter(|j| JAN_27.contains(j)).count()).collect();
+        assert_eq!(jan, vec![2, 2, 2, 1, 1]);
+    }
+
     /// The loss reproduces cassie_loss_utils on synthetic cases: equal trajectories give 0, and
     /// known offsets give their known values (per term, averaged over the samples).
     #[test]

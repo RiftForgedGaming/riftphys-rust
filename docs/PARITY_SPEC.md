@@ -554,6 +554,12 @@ which the paper itself names as the limit for Drake and MuJoCo.
     unconverged. The pass stays at (8, 6), as the Designer decided;
   - **the pairing:** per jump against MuJoCo's stricter integrator under D2 (a bootstrap over the
     22 jumps), the main line, then the sensitivity line.
+  - **Set 2026-11-10 with the SR&ED week-start update (before any MuJoCo run):** the bootstrap
+    resamples the 22 jumps' paired differences 10,000 times with seed 1; "stricter" is the
+    integrator (Euler or RK4, each refit) with the lower held-out mean. **P5's remaining condition**
+    (the lever-arm fix only if P3 or P4 shows it) is shown if any of the 22 main-line runs at
+    240 Hz and (8, 6) has a hinge past its URDF limit by more than 0.01 rad, or a joint row's
+    position error above 1 mm, at any recorded sample; neither, and P5 is met.
 - **RiftPhys's fit, run 2026-11-10 as stated** (`riftphys-cassie --fit hz 200 out`; per-jump
   results in `riftphys-parity-data/cassie_results/riftphys_{240,2000}hz.json`):
 
