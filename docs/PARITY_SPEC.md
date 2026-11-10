@@ -1783,11 +1783,19 @@ with the full report once the biped reaches P4 and P5. Biped parity needs W4a an
 
 **A downstream requirement (the Designer's goal, relayed by the SR&ED Bookkeeper 2026-11-10):**
 after parity, URIEL trains on parity physics, and RiftForged then "exacerbates reality" for fun
-(a game on real physics must be sped up), with URIEL learning in both. So when RiftPhys's API is
-extended for that, the "fun" layer is a separate transform over the parity core, applied and
-recorded by its parameters and version, and every parity result here stays reproducible with it
-switched off. Swapping RiftPhys in for Bullet behind RiftForged's physics API is integration
-(SR&ED project F); parity itself is B.
+(a game on real physics must be sped up), with URIEL learning in both.
+- **Refined the same day** (the Designer: "Once we have 'real-world parity', ask it to match the
+  current 'RiftForged physics' in a separate API for the game. That's probably the easiest."):
+  after parity (the biped's P4 and P5), a second API in RiftPhys reproduces RiftForged's current
+  physics (Bullet behind RiftForged's strict API), beside the parity core, which stays untouched.
+  It is URIEL's "altered reality"; its distance from parity is the difference between the two
+  APIs on identical scenes and inputs, so both must run them.
+- **Criteria first:** reproduce reference traces of today's RiftForged physics (RF Orchestration
+  records them from the current Bullet build) within tolerances stated in a week-start update
+  before the work starts, with determinism bitwise. Every parity result stays reproducible on the
+  parity API alone.
+- SR&ED: matching RiftForged is engine parity, integration (project F, logged); real-world parity
+  is B.
 
 **Each parity report:**
 - is a new section in `docs/PHYSICS_FIDELITY.md`;
