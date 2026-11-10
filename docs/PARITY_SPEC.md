@@ -487,6 +487,11 @@ which the paper itself names as the limit for Drake and MuJoCo.
   - URDF damping through `set_d6_damping`;
   - URDF limits in radians;
   - the four contact points as 1 mm spheres with compliant contact against the ground.
+    Under compliant contact a loaded sphere rests F / k deep (about 1 cm or more), with no slop
+    added. Any line that runs rigid feet instead rests each sphere 4 mm with its centre inside
+    the ground (`CONTACT_POS_SLOP` is 5 mm, more than r), which the inside-box fix (b4c3c52)
+    handles; such a line says so. The ground is a box of half-height 0.5 m, well beyond any
+    depth.
 - **The state:** dataset rows go through forward kinematics to body poses and velocities. The
   pelvis angular velocity is world-frame (Drake's quaternion floating joint). Ankle-spring
   velocity is unrecorded (0).
@@ -761,6 +766,27 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
   inside a box.
 
 **Order:** W4c, then W4d, then the W4 model.
+
+### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
+
+Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4
+unless a workload hits it first. It doesn't block W4 (Cassie stands on a box), and the seam's
+golden shows the seam never takes a sphere centre behind a triangle.
+- **The failure:** the terrain is triangles. A sphere or capsule pushed, or landing hard enough,
+  that its centre crosses a triangle's plane is measured from the closest point as if in front:
+  the normal reverses and it is pulled through, as box–sphere did before b4c3c52.
+- **A convention mismatch:** `collide_sphere_triangle` returns the normal from the triangle to
+  the sphere (B → A for the sphere-first call), while `collide_box_triangle` returns A → B
+  (box → terrain), the convention `collide_shapes` documents. Terrain contacts aren't flipped by
+  the step, so which one the solver expects decides which is wrong; settle it first.
+- **The design point:** a single triangle has no inside, so "behind the plane" needs a rule.
+  Proposed: one-sided, by the winding's normal (as box–triangle already is); a centre behind the
+  plane within r + the contact margin, over the triangle's face, counts as penetrating, with the
+  face normal and penetration r + margin + depth. Farther behind is no contact, or thin terrain
+  gets pushed through from below.
+- **Tests:** the box_sphere_inside_test depth series (r/2, r, 2r, 20r, and just in front)
+  against a single triangle and a two-triangle quad, in both argument orders; the same for a
+  capsule; terrain and seam goldens.
 
 ### 3.5 W5: lever-arm conditioning (P5, only if shown)
 
