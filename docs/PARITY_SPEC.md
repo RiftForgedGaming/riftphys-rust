@@ -1094,6 +1094,78 @@ the same implicit-Euler accuracy.
 - no URIEL workload uses compliant contact (none sets a pair's stiffness);
 - the reality crate's scene replays (`scene.rs`) where a log sets stiffness.
 
+### 3.4e The MuJoCo reference for P4 (set 2026-11-10, before any MuJoCo run)
+
+The pass pairs RiftPhys (the URDF with dairlib's constants) against MuJoCo with Agility's MJCF
+(`cassie-mujoco-sim/model/cassie.xml` at osudrl 188d3d7, D10), as the paper did. So the verdict is
+engine plus model, and the differences between the two models are listed here before any fit.
+
+**The MJCF, as loaded in MuJoCo 3.17.0:** nq 35, nv 32, 10 actuators, 4 equality constraints;
+timestep 0.5 ms, Euler, PGS, 50 iterations. The pelvis is three slide joints and a ball joint.
+Each leg has hip roll, yaw and pitch; the achilles rod as a ball joint on the thigh, closed to the
+heel spring by a `connect` equality (0.5012 m, solref 0.005 1); the knee; the knee spring
+(`shin`, k 1500); the ankle (`tarsus`); the ankle spring (`heel-spring`, k 1250); a passive foot
+crank and plantar rod, closed to the foot by a second `connect`; the foot (toe), driven directly by
+its actuator. Actuators are motor-side (gear 25, 25, 16, 16, 50) with control limits at the motors'
+peaks (4.5, 4.5, 12.2, 12.2, 0.9 N m).
+
+**The mapping (dataset row → MJCF state), checked against dairlib's `drake_to_mujoco_converter.py`
+(contact_model_verification branch) and the Reviewer's list:**
+- **Shared joints map one to one** (no sign or offset changes); the pelvis position and quaternion
+  copy straight across.
+- **(a) The pelvis's angular velocity:** the ball joint's qvel is in the pelvis's own frame, and the
+  dataset's ω is world-frame (checked on t_00). It is rotated by the pelvis's inverse orientation.
+  dairlib's converter copies it without rotating; that looks like a frame slip in the paper's runs,
+  and is not reproduced here.
+- **(b) The redundant coordinates:** each achilles rod's ball rotation, foot-crank angle and
+  plantar-rod angle are solved (Gauss–Newton on the equality residuals, MuJoCo's own kinematics)
+  so both loops close at t0, and their rates are solved from the equality constraints' Jacobian so
+  the loops' velocity residuals vanish. Gate after `mj_forward`: equality position residuals under
+  1e-6 m, velocity residuals under 1e-4 m/s, per jump, reported.
+- **(c) Inputs:** the actuators drive the joints directly (the toe motor acts on the foot joint, the
+  crank and rod are passive), so ctrl = τ_joint / gear. Each step's control is the first-order
+  hold's mean over that step on the real sample times (the same impulse RiftPhys gets).
+- **(d) No clipping:** `ctrllimited` is turned off, as RiftPhys's loader ignores effort; the data
+  exceeds the motors' peaks (hip roll 117.7 / 25 = 4.7 against 4.5; knee and toe likewise).
+- **A deliberate difference from the paper's runs:** dairlib drove MuJoCo through Agility's compiled
+  simulator library (`cassiemujoco`, with a motor model, a 3 ms actuator delay and torque limits)
+  and fed it the joint-side torques. Here the MJCF runs in MuJoCo's own Python bindings with exactly
+  RiftPhys's inputs, so both engines get the same torques.
+- **Test:** a dataset row through the mapping, then back out of MuJoCo's qpos and qvel, equals the
+  row, as RiftPhys's round trip does.
+
+**The model differences (per leg unless stated):**
+
+| | RiftPhys (cassie_v2.urdf + dairlib) | MuJoCo (Agility MJCF) |
+|---|---|---|
+| total mass | 33.005 kg | 33.312 kg (the achilles rods, 0.157 kg each, are bodies; the URDF has none) |
+| pelvis principal inertia | 0.0841, 0.0858, 0.1211 kg m² | 0.0863, 0.0858, 0.0492 kg m² |
+| foot crank, plantar rod | lumped at the toe (0.129, 0.1186 kg) | bodies on a passive four-bar (0.1261, 0.1186 kg) |
+| achilles rod | massless anchored distance joint, compliance 1e-6 m/N, damping 2e3 N s/m | rigid body on a ball joint, soft `connect` (solref 0.005 1) |
+| leaf springs k | knee 1500, ankle 1250 N m/rad | the same |
+| joint damping (N m s/rad) | hip roll 2, yaw 1, pitch 1, knee 1, knee spring 0.05, ankle 0.1, ankle spring 10, toe 1 | hips 1, knee 1, knee spring 0.1, ankle 0.1, ankle spring 0, foot crank 1, toe 1 |
+| reflected inertia | 0.0381, 0.0381, 0.0934, 0.0934, 0.0123 kg m² | the same (armature) |
+| limits | URDF; the sprung joints' dropped | knee spring ±0.349, ankle 0.873–2.967, toe −2.443 to −0.524; the ankle spring unlimited |
+| foot contact | four 1 mm spheres (two per foot) | a capsule per foot (r 0.02 m, half-length 0.08 m); shins, tarsi, thighs and pelvis also collide |
+| contact model | Hunt–Crossley, implicit (W4e): k, d, μ | MuJoCo's soft contact: solref (−stiffness, −damping), friction μ, on every geom (as dairlib) |
+| solver | (8, 6) iterations (D9) | PGS, 50 iterations (the MJCF's) |
+
+**MuJoCo's fit (set here, before its first run):**
+- **parameters:** stiffness on a log scale over [10, 1e6] (the paper's [0, 1e6]; a stiffness of 0 is
+  no contact, so the log scale starts at 10), damping over [0, 1000], μ over [0.01, 1]; started at
+  Table VI's MuJoCo values (1600, 270, 0.43); the same CMA-ES as RiftPhys (initial step 0.2 in the
+  unit box, 200 evaluations, seed 1), not the paper's NGOpt, so both engines get the same optimiser;
+- **runs:** Euler and RK4 (`opt.integrator` 0 and 1), each at 240 Hz and 2 kHz timesteps; the
+  MJCF's solver and iterations otherwise unchanged; the same folds, objective (the paper's loss,
+  main line, averaged over the training folds) and held-out scoring as RiftPhys;
+- **starts:** the same data state as RiftPhys (the loop-consistent start), mapped as above; Euler
+  takes the gated half-step correction from its own trial steps (3.4a), RK4 none; the sensitivity
+  line sets the ankle springs' rates to 0 in the data state;
+- **recording:** each step's state mapped back to the dataset's form (the pelvis's ω rotated to
+  world), interpolated to the sample times as RiftPhys's are;
+- **stricter:** the integrator with the lower held-out mean at 240 Hz is the reference for the pass;
+  if an integrator isn't stable at 240 Hz, that is reported and it pairs at 2 kHz.
+
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
 Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4
