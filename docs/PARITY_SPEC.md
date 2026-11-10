@@ -1603,6 +1603,97 @@ data. Two price numbers came first, both from runs already made:
   simulated second: (8, 6) 123.1 and 101 ms; (8, 12) 87.0 and 173 ms; (8, 24) 64.4 and 319 ms;
   (8, 48) 55.9 and 588 ms. For comparison, 2 kHz at (8, 6) under W4g gives 29.65 for 631 ms.
 
+### 3.4k W4h: closed loops join the block (approved 2026-11-10 by the Reviewer; built the same day)
+
+- **The design (the Reviewer's points):**
+  - **Membership:** every joint on a closed loop through a block joins it. In the joint graph,
+    bodies are nodes, and a static body is a separate leaf per joint, so no loop runs through the
+    ground. The graph's non-bridge edges fall into 2-edge-connected components, and a component
+    holding a member brings all of its joints in. For a Cassie leg that adds the ankle, the ankle
+    spring and the achilles rod: no redundancy, since the rod is one scalar closing a 1-DoF loop of
+    hinges.
+  - **The rod's row:** in the block it's symmetric at the start pose (the start direction and lever
+    arms on both sides, no w_mix: a quasi-Newton step per sweep, as the D6 rows), and it keeps its
+    compliance and damping (Ã, Γ).
+  - **One direction choice per block:** if any body in the block turned past SHAKE_MAX_TURN, the
+    whole block uses current-pose directions and inertias.
+- **The deciding gate and the stopping rule** were stated by the Reviewer before the build and are
+  recorded here after its first run.
+  - **The gate:** Cassie at 240 Hz, (8, 6), unfitted Table VI, against the data, within 10% of the
+    converged figure: at most 54.2 (converged 49.3).
+  - **The stopping rule:** a miss stops the block extension, and the choice goes to the Designer.
+  - The 3.4j gates stay, plus the rod's stretch against Gauss–Seidel at 4096 sweeps, a block test
+    with a rod, and the cost beside option (2)'s.
+- **Results (uncommitted, for review):**
+  - **The deciding gate: 53.66 ≤ 54.2, a pass.** By iterations: (8, 6) 53.66, (8, 12) 53.64,
+    (8, 24) 53.65, (80, 6) 48.85, (80, 80) 48.85. Position sweeps no longer matter. What's left
+    (53.7 against 48.9) is velocity iterations, with contact: its compliant rows are velocity-level.
+    2 kHz at (8, 6): 29.06.
+  - **Against its own 2 kHz run (3.4g's table):** flight 2.95 at (8, 6) (W4g 13.15, before W4f
+    86.51), 2.89 at (80, 6), 2.88 at 80 iterations; with contact 15.49 at (8, 6), 12.13 at (80, 6),
+    12.14 at 80 iterations. The diagnostics now behave as physics: flight with the leaf springs held
+    rigid is 0.56; contact k ×0.1 gives 9.88, ×10 gives 20.64, d 0 gives 12.49.
+  - **The velocity gate (3.4j):** flight 2.95 at (8, 6) and 2.89 at (80, 6), 2% apart, so no
+    velocity-block item. With contact the velocity iterations matter (15.49 against 12.13; 53.66
+    against 48.85 on the data), but the data gate is met.
+  - **The rod:** stretch over 12 steps of jump 0 at (8, 6) against Gauss–Seidel alone at (8, 4096),
+    largest difference 0.0046 mm in flight and 0.0069 mm with contact
+    (`riftphys-cassie --rod-stretch`).
+  - **The block with a rod against converged Gauss–Seidel** (`a_block_with_a_rod_matches_converged_gauss_seidel`):
+    - at 64 block sweeps, within 6.2e-7 rad, with the rotor's λ equal;
+    - at the workload's 6 sweeps, 4.2e-6 rad, from the rod's symmetric quasi-Newton row (8
+      sweeps: 6.7e-7);
+    - the test asserts at 64 sweeps and prints the (8, 6) figure. The 1e-6 tolerance was mine,
+      not the Reviewer's, and at 6 sweeps it misses.
+  - **Tests:** `rotor_position_test` passes 10 of 10. The bit-identical gates hold (joint_bits, W6
+    and distance_bits identical; the world suites pass; the URIEL library 31 of 31). The Axis
+    arm's outputs are identical to W4g's, since the arm has no loops.
+  - **Cost, one core, release:**
+
+    | | before W4f | W4g | W4h |
+    |---|---|---|---|
+    | Cassie at 240 Hz, ms per simulated second | 58.7 | 102.4 | 166.5 |
+    | Cassie at 2 kHz, ms per simulated second | 307.5 | 630.9 | 1070 |
+    | the Axis arm, µs per step | 201 | 295 | 304 |
+
+    Cassie's 2.84× at 240 Hz is over 3.4j's 2× cost criterion, carried into W4h. Against option
+    (2), W4h at (8, 6) reaches 53.7 for 166 ms, where Gauss–Seidel sweeps under W4g reached 55.9
+    at (8, 48) for 588 ms. The block assembly is unoptimised: every row pair walks every body in
+    the block, and nothing is reused between sweeps.
+  - **Through the changes, unfitted against the data at (8, 6):** 65.0 (before W4f) → 102.2 (W4f)
+    → 123.1 (W4g) → 53.66 (W4h), with converged at 49.3 throughout W4f to W4h and MuJoCo Euler at
+    48.4. The engine got more correct at every step and needed more convergence until W4h
+    supplied it. **P4 isn't rerun yet:** it waits for the Reviewer.
+- **Review (the Reviewer, 2026-11-10): W4h is accepted.**
+  - **The cost gate is missed, not waived:** Cassie at 240 Hz is 2.84× against 3.4j's 2×. Only
+    armature-axis users pay it: Cassie (a validation scene) and the arm's Axis option (1.51×,
+    inside the gate). No URIEL workload uses axis armature. So it doesn't block P4, which judges
+    physics at the decided rate and iterations. The follow-up is item 3.4l.
+  - **Velocity iterations with contact:** they still move Cassie 28% against its own 2 kHz run
+    (15.49 at (8, 6), 12.13 at (80, 6)). The pre-stated velocity gate was on flight (2%), so no
+    item is logged. The P4 report carries this as an observation, and it's the first place to look
+    if the rerun fails narrowly.
+  - **The P4 rerun is approved** to run exactly as stated, on committed code, so its report can
+    cite the commits. W4f, W4g and W4h each go in as their own commit (the Designer's call), then
+    the rerun.
+    - RiftPhys fits at 240 Hz (8, 6) and at 2 kHz, on the fixed folds, as in 3.4a.
+    - The MuJoCo reference is reused unchanged from 7c1037c: its fits don't depend on RiftPhys.
+    - The pairing is under D2, the main line then the sensitivity line.
+    - The report opens with the 7c1037c fail. It then covers W4f to W4h and the (8, 6) arc against
+      the data, names the gate history (3.4j's 2× gates, which 3.4k replaced), and gives the price
+      comparison against option (2).
+
+### 3.4l The armature block's cost (open; owner RiftPhys Orchestration; logged 2026-11-10)
+
+W4h missed 3.4j's cost gate: Cassie at 240 Hz runs at 2.84× its cost before W4f, against 2×.
+Target: at most 2× on Cassie. It's required before any URIEL workload adopts axis armature.
+- **(a) Reuse the factorisation across sweeps** while the block's active set (violated limits)
+  and SHAKE choice are unchanged. With start-of-step Jacobians and inertias, Ã and Γ, the matrix is
+  constant within a step, so this must be bit-identical. It's gated on the P4 run's per-jump
+  hashes.
+- **(b) Sparse assembly by shared body.** Its float summation order may differ, so it's gated at
+  1e-6 against (a), not on bits.
+
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
 Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4

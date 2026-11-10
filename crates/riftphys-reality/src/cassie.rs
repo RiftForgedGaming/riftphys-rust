@@ -94,13 +94,15 @@ pub struct Params {
     /// A diagnostic, not the model: each rotor's reflected inertia added to its joint's child link
     /// about the joint axis, instead of the armature row, so every solver pass sees it (3.4g).
     pub armature_on_link: u16,
+    /// W4g/W4h's armature blocks (on by default; off: Gauss-Seidel alone, for the checks).
+    pub blocks: bool,
 }
 
 impl Default for Params {
     fn default() -> Self {
         // Contact at Table VI's Drake values until fitted
         Self { knee_k: 1500.0, ankle_k: 1250.0, rod_compliance: 1.0e-6, rod_damping: 2.0e3, toe_r: 0.001,
-               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (8, 6), inputs: true, input_mask: 0x3ff, ankle_spring_c: None, rigid_springs: false, armature_on_link: 0 }
+               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (8, 6), inputs: true, input_mask: 0x3ff, ankle_spring_c: None, rigid_springs: false, armature_on_link: 0, blocks: true }
     }
 }
 
@@ -202,6 +204,7 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
     let mut world = World::with_capacity(32, 32);
     world.set_gravity(Vec3::new(0.0, -9.81, 0.0));
     world.set_solver_iterations(p.iters.0, p.iters.1);
+    world.set_armature_blocks(p.blocks);
     let ground = world.add_body(Isometry { pos: Vec3::new(0.0, -0.5, 0.0), rot: Quat::IDENTITY }, Velocity::default(), MassProps::infinite(), false);
     world.add_collider(ground, Shape::Box { hx: 50.0, hy: 0.5, hz: 50.0 }, material(MaterialId::Concrete));
     let mut pair = world.pair_props(MaterialId::Rubber, MaterialId::Concrete);

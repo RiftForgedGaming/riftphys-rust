@@ -394,3 +394,40 @@ fn a_duplicated_row_changes_nothing() {
     assert!((m1 - m2).abs() < 1.0e-5 && (l1 - l2).abs() < 1.0e-5 && (p1 - p2).length() < 1.0e-5, "duplicate changed it: motor {:e}, load {:e}", (m1 - m2).abs(), (l1 - l2).abs());
     assert_eq!(dup.w.armature_blocks(), (1, 0));
 }
+
+/// W4h (PARITY_SPEC 3.4k): the (a) rig with its loop closed by a damped, compliant rod from the
+/// base to the load, as Cassie's achilles rod closes the knee. The loop joins the block.
+fn rig_loop(iters: (u32, u32), blocks: bool) -> Rig {
+    let mut r = rig(I_M, I_L, J_A, 1500.0, -0.06, false, iters, None);
+    r.w.set_armature_blocks(blocks);
+    let lb = Vec3::new(0.3, 0.2, 0.0);
+    let pb = Quat::from_rotation_z(-0.06) * lb;
+    let la = Vec3::new(0.3, -0.1, 0.0);
+    let rod = r.w.add_distance_joint_at(r.base, la, r.load, lb, (pb - la).length() + 0.002, 1.0e-4);
+    r.w.set_distance_damping(rod, 50.0);
+    r
+}
+
+/// The block with the rod converges to Gauss-Seidel's fixed point (64 block sweeps against 4096);
+/// at the workload's 6 sweeps the rod's symmetric (quasi-Newton) row leaves a few 1e-6 rad, printed.
+#[test]
+fn a_block_with_a_rod_matches_converged_gauss_seidel() {
+    let (m6, l6, _, _) = run_block(&mut rig_loop((8, 6), true), 1);
+    let mut b = rig_loop((8, 64), true);
+    let (mb, lb, pb, lamb) = run_block(&mut b, 1);
+    let (mg, lg, pg, lamg) = run_block(&mut rig_loop((8, 4096), false), 1);
+    println!("loop block (8, 64): motor {:.7} load {:.7} rotor lambda {:.7} blocks {:?}; Gauss-Seidel (8, 4096): motor {:.7} load {:.7} rotor lambda {:.7}; at (8, 6) the block is off by {:e} (motor), {:e} (load)", mb, lb, lamb, b.w.armature_blocks(), mg, lg, lamg, (m6 - mg).abs(), (l6 - lg).abs());
+    assert_eq!(b.w.armature_blocks(), (1, 0));
+    assert!((mb - mg).abs() < 1.0e-6 && (lb - lg).abs() < 1.0e-6 && (pb - pg).length() < 1.0e-6, "poses differ: motor {:e}, load {:e}, position {:e}", (mb - mg).abs(), (lb - lg).abs(), (pb - pg).length());
+    assert!((lamb - lamg).abs() < 1.0e-6, "rotor lambda {:e} against {:e}", lamb, lamg);
+}
+
+#[test]
+#[ignore]
+fn probe_loop_block_sweeps() {
+    let (mg, lg, _, _) = run_block(&mut rig_loop((8, 4096), false), 1);
+    for sweeps in [6u32, 8, 12, 24, 64] {
+        let (mb, lb, _, _) = run_block(&mut rig_loop((8, sweeps), true), 1);
+        println!("loop block at (8, {}): motor diff {:e}, load diff {:e}", sweeps, (mb - mg).abs(), (lb - lg).abs());
+    }
+}

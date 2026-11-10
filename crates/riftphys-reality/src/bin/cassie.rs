@@ -790,6 +790,35 @@ fn split() -> Result<(), String> {
     Ok(())
 }
 
+/// W4h's rod gate (PARITY_SPEC 3.4k): jump 0 at 240 Hz, the rods' stretch (length - rest, mm)
+/// per step for 12 steps, W4h at (8, 6) against Gauss-Seidel alone at (8, 4096); flight and contact.
+fn rod_stretch() -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let t = cassie::load_traj(&cassie::data_dir(), 0)?;
+    for toes in [false, true] {
+        let run = |p: Params| -> Result<Vec<[f64; 2]>, String> {
+            let (lc, _) = cassie::start_row(&urdf, &t, &p)?;
+            let mut c = cassie::build(&urdf, &lc, &p, false)?;
+            let h = 1.0 / 240.0;
+            let mut out = Vec::new();
+            for k in 0..12 {
+                c.apply_inputs(&t, t.t[0] + k as f64 * h, t.t[0] + (k + 1) as f64 * h);
+                c.world.step(h as f32);
+                let l = c.rod_lengths();
+                out.push([(l[0] - ACHILLES_LENGTH) * 1e3, (l[1] - ACHILLES_LENGTH) * 1e3]);
+            }
+            Ok(out)
+        };
+        let a = run(Params { toes, ..Params::default() })?;
+        let g = run(Params { toes, blocks: false, iters: (8, 4096), ..Params::default() })?;
+        let worst = a.iter().zip(&g).map(|(x, y)| (x[0] - y[0]).abs().max((x[1] - y[1]).abs())).fold(0.0, f64::max);
+        println!("{}: rod stretch (mm, left/right) W4h (8, 6) vs Gauss-Seidel (8, 4096):", if toes { "with contact" } else { "flight" });
+        for (k, (x, y)) in a.iter().zip(&g).enumerate() { println!("  step {:2}: {:+.4} {:+.4} | {:+.4} {:+.4}", k + 1, x[0], x[1], y[0], y[1]); }
+        println!("  largest difference {:.4} mm", worst);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -800,6 +829,7 @@ fn main() {
         Some("--diagnose") => diagnose(),
         Some("--diag-inputs") => diag_inputs(),
         Some("--cost") => cost(),
+        Some("--rod-stretch") => rod_stretch(),
         Some("--split") => split(),
         Some("--position-pass") => position_pass(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(4), args.get(4).map(String::as_str) == Some("links")),
         Some("--trace-knee") => trace_knee(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0)),
