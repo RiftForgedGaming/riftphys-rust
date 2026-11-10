@@ -76,13 +76,17 @@ pub struct Params {
     pub joint_damping: bool,
     /// Reflected motor inertia (false leaves the rotors out).
     pub armature: bool,
+    /// The toe spheres (false: no contact, for the half-step start's trial step).
+    pub toes: bool,
+    /// Solver iterations (velocity, position); the World's default is (20, 20).
+    pub iters: (u32, u32),
 }
 
 impl Default for Params {
     fn default() -> Self {
         // Contact at Table VI's Drake values until fitted
         Self { knee_k: 1500.0, ankle_k: 1250.0, rod_compliance: 1.0e-6, rod_damping: 2.0e3, toe_r: 0.001,
-               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true }
+               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (20, 20) }
     }
 }
 
@@ -180,6 +184,7 @@ pub fn state_config(row: &[f64; 45], params: &Params, pinned: bool) -> urdf::Con
 pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<Cassie, String> {
     let mut world = World::with_capacity(32, 32);
     world.set_gravity(Vec3::new(0.0, -9.81, 0.0));
+    world.set_solver_iterations(p.iters.0, p.iters.1);
     let ground = world.add_body(Isometry { pos: Vec3::new(0.0, -0.5, 0.0), rot: Quat::IDENTITY }, Velocity::default(), MassProps::infinite(), false);
     world.add_collider(ground, Shape::Box { hx: 50.0, hy: 0.5, hz: 50.0 }, material(MaterialId::Concrete));
     let mut pair = world.pair_props(MaterialId::Rubber, MaterialId::Concrete);
@@ -209,6 +214,7 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
     }
     let mut toes = Vec::new();
     for link in ["toe_left", "toe_right"] {
+        if !p.toes { break; }
         for pt in TOE_POINTS {
             let (b, local) = model.body_point(link, DVec3::from(pt)).ok_or("no toe")?;
             world.add_collider_at(b, Isometry { pos: local, rot: Quat::IDENTITY }, Shape::Sphere { r: p.toe_r }, material(MaterialId::Rubber));
@@ -366,9 +372,204 @@ pub fn quat_angle(a: &[f64], b: &[f64]) -> f64 {
     2.0 * dot.acos()
 }
 
+/* ───────────────────────── the loss ───────────────────────── */
+
+/// The paper's loss per trajectory, as `cassie_loss_utils.py` computes it (PARITY_SPEC 3.4a): the
+/// mean over the samples of the weighted squared state error, in four terms:
+/// - positions (pelvis origin xyz and the 16 joints, columns 4-22), weight 10;
+/// - velocities (pelvis origin velocity and the 16 joint rates, columns 26-44): pelvis 100; hip
+///   roll, knee spring and toe 0.01; ankle spring 0; the rest 1;
+/// - pelvis angular velocity (columns 23-25), weight 5;
+/// - orientation, (2 x the quaternion's geodesic distance)^2, the rotation angle squared, weight 1.
+pub fn loss_terms(sim: &[[f64; 45]], data: &[[f64; 45]]) -> [f64; 4] {
+    const VEL_W: [f64; 19] = [100.0, 100.0, 100.0, 0.01, 0.01, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 1.0, 1.0, 0.0, 0.01, 0.0, 0.01];
+    let n = sim.len().min(data.len());
+    let mut t = [0.0f64; 4];
+    for k in 0..n {
+        let (a, b) = (&sim[k], &data[k]);
+        for i in 4..23 { t[0] += 10.0 * (a[i] - b[i]).powi(2); }
+        for (j, i) in (26..45).enumerate() { t[1] += VEL_W[j] * (a[i] - b[i]).powi(2); }
+        for i in 23..26 { t[2] += 5.0 * (a[i] - b[i]).powi(2); }
+        let qa = DQuat::from_xyzw(a[1], a[2], a[3], a[0]).normalize();
+        let qb = DQuat::from_xyzw(b[1], b[2], b[3], b[0]).normalize();
+        t[3] += quat_angle(&[qa.w, qa.x, qa.y, qa.z], &[qb.w, qb.x, qb.y, qb.z]).powi(2);
+    }
+    t.map(|v| v / n as f64)
+}
+
+pub fn loss(sim: &[[f64; 45]], data: &[[f64; 45]]) -> f64 { loss_terms(sim, data).iter().sum() }
+
+/// The recorded states with the lagged passive rates (knee springs, ankles) replaced by their
+/// recorded positions' derivative: a least-squares quadratic over 9 samples on the real times,
+/// centred where it can be, one-sided at the edges. For the secondary loss line, a diagnostic
+/// (the 4.5 ms window also smooths the impact transient).
+pub fn delag(t: &Traj) -> Vec<[f64; 45]> {
+    let n = t.x.len();
+    let w = 9usize.min(n);
+    let mut out = t.x.clone();
+    for k in 0..n {
+        let lo = k.saturating_sub(w / 2).min(n - w);
+        for (pos, rate) in LAGGED_RATES {
+            out[k][rate] = quad_slope(&t.t[lo..lo + w], &t.x[lo..lo + w], pos, t.t[k]);
+        }
+    }
+    out
+}
+
+/// The derivative at time `at` of a least-squares quadratic through column `col` of `x`.
+fn quad_slope(ts: &[f64], x: &[[f64; 45]], col: usize, at: f64) -> f64 {
+    let mut m = [[0.0f64; 3]; 3];
+    let mut r = [0.0f64; 3];
+    for (tk, xk) in ts.iter().zip(x) {
+        let d = tk - at;
+        let basis = [1.0, d, d * d];
+        for i in 0..3 { r[i] += basis[i] * xk[col]; for j in 0..3 { m[i][j] += basis[i] * basis[j]; } }
+    }
+    let det3 = |a: [[f64; 3]; 3]| a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    let mut mb = m;
+    for i in 0..3 { mb[i][1] = r[i]; }
+    det3(mb) / det3(m)
+}
+
+/* ───────────────────────── the replay ───────────────────────── */
+
+/// Which start a replay uses (PARITY_SPEC 3.4a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Line {
+    /// The loop-consistent start (lagged passive rates refit), then the half-step correction.
+    Main,
+    /// The main line's corrected start with the ankle springs' rates set to 0.
+    Sensitivity,
+}
+
+/// What a replay gives back.
+#[derive(Clone, Debug)]
+pub struct Replay {
+    /// The simulated state at each recorded sample time.
+    pub states: Vec<[f64; 45]>,
+    /// Time of the first toe touch (a sphere's bottom at or below the ground), s after sample 0.
+    pub first_contact: Option<f64>,
+    /// The half-step trial step: the largest change of an ankle spring's rate and of any other
+    /// joint's rate over it (rad/s), and the rods' length rate after it (m/s).
+    pub trial: (f64, f64, f64),
+}
+
+/// The angular impulse (N m s) of the inputs' first-order hold over [a, b] for actuator `j`, on
+/// the real sample times (held at the ends).
+fn input_impulse(t: &Traj, j: usize, a: f64, b: f64) -> f64 {
+    let n = t.t.len();
+    let u = |time: f64| -> f64 {
+        if time <= t.t[0] { return t.u[0][j]; }
+        if time >= t.t[n - 1] { return t.u[n - 1][j]; }
+        let k = t.t.partition_point(|&x| x <= time) - 1;
+        let s = (time - t.t[k]) / (t.t[k + 1] - t.t[k]);
+        t.u[k][j] * (1.0 - s) + t.u[k + 1][j] * s
+    };
+    // Exact for a piecewise-linear input: trapezoids between the knots inside [a, b]
+    let mut pts = vec![a];
+    pts.extend(t.t.iter().cloned().filter(|&x| x > a && x < b));
+    pts.push(b);
+    pts.windows(2).map(|w| 0.5 * (u(w[0]) + u(w[1])) * (w[1] - w[0])).sum()
+}
+
+impl Cassie {
+    /// Applies each actuator's angular impulse over [a, b] as an equal and opposite pair on the
+    /// joint's child and parent, about the joint's axis.
+    pub fn apply_inputs(&mut self, t: &Traj, a: f64, b: f64) {
+        for (k, name) in ACTUATORS.iter().enumerate() {
+            let imp = input_impulse(t, k, a, b);
+            let j = self.urdf.joint(name).unwrap().clone();
+            let axis = self.model.link_frame(&self.world, &j.child).unwrap().rot * j.axis * imp;
+            let v = Vec3::new(axis.x as f32, axis.y as f32, axis.z as f32);
+            let (cb, _) = self.model.links[&j.child];
+            let (pb, _) = self.model.links[&j.parent];
+            let (c, pa) = (self.model.bodies[cb].id, self.model.bodies[pb].id);
+            self.world.apply_torque(c, v);
+            self.world.apply_torque(pa, -v);
+        }
+    }
+}
+
+/// The 22 velocity coordinates of a row (pelvis angular, pelvis origin linear, 16 joint rates).
+const VEL: std::ops::Range<usize> = 23..45;
+
+/// Replays trajectory `t` at `hz` from the start of `line`, recording at the data's sample times.
+pub fn replay(urdf: &Urdf, t: &Traj, p: &Params, hz: f64, line: Line) -> Result<Replay, String> {
+    let h = 1.0 / hz;
+    let (lc, _) = start_row(urdf, t, p)?;
+    // The half-step correction from a trial step on the loop-consistent state, contact off
+    let mut trial = build(urdf, &lc, &Params { toes: false, ..*p }, false)?;
+    trial.apply_inputs(t, t.t[0], t.t[0] + h);
+    trial.world.step(h as f32);
+    let after = trial.state();
+    let mut start = lc;
+    for i in VEL { start[i] = lc[i] - 0.5 * (after[i] - lc[i]); }
+    let d_ankle = (after[41] - lc[41]).abs().max((after[43] - lc[43]).abs());
+    let d_other = (29..45).filter(|&i| i != 41 && i != 43).map(|i| (after[i] - lc[i]).abs()).fold(0.0, f64::max);
+    let rods = trial.rod_rates();
+    let trial_info = (d_ankle, d_other, rods[0].abs().max(rods[1].abs()));
+    if line == Line::Sensitivity { start[41] = 0.0; start[43] = 0.0; }
+    // Positions stay the data's; only the rates are corrected
+    let mut c = build(urdf, &start, p, false)?;
+    let t0 = t.t[0];
+    let end = t.t[t.t.len() - 1] - t0;
+    let steps = (end / h).ceil() as usize + 1;
+    let mut times = vec![0.0];
+    let mut states = vec![c.state()];
+    let mut first_contact = None;
+    for k in 0..steps {
+        let (a, b) = (t0 + k as f64 * h, t0 + (k + 1) as f64 * h);
+        c.apply_inputs(t, a, b);
+        c.world.step(h as f32);
+        times.push(b - t0);
+        states.push(c.state());
+        if first_contact.is_none() && c.toe_heights().iter().any(|&z| z <= p.toe_r as f64) { first_contact = Some(b - t0); }
+    }
+    // Linear interpolation to the sample times (the quaternion normalised, its sign aligned)
+    let out = t.t.iter().map(|&tk| {
+        let x = tk - t0;
+        let i = times.partition_point(|&s| s <= x).clamp(1, times.len() - 1);
+        let s = ((x - times[i - 1]) / (times[i] - times[i - 1])).clamp(0.0, 1.0);
+        let (a, b) = (&states[i - 1], &states[i]);
+        let mut r = [0.0; 45];
+        let sign = if (0..4).map(|j| a[j] * b[j]).sum::<f64>() < 0.0 { -1.0 } else { 1.0 };
+        for j in 0..45 { r[j] = a[j] * (1.0 - s) + if j < 4 { sign } else { 1.0 } * b[j] * s; }
+        let n = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3]).sqrt();
+        for j in 0..4 { r[j] /= n; }
+        r
+    }).collect();
+    Ok(Replay { states: out, first_contact, trial: trial_info })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loss reproduces cassie_loss_utils on synthetic cases: equal trajectories give 0, and
+    /// known offsets give their known values (per term, averaged over the samples).
+    #[test]
+    fn the_loss_matches_the_papers_on_synthetic_cases() {
+        let mut row = [0.0f64; 45];
+        row[0] = 1.0;
+        let data = vec![row; 100];
+        assert_eq!(loss(&data, &data), 0.0);
+        let shifted = |f: &dyn Fn(&mut [f64; 45])| { let mut r = row; f(&mut r); vec![r; 100] };
+        // Pelvis x 1 cm off: 10 x 1e-4
+        assert!((loss(&shifted(&|r| r[4] = 0.01), &data) - 1e-3).abs() < 1e-12);
+        // Pelvis vz 0.1 m/s off: 100 x 0.01; knee spring rate 1 rad/s off: 0.01; ankle spring: 0
+        assert!((loss(&shifted(&|r| r[28] = 0.1), &data) - 1.0).abs() < 1e-12);
+        assert!((loss(&shifted(&|r| r[37] = 1.0), &data) - 0.01).abs() < 1e-12);
+        assert_eq!(loss(&shifted(&|r| r[41] = 1.0), &data), 0.0);
+        // Pelvis omega 0.1 rad/s off: 5 x 0.01
+        assert!((loss(&shifted(&|r| r[24] = 0.1), &data) - 0.05).abs() < 1e-12);
+        // Orientation turned 0.1 rad: 0.01
+        let q = DQuat::from_rotation_z(0.1);
+        assert!((loss(&shifted(&|r| { r[0] = q.w; r[3] = q.z; }), &data) - 0.01).abs() < 1e-9);
+        // Half the samples off: half the value (a mean, not a sum)
+        let mut half = data.clone();
+        for r in half.iter_mut().take(50) { r[4] = 0.01; }
+        assert!((loss(&half, &data) - 5e-4).abs() < 1e-12);
+    }
 
     fn here() -> bool { data_dir().join("x_00.npy").exists() && Path::new(DATA_ROOT).join("cassie_v2.urdf").exists() }
 

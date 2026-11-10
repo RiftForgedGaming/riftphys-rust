@@ -241,12 +241,96 @@ fn peak_above(x: &[f64], hz: f64, fmin: f64) -> Option<f64> {
     (1..p.len() - 1).filter(|&k| p[k] > p[k - 1] && p[k] >= p[k + 1]).max_by(|&a, &b| p[a].partial_cmp(&p[b]).unwrap()).map(|k| fs[k])
 }
 
+/// The paper's 22 jumps replayed at `hz` on `line`, contact at Table VI's Drake values (not fitted):
+/// each jump's loss and terms, the secondary (de-lagged) loss, first contact, and the trial step.
+fn replay_all(hz: f64, line: cassie::Line) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let p = Params::default();
+    println!("{} Hz, {:?} line, unfitted (k {}, d {}, mu {})", hz, line, p.k, p.d, p.mu);
+    println!("traj | loss (pos, vel, omega, quat) | de-lagged loss | first contact (ms) | trial: d ankle spring, d other max (rad/s), rod rate (m/s)");
+    let (mut sum, mut sum2) = (0.0, 0.0);
+    for &i in PAPER_JUMPS.iter() {
+        let t = cassie::load_traj(&cassie::data_dir(), i)?;
+        let r = cassie::replay(&urdf, &t, &p, hz, line)?;
+        let terms = cassie::loss_terms(&r.states, &t.x);
+        let l: f64 = terms.iter().sum();
+        let l2 = cassie::loss(&r.states, &cassie::delag(&t));
+        sum += l;
+        sum2 += l2;
+        println!("{:4} | {:7.2} ({:6.2} {:6.2} {:5.2} {:5.2}) | {:7.2} | {:>6} | {:.3} {:.3} {:.4}", i, l, terms[0], terms[1], terms[2], terms[3], l2,
+                 r.first_contact.map_or("none".to_string(), |f| format!("{:.1}", f * 1e3)), r.trial.0, r.trial.1, r.trial.2);
+    }
+    println!("mean over the 22: {:.2} (de-lagged {:.2})", sum / 22.0, sum2 / 22.0);
+    Ok(())
+}
+
+/// One jump's velocity-term contributions by column (the largest first), at `hz`, main line.
+fn terms(i: usize, hz: f64) -> Result<(), String> {
+    const VEL_W: [f64; 19] = [100.0, 100.0, 100.0, 0.01, 0.01, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.01, 0.01, 1.0, 1.0, 0.0, 0.01, 0.0, 0.01];
+    let names = ["pelvis vx", "pelvis vy", "pelvis vz"];
+    let urdf = cassie::load_urdf()?;
+    let iters: u32 = std::env::var("CASSIE_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let p = Params { iters: (iters, iters), ..Params::default() };
+    let t = cassie::load_traj(&cassie::data_dir(), i)?;
+    let r = cassie::replay(&urdf, &t, &p, hz, cassie::Line::Main)?;
+    println!("{} iterations: loss {:.2}", iters, cassie::loss(&r.states, &t.x));
+    let n = t.x.len() as f64;
+    let mut c: Vec<(String, f64, f64)> = (26..45).enumerate().map(|(j, col)| {
+        let name = if j < 3 { names[j].to_string() } else { cassie::JOINTS[j - 3].to_string() };
+        let e = r.states.iter().zip(&t.x).map(|(a, b)| (a[col] - b[col]).powi(2)).sum::<f64>() / n;
+        (name, VEL_W[j] * e, e.sqrt())
+    }).collect();
+    c.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    println!("traj {} at {} Hz, velocity term by column (weighted, RMS error):", i, hz);
+    for (name, w, rms) in c.iter().take(8) { println!("  {:26} {:8.2}  rms {:.3}", name, w, rms); }
+    // The pelvis vertical velocity, sampled
+    for k in (0..t.x.len()).step_by(10) { println!("  t {:5.1} ms  vz sim {:+.3} data {:+.3}", (t.t[k] - t.t[0]) * 1e3, r.states[k][28], t.x[k][28]); }
+    Ok(())
+}
+
+/// The loss floor of sampling alone: each jump's recorded states held only on a grid at `hz` and
+/// interpolated linearly back to the sample times, scored against themselves.
+fn floor(hz: f64) -> Result<(), String> {
+    let mut sum = 0.0;
+    for &i in PAPER_JUMPS.iter() {
+        let t = cassie::load_traj(&cassie::data_dir(), i)?;
+        let h = 1.0 / hz;
+        let at = |x: f64| -> [f64; 45] {
+            // The recorded state at time x (linear between samples)
+            let k = t.t.partition_point(|&s| s <= x).clamp(1, t.t.len() - 1);
+            let s = ((x - t.t[k - 1]) / (t.t[k] - t.t[k - 1])).clamp(0.0, 1.0);
+            let mut r = [0.0; 45];
+            for j in 0..45 { r[j] = t.x[k - 1][j] * (1.0 - s) + t.x[k][j] * s; }
+            r
+        };
+        let held: Vec<[f64; 45]> = t.t.iter().map(|&tk| {
+            let g = ((tk - t.t[0]) / h).floor();
+            let (a, b) = (t.t[0] + g * h, t.t[0] + (g + 1.0) * h);
+            let (xa, xb) = (at(a), at(b));
+            let s = (tk - a) / h;
+            let mut r = [0.0; 45];
+            for j in 0..45 { r[j] = xa[j] * (1.0 - s) + xb[j] * s; }
+            r
+        }).collect();
+        sum += cassie::loss(&held, &t.x);
+    }
+    println!("sampling floor at {} Hz: mean loss {:.2} over the 22", hz, sum / 22.0);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
         Some("--check") => check(),
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
+        Some("--floor") => floor(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0)),
+        Some("--terms") => terms(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0), args.get(3).and_then(|a| a.parse().ok()).unwrap_or(240.0)),
+        Some("--replay") => {
+            let hz = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0);
+            let line = if args.get(3).map(String::as_str) == Some("sensitivity") { cassie::Line::Sensitivity } else { cassie::Line::Main };
+            replay_all(hz, line)
+        }
         Some("--stance") => stance(2.0, args.get(2).and_then(|a| a.parse().ok()).unwrap_or(9400.0)),
         Some("--probe") => probe(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(20), 4.0),
         _ => Err("usage: riftphys-cassie --check | --pluck | --stance | --rates | --probe [traj]".into()),

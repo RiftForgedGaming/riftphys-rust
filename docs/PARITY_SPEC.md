@@ -881,6 +881,43 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     the 18 Hz one at the stiffer ground), and largest on the swing-leg modes (0.19–0.51). "Small
     for stance" covers the bounce only.
 
+**The replay (built 2026-11-10, `cassie::replay`, `riftphys-cassie --replay hz [sensitivity]`):**
+- **What it does:** the starts as decided above (the half-step correction from a trial step with
+  the toe spheres left out); each step's input impulse is the first-order hold integrated
+  exactly on the real sample times and applied as an equal and opposite pair on each actuated
+  joint's child and parent; states recorded each step and interpolated linearly to the data's
+  sample times (the quaternion normalised); the first toe touch timed.
+- **The loss** (`cassie::loss_terms`) reproduces `cassie_loss_utils.py`'s weights and its per-jump
+  mean; a test checks it on synthetic cases (equal trajectories give 0; each term's known value
+  for a known offset; half the samples off gives half). The secondary line (`cassie::delag`) is
+  built as stated above.
+- **A first pass, unfitted (contact at Table VI's Drake values), on the paper's 22, main line.
+  Not a P4 result:** P4 needs the fit and the paired MuJoCo rerun, and 38.0 and 30.0 are
+  context on other windows.
+  - **2 kHz:** mean loss 30.21 (de-lagged 41.76); the sensitivity line 30.21. Per jump 21.3–59.1.
+    The largest terms are joint rates (hip pitch, ankle, knee: 1.3–2.0 rad/s RMS) and pelvis vz
+    (0.15 m/s RMS).
+  - **240 Hz:** mean loss 222.84 (sensitivity 224.28), about seven times 2 kHz. Trajectory 0:
+    648 at 20 iterations, the knee and ankle rates off by 14–16 rad/s RMS. 80 iterations give 308,
+    320 give 289, so convergence explains only about half. The sampling floor (each jump's own
+    data held on a 240 Hz grid and interpolated back, scored against itself) is 0.35, so it isn't
+    the interpolation. The rest is the dynamics at a 4.17 ms step, not yet diagnosed. Candidates:
+    the compliant contact, whose force is computed once per step; the leaf springs' integrator
+    damping; and the knee motors' large impulses into the loop. D9's rule (b) already names the
+    first diagnostic, a 240 Hz run with the leaf springs made rigid.
+  - **The de-lagged line is higher than the paper's, not lower** (41.76 against 30.21 at
+    2 kHz). Either the 9-sample derivative is noisy through the impact, or the simulation
+    happens to resemble the lagged rates. To be checked before the line is read.
+  - **The trial step:** over one 2 kHz step the ankle springs' rates change by 0.40–1.82 rad/s,
+    the other joints' by up to 4.5 rad/s, and the rods' length rate reaches 0.01–0.15 m/s; at
+    240 Hz, 0.45–2.8, up to 13.4, and 0.03–0.06. These are the motors' torques acting on light
+    links (torque scale), not a closure jump (the start is loop-consistent), but the rod rate
+    after one step needs a criterion before it's gated.
+  - **First contact comes earlier than the ballistic estimate** under the measured torques: 3.5
+    and 4.0 ms on trajectories 1 and 2 (ballistic 4.9 and 5.2). So at 240 Hz the first step
+    (4.17 ms) includes contact on those jumps, while the trial step runs without it; on the rest
+    it is 5.0–11.5 ms.
+
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
 Opened 2026-11-10 at the Reviewer's request, from the inside-box fix's review. Built after W4
