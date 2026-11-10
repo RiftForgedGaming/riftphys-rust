@@ -481,6 +481,30 @@ fn fit_all(hz: f64, evals: usize, out: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The data states both engines start from (PARITY_SPEC 3.4e), for every public trajectory: the
+/// loop-consistent start row (`cassie::start_row`), plus each trajectory's times, recorded states
+/// and inputs; and RiftPhys's own main-line replay of trajectory 0 at 2 kHz, to check the other
+/// engine's loss port against this one. Written as JSON to `out`.
+fn export_starts(out: &str) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let p = Params::default();
+    let mut trajs = Vec::new();
+    for i in 0..ALL_JUMPS {
+        let t = cassie::load_traj(&cassie::data_dir(), i)?;
+        let (start, ankle) = cassie::start_row(&urdf, &t, &p)?;
+        trajs.push(serde_json::json!({ "index": i, "paper": PAPER_JUMPS.contains(&i), "start": start.to_vec(), "ankle_spring_rates": ankle,
+            "t": t.t, "x": t.x.iter().map(|r| r.to_vec()).collect::<Vec<_>>(), "u": t.u.iter().map(|r| r.to_vec()).collect::<Vec<_>>() }));
+    }
+    let t0 = cassie::load_traj(&cassie::data_dir(), 0)?;
+    let r = cassie::replay(&urdf, &t0, &p, 2000.0, cassie::Line::Main)?;
+    let check = serde_json::json!({ "trajectory": 0, "hz": 2000.0, "states": r.states.iter().map(|s| s.to_vec()).collect::<Vec<_>>(),
+        "loss": cassie::loss(&r.states, &t0.x), "terms": cassie::loss_terms(&r.states, &t0.x) });
+    let doc = serde_json::json!({ "trajectories": trajs, "loss_check": check, "folds": cassie::folds(1) });
+    std::fs::write(out, serde_json::to_string(&doc).unwrap()).map_err(|e| e.to_string())?;
+    println!("wrote {} ({} trajectories)", out, ALL_JUMPS);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let r = match args.get(1).map(String::as_str) {
@@ -488,6 +512,7 @@ fn main() {
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
         Some("--iters") => iters_check(),
+        Some("--export-starts") => export_starts(&args.get(2).cloned().unwrap_or_else(|| "cassie_starts.json".to_string())),
         Some("--fit") => {
             let hz = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(240.0);
             let evals = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(200);

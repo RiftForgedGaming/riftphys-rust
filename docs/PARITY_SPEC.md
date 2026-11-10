@@ -1133,6 +1133,19 @@ peaks (4.5, 4.5, 12.2, 12.2, 0.9 N m).
   RiftPhys's inputs, so both engines get the same torques.
 - **Test:** a dataset row through the mapping, then back out of MuJoCo's qpos and qvel, equals the
   row, as RiftPhys's round trip does.
+- **Amendment 2026-11-10 (before any MuJoCo run), the ankle springs:** with the data's leg joints
+  the MJCF's achilles loop doesn't close: 0.3–1.0 mm short on every jump (the plantar loops close
+  exactly). The MJCF's anchors differ slightly from dairlib's (on the heel spring (0.1194, −0.0087,
+  −0.0016) against (0.11877, −0.01, 0)), and a rigid rod can't take up the gap. The robot never
+  measured its ankle springs: its estimator solved them by closing this loop in the URDF's
+  geometry. So the mapping re-solves each ankle spring's angle and rate in the MJCF's geometry,
+  with the rods, cranks and plantar rods. Result (`--check`, all 29): position and velocity
+  residuals under 1e-11, the ankle springs moved 3.4–8.3 mrad and their rates at most 0.15 rad/s;
+  every other coordinate round-trips exactly. The loss port matches the Rust loss on RiftPhys's
+  trajectory-0 replay to 1e-6 (31.245718 both).
+- **Amendment 2026-11-10, the optimiser:** "the same CMA-ES as RiftPhys" means the same algorithm
+  and settings (initial step 0.2 in the unit box, 200 evaluations, seed 1) in the Python port W3
+  used for MuJoCo; its random stream differs from the Rust one.
 
 **The model differences (per leg unless stated):**
 
