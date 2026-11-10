@@ -788,13 +788,36 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     up to 4.46 rad/s. MuJoCo gets exactly the same starting velocities, so its equality
     constraint doesn't resolve the inconsistency its own way.
   - **sensitivity line: the ankle springs' rate at 0** for both engines, as Drake had it. The
-    context comparison with Drake's 38.0 sits on this line.
-  - **The half-step start works from the loop-consistent state,** and its trial step, which runs
-    with contact off, must show a rod impulse at gravity and torque scale, not closure scale. From
-    the 0 state the trial step's first projection would remove the closure as a velocity jump,
-    and −½ of it would be applied backwards (up to about 0.25 m/s of extra rod rate). The
-    sensitivity line therefore starts from the 0 state directly, with no half-step correction on
-    the ankle springs' columns.
+    context comparison with Drake's 38.0 sits on this line. It differs from the main line in that
+    one thing only.
+  - **The data state is the same for both engines; each applies its own start correction.** The
+    half-step correction belongs to an integrator, not to the data: RiftPhys's is its leapfrog
+    offset, taken from its own trial step, as in W3. MuJoCo Euler takes a half-step from its own
+    trial step; MuJoCo RK4 takes none. Handing MuJoCo RiftPhys's corrected velocities would build
+    RiftPhys's correction into the reference.
+  - **RiftPhys's start, main line:** the loop-consistent state, then the half-step correction from
+    a trial step on it, which runs with contact off and must show a rod impulse at gravity and
+    torque scale, not closure scale. In joint coordinates, q̇_start = q̇_lc − ½(q̇_1 − q̇_lc).
+  - **RiftPhys's start, sensitivity line:** the main line's corrected start with the two ankle
+    springs' rates then set to 0. (A trial step taken on the 0 state would remove the closure as
+    a velocity jump and apply −½ of it backwards, up to about 0.25 m/s of extra rod rate; leaving
+    out the correction would drop the half-step start too. Either way the line would differ in
+    more than the ankle springs' rate.)
+  - **MuJoCo's integrator:** Agility's `cassie.xml` sets PGS with 50 iterations and MuJoCo's
+    default Euler integrator at a 0.5 ms step, and the paper's runs used it. As in W3, both
+    Euler (the model's own option) and RK4 run, each at 240 Hz for the pairing (D9) and at 2 kHz
+    beside it, with the model's solver settings otherwise unchanged; the reference for the pass is
+    the stricter of the two on the held-out loss (D7's rule for P3). If Agility's model isn't
+    stable at 240 Hz under an integrator, that is reported and that integrator pairs at 2 kHz.
+- **The recorded rates against the recorded angles (a cross-check, reported, not gated;
+  `riftphys-cassie --rates`):** each loop-consistent ankle-spring rate beside the slope of a line
+  through that spring's recorded angle over the first 6 samples (about 2.5 ms; the estimator's
+  inverse kinematics). They agree poorly: of 58 legs, 20 differ in sign (where either is above
+  0.2 rad/s) and 30 differ by more than 1 rad/s (largest: trajectory 3 left, −0.82 against
+  −6.96; trajectory 10, −0.29 / −1.52 against −3.58 / −4.44). The loop-consistent rate is built
+  from the other joints' recorded rates, so the recorded rates and positions aren't mutually
+  consistent at the first samples. That bounds how well any engine can match the window's first
+  milliseconds, for RiftPhys and MuJoCo alike.
 - **Toe heights at sample 0:** 11–88 mm above the ground (sphere bottoms). The earliest ballistic
   arrival of any toe is 4.8–11.6 ms on the paper's 22, consistent with "about 5 ms before
   impact" and the public offsets already applied. So the half-step start's trial step (4.17 ms
@@ -814,8 +837,17 @@ part read the AABB, which follows the offset. The CCD integrators in ccd.rs and
     contaminated the spectra: it gave 12–17.5 Hz, and a 3.5 Hz "mode" on trajectory 20's right
     leg that was the creep. The Reviewer asked for the check rather than an interpretation;
     `riftphys-cassie --probe` prints each joint's motion, limit margin and frequency.
-  - These are the swing leg's modes. In the window the springs carry the body, so a stance pluck
-    (standing on compliant ground) is the next measurement, and D9 carries both.
+  - These are the swing leg's modes.
+- **Leaf springs standing** (`riftphys-cassie --stance`: a trajectory's last sample, at rest,
+  motors locked, undamped, on the compliant ground at 9400 N/m, the pelvis on a vertical guide,
+  2 kHz for 2 s, the first 0.3 s left out): the dominant mode is the body's bounce on its legs and
+  the ground, 2–2.5 Hz on all six trajectories, with the springs and the ground in series: ω dt
+  0.05–0.07 at 240 Hz, where implicit Euler keeps 0.82–0.85 per period. Its period (400–500 ms)
+  is far longer than the window. Unguided, with the motors locked, the robot toppled within 2 s
+  and its pelvis fell through the floor (only the toes collide), so the guide is needed.
+  - **So for D9:** standing, the integrator's damping is small; it bites on the swing-leg modes
+    (8.5–23.5 Hz, 0.19–0.51 per period at 240 Hz), the legs' motion relative to the body during
+    the impact.
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 
@@ -1551,8 +1583,8 @@ is: it is Agility Robotics' bipedal robot, see D4); D5 sizes below, go-ahead pen
     model, hung (3.4a), they ring in two modes per leg at 8.5–23.5 Hz: ω dt 0.22–0.62 at 240 Hz,
     where implicit Euler keeps (1 + ω²dt²)^(−π/(ω dt)) ≈ 0.19–0.51 of the amplitude per period;
     0.03–0.07 at 2 kHz. The swing-leg periods (43–118 ms) are as long as or longer than the
-    window. The stance frequencies, the relevant ones for the impact and possibly stiffer, are
-    still to be measured; D9 carries both. MuJoCo's springs aren't damped
+    window. Standing (3.4a, on a vertical guide), the dominant mode is the body's bounce at
+    2–2.5 Hz, ω dt 0.05–0.07 at 240 Hz, keeping 0.82–0.85 per period. MuJoCo's springs aren't damped
     numerically there, so the paired 240 Hz comparison shows it directly. The URIEL biped has no
     compliant rows, dampers or armature, and 240 Hz is already its rate: the handicap comes
     from a feature the biped workload doesn't use today.

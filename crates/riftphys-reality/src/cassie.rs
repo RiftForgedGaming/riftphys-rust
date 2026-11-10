@@ -139,6 +139,8 @@ pub fn load_traj(dir: &Path, index: usize) -> Result<Traj, String> {
 /// Cassie built in a World.
 pub struct Cassie {
     pub world: World,
+    /// The static ground box.
+    pub ground: BodyId,
     pub urdf: Urdf,
     pub model: urdf::Model,
     /// Achilles rods, left and right.
@@ -213,7 +215,7 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
             toes.push((link, b, DVec3::from(pt)));
         }
     }
-    Ok(Cassie { world, urdf: urdf.clone(), model, rods: [rods[0], rods[1]], toes })
+    Ok(Cassie { world, ground, urdf: urdf.clone(), model, rods: [rods[0], rods[1]], toes })
 }
 
 fn d(v: Vec3) -> DVec3 { DVec3::new(v.x as f64, v.y as f64, v.z as f64) }
