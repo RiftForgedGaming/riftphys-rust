@@ -514,7 +514,7 @@ fn rigid_check(fits: &str, out: &str) -> Result<(), String> {
     let mut rows = Vec::new();
     for f in doc["folds"].as_array().ok_or("no folds")? {
         let p = Params { k: f["k"].as_f64().unwrap() as f32, d: f["d"].as_f64().unwrap() as f32, mu: f["mu"].as_f64().unwrap() as f32,
-                         knee_k: 1.0e9, ankle_k: 1.0e9, ..Params::default() };
+                         rigid_springs: true, ..Params::default() };
         for j in f["held_out"].as_array().unwrap() {
             let j = j.as_u64().unwrap() as usize;
             let t = cassie::load_traj(&cassie::data_dir(), j)?;
@@ -525,7 +525,116 @@ fn rigid_check(fits: &str, out: &str) -> Result<(), String> {
     }
     let mean = rows.iter().map(|r| r["main"].as_f64().unwrap()).sum::<f64>() / rows.len() as f64;
     println!("240 Hz, (8, 6), leaf springs rigid, the 240 Hz folds' parameters: held-out mean {:.2}", mean);
-    std::fs::write(out, serde_json::to_string_pretty(&serde_json::json!({ "hz": 240.0, "leaf_springs": "rigid (k 1e9)", "jumps": rows })).unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(out, serde_json::to_string_pretty(&serde_json::json!({ "hz": 240.0, "leaf_springs": "rigid, held at their starting angles", "jumps": rows })).unwrap()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The 240 Hz step error, isolated (PARITY_SPEC 3.4g): for each configuration, the paper's 22 at
+/// 240 Hz scored against RiftPhys's own 2 kHz run of the same configuration (the same start and
+/// parameters), with the error before the first contact and after it split out. Report only.
+fn diagnose() -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let b = Params::default();
+    let cases: Vec<(&str, Params)> = vec![
+        ("base (W4e, (8, 6), Table VI contact)", b),
+        ("no contact (the toes left out)", Params { toes: false, ..b }),
+        ("no contact, no torques", Params { toes: false, inputs: false, ..b }),
+        ("no contact, no rotors", Params { toes: false, armature: false, ..b }),
+        ("no contact, leaf springs rigid", Params { toes: false, rigid_springs: true, ..b }),
+        ("leaf springs rigid", Params { rigid_springs: true, ..b }),
+        ("no contact, achilles rod rigid", Params { toes: false, rod_compliance: 0.0, rod_damping: 0.0, ..b }),
+        ("no contact, no joint damping", Params { toes: false, joint_damping: false, ..b }),
+        ("no contact, 80 iterations", Params { toes: false, iters: (80, 80), ..b }),
+        ("no rotors", Params { armature: false, ..b }),
+        ("achilles rod rigid", Params { rod_compliance: 0.0, rod_damping: 0.0, ..b }),
+        ("contact k x0.1", Params { k: b.k * 0.1, ..b }),
+        ("contact k x10", Params { k: b.k * 10.0, ..b }),
+        ("contact d 0", Params { d: 0.0, ..b }),
+        ("80 iterations", Params { iters: (80, 80), ..b }),
+        ("no contact, rotors on the links", Params { toes: false, armature_on_link: 0x3ff, ..b }),
+        ("rotors on the links", Params { armature_on_link: 0x3ff, ..b }),
+        ("no contact, rotors on the links, springs rigid", Params { toes: false, armature_on_link: 0x3ff, rigid_springs: true, ..b }),
+        ("no contact, knee rotors on the links", Params { toes: false, armature_on_link: 0xc0, ..b }),
+        ("knee rotors on the links", Params { armature_on_link: 0xc0, ..b }),
+        ("rotors on the links but the toes'", Params { armature_on_link: 0xff, ..b }),
+    ];
+    println!("configuration | 240 Hz against its own 2 kHz: all samples, before first contact, after | mean first contact 240 / 2k (ms)");
+    let only = std::env::var("CASSIE_DIAG").ok();
+    for (name, p) in cases.iter().filter(|(n, _)| only.as_deref().map_or(true, |o| n.contains(o))) {
+        let (mut all, mut pre, mut post, mut npre, mut npost) = (0.0, 0.0, 0.0, 0usize, 0usize);
+        let (mut fc240, mut fc2k, mut nfc) = (0.0, 0.0, 0usize);
+        for &i in PAPER_JUMPS.iter() {
+            let t = cassie::load_traj(&cassie::data_dir(), i)?;
+            let a = cassie::replay(&urdf, &t, p, 240.0, cassie::Line::Main)?;
+            let c = cassie::replay(&urdf, &t, p, 2000.0, cassie::Line::Main)?;
+            all += cassie::loss(&a.states, &c.states) / 22.0;
+            let touch = c.first_contact.unwrap_or(f64::INFINITY);
+            for k in 0..t.t.len() {
+                let e = cassie::loss(&a.states[k..k + 1], &c.states[k..k + 1]);
+                if t.t[k] - t.t[0] < touch { pre += e; npre += 1; } else { post += e; npost += 1; }
+            }
+            if let (Some(x), Some(y)) = (a.first_contact, c.first_contact) { fc240 += x; fc2k += y; nfc += 1; }
+        }
+        let m = |s: f64, n: usize| if n > 0 { s / n as f64 } else { f64::NAN };
+        println!("{:40} | {:7.2} | {:7.2} | {:7.2} | {}", name, all, m(pre, npre), m(post, npost),
+                 if nfc > 0 { format!("{:.1} / {:.1}", fc240 / nfc as f64 * 1e3, fc2k / nfc as f64 * 1e3) } else { "-".into() });
+    }
+    Ok(())
+}
+
+/// Flight only (no contact): which actuators carry the 240 Hz error, and whether 2 kHz is itself
+/// converged (against 8 kHz). Report-only (PARITY_SPEC 3.4g).
+fn diag_inputs() -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let b = Params { toes: false, ..Params::default() };
+    let run = |p: &Params, lo: f64, hi: f64| -> Result<f64, String> {
+        let mut all = 0.0;
+        for &i in PAPER_JUMPS.iter() {
+            let t = cassie::load_traj(&cassie::data_dir(), i)?;
+            let a = cassie::replay(&urdf, &t, p, lo, cassie::Line::Main)?;
+            let c = cassie::replay(&urdf, &t, p, hi, cassie::Line::Main)?;
+            all += cassie::loss(&a.states, &c.states) / 22.0;
+        }
+        Ok(all)
+    };
+    println!("flight, 240 Hz against 2 kHz, one actuator pair at a time:");
+    for (name, mask) in [("all ten", 0x3ffu16), ("none", 0), ("hip roll", 0x3), ("hip yaw", 0xc), ("hip pitch", 0x30), ("knee", 0xc0), ("toe", 0x300), ("all but toe", 0xff)] {
+        println!("  {:12} {:8.2}", name, run(&Params { input_mask: mask, ..b }, 240.0, 2000.0)?);
+    }
+    println!("flight, all torques, each rate against 8 kHz:");
+    for hz in [240.0, 480.0, 960.0, 2000.0, 4000.0] {
+        println!("  {:6} Hz {:8.2}", hz, run(&b, hz, 8000.0)?);
+    }
+    Ok(())
+}
+
+/// One jump, flight, knee torques only: the left knee, knee spring and ankle over time at three rates.
+fn trace_knee(i: usize) -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let p = Params { toes: false, input_mask: 0xc0, ..Params::default() };
+    let t = cassie::load_traj(&cassie::data_dir(), i)?;
+    let r: Vec<_> = [240.0, 2000.0, 8000.0].iter().map(|&hz| cassie::replay(&urdf, &t, &p, hz, cassie::Line::Main)).collect::<Result<_, _>>()?;
+    let col = |name: &str| cassie::JOINTS.iter().position(|j| *j == name).unwrap();
+    let (kq, sq, aq) = (7 + col("knee_left"), 7 + col("knee_joint_left"), 7 + col("ankle_joint_left"));
+    let kv = 29 + col("knee_left");
+    println!("t ms | tau knee L | knee q 240/2k/8k | knee rate 240/2k/8k | spring q 240/2k/8k | ankle q 240/2k/8k");
+    for k in (0..t.t.len()).step_by(2) {
+        let f = |c: usize| format!("{:8.4} {:8.4} {:8.4}", r[0].states[k][c], r[1].states[k][c], r[2].states[k][c]);
+        println!("{:5.1} | {:7.1} | {} | {} | {} | {}", (t.t[k] - t.t[0]) * 1e3, t.u[k][6], f(kq), f(kv), f(sq), f(aq));
+    }
+    Ok(())
+}
+
+/// Wall clock per simulated second of the Cassie replay (the 22 jumps, (8, 6), contact on), by rate.
+fn cost() -> Result<(), String> {
+    let urdf = cassie::load_urdf()?;
+    let trajs: Vec<_> = PAPER_JUMPS.iter().map(|&i| cassie::load_traj(&cassie::data_dir(), i)).collect::<Result<_, _>>()?;
+    let sim: f64 = trajs.iter().map(|t| t.t[t.t.len() - 1] - t.t[0]).sum();
+    for hz in [240.0, 480.0, 960.0, 2000.0] {
+        let t0 = std::time::Instant::now();
+        for t in &trajs { cassie::replay(&urdf, t, &Params::default(), hz, cassie::Line::Main)?; }
+        println!("{:6} Hz: {:.1} ms per simulated second ({:.2} s simulated; includes the start solve and trial steps)", hz, t0.elapsed().as_secs_f64() / sim * 1e3, sim);
+    }
     Ok(())
 }
 
@@ -536,6 +645,10 @@ fn main() {
         Some("--pluck") => pluck(),
         Some("--rates") => rates(),
         Some("--iters") => iters_check(),
+        Some("--diagnose") => diagnose(),
+        Some("--diag-inputs") => diag_inputs(),
+        Some("--cost") => cost(),
+        Some("--trace-knee") => trace_knee(args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0)),
         Some("--rigid-check") => match (args.get(2), args.get(3)) { (Some(f), Some(o)) => rigid_check(f, o), _ => Err("usage: --rigid-check fits.json out.json".into()) },
         Some("--export-starts") => export_starts(&args.get(2).cloned().unwrap_or_else(|| "cassie_starts.json".to_string())),
         Some("--fit") => {

@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use glam::{DQuat, DVec3};
+use glam::{DMat3, DQuat, DVec3};
 use riftphys_core::{BodyId, Isometry, JointId, Quat, Vec3, Velocity};
 use riftphys_geom::{MassProps, Shape};
 use riftphys_materials::materials::{material, MaterialId};
@@ -83,15 +83,24 @@ pub struct Params {
     pub iters: (u32, u32),
     /// Apply the measured motor torques (false: none, a diagnostic).
     pub inputs: bool,
+    /// Which actuators' torques are applied, bit k for ACTUATORS[k] (a diagnostic; all ten by default).
+    pub input_mask: u16,
     /// The ankle springs' damping, N m s/rad, overriding the URDF's "made up" 10 (None: the URDF).
     pub ankle_spring_c: Option<f64>,
+    /// The leaf springs made rigid: each held at its starting angle (a limit with min = max, and
+    /// k 1e9 so the row stays stiff outside it). A stiffness alone pulls them to rest angle 0, which
+    /// snaps every spring that starts deflected (PARITY_SPEC 3.4g, corrected 2026-11-10).
+    pub rigid_springs: bool,
+    /// A diagnostic, not the model: each rotor's reflected inertia added to its joint's child link
+    /// about the joint axis, instead of the armature row, so every solver pass sees it (3.4g).
+    pub armature_on_link: u16,
 }
 
 impl Default for Params {
     fn default() -> Self {
         // Contact at Table VI's Drake values until fitted
         Self { knee_k: 1500.0, ankle_k: 1250.0, rod_compliance: 1.0e-6, rod_damping: 2.0e3, toe_r: 0.001,
-               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (8, 6), inputs: true, ankle_spring_c: None }
+               k: 9400.0, d: 3.0, mu: 0.45, joint_damping: true, armature: true, toes: true, iters: (8, 6), inputs: true, input_mask: 0x3ff, ankle_spring_c: None, rigid_springs: false, armature_on_link: 0 }
     }
 }
 
@@ -150,6 +159,7 @@ pub struct Cassie {
     pub world: World,
     /// Whether `apply_inputs` applies the measured torques.
     pub inputs: bool,
+    pub input_mask: u16,
     /// The static ground box.
     pub ground: BodyId,
     pub urdf: Urdf,
@@ -201,7 +211,29 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
     pair.mu_k = p.mu;
     world.set_pair_props(MaterialId::Rubber, MaterialId::Concrete, pair);
 
-    let model = urdf::build(urdf, &mut world, &state_config(row, p, pinned))?;
+    let moved;
+    let urdf = if p.armature_on_link != 0 {
+        let mut u = urdf.clone();
+        for (k, name) in ACTUATORS.iter().enumerate() {
+            if p.armature_on_link & (1 << k) == 0 { continue; }
+            let j = u.joints.iter().find(|j| j.name == *name).ok_or("no joint")?.clone();
+            let l = u.links.iter_mut().find(|l| l.name == j.child).ok_or("no link")?;
+            let i = l.inertial.as_mut().ok_or("no inertial")?;
+            let a = j.axis.normalize();
+            let ja = ROTOR_INERTIA[k] * GEAR_RATIO[k] * GEAR_RATIO[k];
+            i.inertia += DMat3::from_cols(a * a.x, a * a.y, a * a.z) * ja;
+        }
+        moved = u;
+        &moved
+    } else { urdf };
+    let springs_k = if p.rigid_springs { (1.0e9, 1.0e9) } else { (p.knee_k, p.ankle_k) };
+    let model = urdf::build(urdf, &mut world, &state_config(row, &Params { knee_k: springs_k.0, ankle_k: springs_k.1, ..*p }, pinned))?;
+    if p.rigid_springs {
+        for name in ["knee_joint_left", "knee_joint_right", "ankle_spring_joint_left", "ankle_spring_joint_right"] {
+            let q0 = row[7 + JOINTS.iter().position(|j| *j == name).unwrap()] as f32;
+            world.set_d6_limit_r(model.joints[name], 0, Some(riftphys_articulation::bodies::D6Limit { min: q0, max: q0 }));
+        }
+    }
     if !p.joint_damping {
         for id in model.joints.values() { world.set_d6_damping(*id, true, 0, 0.0, 0.0); }
     } else if let Some(c) = p.ankle_spring_c {
@@ -209,6 +241,7 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
     }
     if p.armature {
         for (k, name) in ACTUATORS.iter().enumerate() {
+            if p.armature_on_link & (1 << k) != 0 { continue; }
             let id = *model.joints.get(*name).ok_or(format!("no joint {}", name))?;
             world.set_d6_armature(id, 0, (ROTOR_INERTIA[k] * GEAR_RATIO[k] * GEAR_RATIO[k]) as f32);
         }
@@ -230,7 +263,7 @@ pub fn build(urdf: &Urdf, row: &[f64; 45], p: &Params, pinned: bool) -> Result<C
             toes.push((link, b, DVec3::from(pt)));
         }
     }
-    Ok(Cassie { world, inputs: p.inputs, ground, urdf: urdf.clone(), model, rods: [rods[0], rods[1]], toes })
+    Ok(Cassie { world, inputs: p.inputs, input_mask: p.input_mask, ground, urdf: urdf.clone(), model, rods: [rods[0], rods[1]], toes })
 }
 
 fn d(v: Vec3) -> DVec3 { DVec3::new(v.x as f64, v.y as f64, v.z as f64) }
@@ -594,6 +627,7 @@ impl Cassie {
     pub fn apply_inputs(&mut self, t: &Traj, a: f64, b: f64) {
         if !self.inputs { return; }
         for (k, name) in ACTUATORS.iter().enumerate() {
+            if self.input_mask & (1 << k) == 0 { continue; }
             let imp = input_impulse(t, k, a, b);
             let j = self.urdf.joint(name).unwrap().clone();
             let axis = self.model.link_frame(&self.world, &j.child).unwrap().rot * j.axis * imp;

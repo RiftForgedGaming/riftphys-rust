@@ -13,3 +13,6 @@
 
 # Python bytecode (tools/)
 __pycache__/
+
+# MuJoCo writes its warnings here when run from the repo root
+/MUJOCO_LOG.TXT

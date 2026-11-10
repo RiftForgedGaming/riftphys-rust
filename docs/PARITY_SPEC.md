@@ -1210,6 +1210,13 @@ held out over the fixed folds; the bar: (c) MuJoCo 3.17.0 with Agility's MJCF, r
   gap**: held out 77.95, +29.81 (SE 4.87) behind MuJoCo, worse than with compliant springs. So the
   failure is **not** attributed to the leaf springs' integrator damping. By the rule it is not
   reported as parity, and a follow-up item is logged (3.4g).
+  - **Corrected 2026-11-10 (the test's setup, not its rule):** k 1e9 alone pulled each leaf spring
+    to its rest angle 0, snapping every spring that started deflected, so the 77.95 run wasn't
+    "the springs rigid". Rerun with each spring held at its starting angle (a limit with
+    min = max, k 1e9 outside it), the same parameters and pairing: held out **71.77, +23.63
+    (SE 5.82, 95% [+12.12, +34.79])** behind MuJoCo, lower on 3 of 22; by day Jan 27 +8.45,
+    Feb 12 +32.31. Still worse than with compliant springs (65.53), so the outcome (b) and the
+    attribution stand. The snapped run is kept as `riftphys_240hz_rigid_springs_snapped_to_zero.json`.
 - **Report only, both engines unfitted at Table VI's values, the main line's mean over the 22:**
   RiftPhys 65.0 / 50.1 / 35.6 / 29.2 at 240 / 480 / 960 / 2000 Hz; MuJoCo Euler 48.4 / 33.2 / 32.2
   (2 kHz 31.9). MuJoCo has settled by 480 Hz; RiftPhys needs about 960 Hz to come within a few
@@ -1227,6 +1234,56 @@ geared rotors at a 4.17 ms step, and the implicit contact's own dissipation. Two
 Designer's to choose: engine work at 240 Hz (diagnosis first, each candidate isolated against
 RiftPhys's own 2 kHz run, as in 3.4a), or the biped workload moving to a higher physics rate under
 its 240 Hz control (sub-steps), with P4 rerun at that rate under criteria set before the run.
+- **Decided 2026-11-10 (Designer: "Engine work at 240 Hz"):** the biped keeps its 240 Hz physics
+  rate; RiftPhys is to close the gap at 240 Hz. Diagnosis first, report-only, each candidate
+  isolated against RiftPhys's own 2 kHz run from the same start with the same parameters. Any engine
+  change goes to the Reviewer before it's built, and P4 is rerun afterwards exactly as stated in
+  3.4a and 3.4e (the same folds, fit, pairing and D9 outcomes; 7c1037c's result stays on record).
+- **Diagnosis, first pass (2026-11-10, report-only, unfitted at Table VI's values, (8, 6)):** each
+  line is the paper's loss of the 240 Hz run against RiftPhys's own 2 kHz run with the same change,
+  the mean over the 22 (`riftphys-cassie --diagnose`; "no contact" leaves the toe spheres out, so the
+  whole replay is flight; the before/after split uses a touch time that fires near t0 without toes
+  and isn't meaningful there).
+
+  | change | 240 Hz vs own 2 kHz |
+  |---|---|
+  | none (base) | 25.32 |
+  | no contact | 86.51 |
+  | no contact, no torques | 7.66 |
+  | no contact, only the knee motors' torques / all but the knees' (`--diag-inputs`) | 88.44 / 9.77 at most |
+  | no contact, no rotors / no joint damping / 80 iterations | 143.83 / 98.70 / 90.35 |
+  | no contact, leaf springs held rigid / achilles rod rigid | 88.89 / 87.02 |
+  | no contact, rotor inertias moved onto the child links (all / knees only) | **22.99 / 40.07** |
+  | leaf springs held rigid / rotors on the links (with contact) | 36.88 / 138.90 |
+  | contact k ×0.1 / ×10 / d 0 / 80 iterations | 29.61 / 25.32 / 37.05 / 42.44 |
+
+  - **The flight error is the knee motors' torque acting through the armature row.** Flight with
+    every torque but the knees' is within 2 of no torques at all. Moving each rotor's reflected
+    inertia onto its child link (a diagnostic, not the model: it puts J_a on the link's absolute
+    rotation rather than the joint's relative one) cuts the flight error from 86.5 to 23.0. A
+    left-knee trace (`--trace-knee 0`) shows the first 240 Hz step unloading the knee spring
+    (−0.063 to −0.024 rad, where the 2 kHz run holds it near its loaded −0.06) and turning the knee
+    rate from +6 to −3 rad/s against +90 N m of torque.
+  - **Leading mechanism (not yet shown):** the position pass doesn't see J_a (W4b: "The position
+    solve doesn't see J_a"), so the leaf springs' XPBD rows and the loop's SHAKE corrections move the
+    light motor-side link, and the armature row only reconciles it inelastically on the next step.
+    At 2 kHz the per-step corrections are small; at 240 Hz one step's correction is most of the
+    spring's load.
+  - **Contact is a separate effect.** It hides the flight error (25.3 with contact against 86.5
+    without), and the rotors-on-links diagnostic makes the contact runs far worse (138.9), so
+    whatever fixes flight has to be checked with contact on.
+  - **The 2 kHz reference is converged:** flight with all torques against 8 kHz: 137.7 / 71.3 / 22.7 /
+    8.5 / 3.2 at 240 / 480 / 960 / 2000 / 4000 Hz.
+- **The URIEL biped (the Reviewer's item 2; `biped::rate_probe`, report-only):** its own rollouts,
+  StandPd held at 240 Hz and only the physics rate changed, against 1920 Hz over 3 s. It has no
+  leaf springs, loops or compliant contact, and its armature is already on the links.
+  - stand: joint RMS mean 0.0034 / 0.0015 / 0.0004 rad, pelvis mean 2.8 / 0.7 / 0.1 mm at 240 /
+    480 / 960 Hz; a 12 N s push: 0.0041 / 0.0011 / 0.0006 rad, 2.9 / 0.6 / 0.3 mm. None fall.
+  - a 20 N s push (falls at every rate) and no control (collapse) diverge by tens of mm to 0.3 m at
+    every rate, 960 Hz no closer than 480 Hz: chaotic falls, not a step-size trend.
+- **Cost per simulated second (item 3, release, one core):** the URIEL biped 21.2 / 38.5 / 78.0 /
+  152.5 ms at 240 / 480 / 960 / 1920 Hz; the Cassie replay 66.7 / 118.1 / 204.3 / 369.3 ms at
+  240 / 480 / 960 / 2000 Hz (including the start solve and trial steps).
 
 ### 3.4c Sphere–triangle contact behind the plane (open; owner RiftPhys Orchestration; after W4)
 

@@ -598,4 +598,61 @@ mod trace {
         }
         println!("lowest foot centre y {:+.3} (rest 0.030)", min_y);
     }
+
+    /// PARITY_SPEC 3.4g, report-only (the Reviewer's item 2 and 3): the biped's own rollouts at
+    /// 240, 480 and 960 Hz against 1920 Hz (2 kHz's nearest multiple of 240), the servo held at
+    /// 240 Hz so only the physics rate changes, and the wall clock per simulated second.
+    #[test]
+    #[ignore]
+    fn rate_probe() {
+        let seconds = 3.0f32;
+        let ticks = (seconds * CONTROL_HZ as f32) as u32;
+        // (pelvis position, joint angles) per control tick, fell, wall seconds
+        let run = |scene: usize, m: u32| -> (Vec<(Vec3, [f32; JOINTS])>, bool, f64) {
+            let cfg = BipedConfig { push_rate: 0.0, ..Default::default() };
+            let mut env = BipedEnv::new(&cfg, seconds, 0, 7);
+            let ctl = if scene == 3 { StandPd { kp: [0.0; 3], kd: [0.0; 3], k_com: 0.0, k_com_v: 0.0, k_torso: 0.0, k_torso_v: 0.0, ..Default::default() } } else { StandPd::default() };
+            let dt = 1.0 / (CONTROL_HZ * SUBSTEPS * m) as f32;
+            let mut out = Vec::new();
+            let mut fell = false;
+            let t0 = std::time::Instant::now();
+            for tick in 0..ticks {
+                if tick == 30 && (scene == 1 || scene == 2) {
+                    env.world.apply_impulse(env.biped.torso, Vec3::new(0.0, 0.0, if scene == 1 { 12.0 } else { 20.0 }));
+                }
+                for _ in 0..SUBSTEPS {
+                    let t = ctl.command(&env.world, &env.biped);
+                    for _ in 0..m {
+                        env.biped.apply(&mut env.world, t, dt);
+                        env.world.step(dt);
+                    }
+                }
+                fell |= env.biped.is_fallen(&env.world);
+                out.push((env.world.get_body_pose(env.biped.pelvis).pos, std::array::from_fn(|j| env.biped.angle(&env.world, j))));
+            }
+            (out, fell, t0.elapsed().as_secs_f64())
+        };
+        let names = ["stand", "push 12 N s at 0.5 s", "push 20 N s at 0.5 s", "no control (collapse)"];
+        let mut wall = [0.0f64; 4];
+        for (scene, name) in names.iter().enumerate() {
+            let (fine, fine_fell, w) = run(scene, 8);
+            wall[3] += w;
+            println!("{}: 1920 Hz fell {}", name, fine_fell);
+            for (k, m) in [1u32, 2, 4].iter().enumerate() {
+                let (r, fell, w) = run(scene, *m);
+                wall[k] += w;
+                let (mut jm, mut jx, mut pm, mut px) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                for (a, b) in r.iter().zip(fine.iter()) {
+                    let j = ((0..JOINTS).map(|i| (a.1[i] - b.1[i]).powi(2)).sum::<f32>() / JOINTS as f32).sqrt();
+                    let p = (a.0 - b.0).length() * 1e3;
+                    jm += j / r.len() as f32; jx = jx.max(j); pm += p / r.len() as f32; px = px.max(p);
+                }
+                println!("  {:4} Hz against 1920: joint rms mean {:.4} max {:.4} rad; pelvis mean {:.2} max {:.2} mm; fell {}",
+                         240 * m, jm, jx, pm, px, fell);
+            }
+        }
+        for (k, hz) in [240, 480, 960, 1920].iter().enumerate() {
+            println!("wall clock at {} Hz: {:.2} ms per simulated second", hz, wall[k] / (4.0 * seconds as f64) * 1e3);
+        }
+    }
 }
